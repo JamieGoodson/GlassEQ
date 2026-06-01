@@ -394,6 +394,25 @@ struct EQCoreTests {
     }
 
     @Test
+    func profileDecoderDefaultsMissingStereoFieldsToLinked() throws {
+        let json = """
+        {
+          "id": "00000000-0000-0000-0000-000000000001",
+          "name": "Legacy",
+          "mode": "parametric",
+          "preampDB": 0,
+          "filters": [],
+          "isBypassed": false
+        }
+        """
+
+        let profile = try ProfilePersistence.decoder.decode(EQProfile.self, from: Data(json.utf8))
+        #expect(profile.channelMode == EQChannelMode.linked)
+        #expect(profile.leftFilters == profile.filters)
+        #expect(profile.rightFilters == profile.filters)
+    }
+
+    @Test
     func profileMappingUsesOutputUID() {
         let profile = EQProfile(name: "USB DAC", mode: .graphic31, filters: EQProfile.flatGraphic31.filters)
         let store = ProfileStore(
@@ -456,6 +475,16 @@ struct EQCoreTests {
 
         #expect(storeWithBrokenFallback.profile(forOutputUID: nil).id == first.id)
         #expect(emptyStore.profile(forOutputUID: nil).id == EQProfile.flatParametric.id)
+    }
+
+    @Test
+    func profileStoreRoundTripsThroughJSON() throws {
+        let store = ProfileStore()
+        let data = try ProfilePersistence.encode(store)
+        let decoded = try ProfilePersistence.decode(data)
+
+        #expect(decoded.profiles.count == store.profiles.count)
+        #expect(decoded.outputMappings == store.outputMappings)
     }
 
     private func makeStereoTestBlock(frameCount: Int, sampleRate: Double) -> [Float] {
