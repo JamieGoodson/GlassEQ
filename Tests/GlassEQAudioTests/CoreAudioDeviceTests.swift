@@ -1,6 +1,7 @@
 import CoreAudio
 import Foundation
 @testable import GlassEQAudio
+import GlassEQCore
 import Testing
 
 @Suite
@@ -108,6 +109,92 @@ struct CoreAudioDeviceTests {
             for: output(channelCount: 2, bufferFrameSize: 512),
             runtimeBufferFrameSize: 512
         ) == 1_024)
+    }
+
+    @Test
+    func dspHotSwapAllowsSameTopologyParameterAndBypassChanges() {
+        let active = EQProfile(
+            name: "Active",
+            mode: .graphic10,
+            preampDB: -3,
+            filters: EQProfile.flatGraphic10.filters
+        )
+        var next = active
+        next.preampDB = -4
+        next.filters[0].gainDB = 3
+        next.filters[1].frequency = 70
+        next.isBypassed = true
+
+        #expect(SystemTapAudioEngine.canHotSwapDSP(
+            from: active,
+            to: next,
+            sampleRate: 48_000,
+            channelCount: 2
+        ))
+    }
+
+    @Test
+    func dspHotSwapRejectsTopologyChangingProfiles() {
+        let graphic = EQProfile(
+            name: "Graphic",
+            mode: .graphic10,
+            filters: EQProfile.flatGraphic10.filters
+        )
+
+        var disabledBand = graphic
+        disabledBand.filters[0].isEnabled = false
+        #expect(!SystemTapAudioEngine.canHotSwapDSP(
+            from: graphic,
+            to: disabledBand,
+            sampleRate: 48_000,
+            channelCount: 2
+        ))
+
+        let parametric = EQProfile(
+            name: "Parametric",
+            mode: .parametric,
+            filters: [EQFilter(kind: .peak, frequency: 1_000, gainDB: 0, q: 1)]
+        )
+        var addedFilter = parametric
+        addedFilter.filters.append(EQFilter(kind: .peak, frequency: 2_000, gainDB: 0, q: 1))
+        #expect(!SystemTapAudioEngine.canHotSwapDSP(
+            from: parametric,
+            to: addedFilter,
+            sampleRate: 48_000,
+            channelCount: 2
+        ))
+
+        let modeSwitch = EQProfile(
+            name: "Parametric Same Count",
+            mode: .parametric,
+            filters: graphic.filters
+        )
+        #expect(!SystemTapAudioEngine.canHotSwapDSP(
+            from: graphic,
+            to: modeSwitch,
+            sampleRate: 48_000,
+            channelCount: 2
+        ))
+
+        var stereoSwitch = graphic
+        stereoSwitch.channelMode = .stereo
+        #expect(!SystemTapAudioEngine.canHotSwapDSP(
+            from: graphic,
+            to: stereoSwitch,
+            sampleRate: 48_000,
+            channelCount: 2
+        ))
+    }
+
+    @Test
+    func renderConfigurationTopologyRejectsFormatChanges() {
+        let profile = EQProfile.flatGraphic10
+        let active = EQRenderConfiguration(profile: profile, sampleRate: 48_000, channelCount: 2)
+        let sampleRateChange = EQRenderConfiguration(profile: profile, sampleRate: 44_100, channelCount: 2)
+        let channelCountChange = EQRenderConfiguration(profile: profile, sampleRate: 48_000, channelCount: 1)
+
+        #expect(!sampleRateChange.hasRealtimeCompatibleTopology(with: active))
+        #expect(!channelCountChange.hasRealtimeCompatibleTopology(with: active))
     }
 
     @Test

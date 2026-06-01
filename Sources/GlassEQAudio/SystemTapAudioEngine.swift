@@ -786,21 +786,55 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     public func updateDSP(profile: EQProfile) -> Bool {
         control.withLock { state in
             guard let output = state.activeOutput,
+                  let activeProfile = state.activeProfile,
                   let runtime = state.runtime else {
                 return false
             }
 
-            runtime.drainDSPConfigBoxes()
+            guard Self.canHotSwapDSP(
+                from: activeProfile,
+                to: profile,
+                sampleRate: output.nominalSampleRate,
+                channelCount: runtime.channelCount
+            ) else {
+                return false
+            }
+
             let preparedConfig = EQRenderConfiguration(
                 profile: Self.dspProfile(from: profile),
                 sampleRate: output.nominalSampleRate,
                 channelCount: runtime.channelCount
             )
+            runtime.drainDSPConfigBoxes()
             runtime.publishPendingDSPConfig(preparedConfig)
             runtime.setBypassed(profile.isBypassed)
             state.activeProfile = profile
             return true
         }
+    }
+
+    static func canHotSwapDSP(
+        from activeProfile: EQProfile,
+        to nextProfile: EQProfile,
+        sampleRate: Double,
+        channelCount: Int
+    ) -> Bool {
+        guard activeProfile.mode == nextProfile.mode,
+              activeProfile.channelMode == nextProfile.channelMode else {
+            return false
+        }
+
+        return EQRenderConfiguration(
+            profile: Self.dspProfile(from: nextProfile),
+            sampleRate: sampleRate,
+            channelCount: channelCount
+        ).hasRealtimeCompatibleTopology(
+            with: EQRenderConfiguration(
+                profile: Self.dspProfile(from: activeProfile),
+                sampleRate: sampleRate,
+                channelCount: channelCount
+            )
+        )
     }
 
     public func setBypassed(_ isBypassed: Bool) {

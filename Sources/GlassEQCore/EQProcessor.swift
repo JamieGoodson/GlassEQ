@@ -92,6 +92,12 @@ public struct EQRenderConfiguration: Equatable, Sendable {
         self.channelFilterCounts = renderLayout.channelFilterCounts
         self.preampLinearGains = renderLayout.preampLinearGains
     }
+
+    public func hasRealtimeCompatibleTopology(with other: EQRenderConfiguration) -> Bool {
+        configuration.sampleRate == other.configuration.sampleRate
+            && configuration.channelCount == other.configuration.channelCount
+            && channelFilterCounts == other.channelFilterCounts
+    }
 }
 
 public struct EQProcessor: Sendable {
@@ -121,8 +127,9 @@ public struct EQProcessor: Sendable {
 
     public mutating func applyPreparedConfiguration(_ renderConfiguration: EQRenderConfiguration) {
         let previousCoefficients = coefficients
+        // Keep this comparison allocation-free; audio callbacks use it for same-topology DSP swaps.
         let needsStateReset = renderConfiguration.configuration.channelCount != self.configuration.channelCount
-            || renderConfiguration.configuration.channelConfigurations.map(\.coefficients.count) != self.configuration.channelConfigurations.map(\.coefficients.count)
+            || renderConfiguration.channelFilterCounts != channelFilterCounts
             || renderConfiguration.configuration.sampleRate != self.configuration.sampleRate
 
         self.configuration = renderConfiguration.configuration
