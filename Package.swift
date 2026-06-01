@@ -13,8 +13,10 @@ let package = Package(
         .library(name: "GlassEQAudio", targets: ["GlassEQAudio"]),
         .library(name: "GlassEQSettingsIPC", targets: ["GlassEQSettingsIPC"]),
         .library(name: "GlassEQSettingsUI", targets: ["GlassEQSettingsUI"]),
+        .library(name: "GlassEQDiagnosticsSupport", targets: ["GlassEQDiagnosticsSupport"]),
         .executable(name: "GlassEQ", targets: ["GlassEQApp"]),
-        .executable(name: "GlassEQSettings", targets: ["GlassEQSettings"])
+        .executable(name: "GlassEQSettings", targets: ["GlassEQSettings"]),
+        .executable(name: "GlassEQDiagnostics", targets: ["GlassEQDiagnostics"])
     ],
     targets: [
         .target(
@@ -30,6 +32,9 @@ let package = Package(
         .target(
             name: "GlassEQSettingsIPC",
             dependencies: ["GlassEQCore"]
+        ),
+        .target(
+            name: "GlassEQDiagnosticsSupport"
         ),
         .target(
             name: "GlassEQSettingsUI",
@@ -79,6 +84,14 @@ let package = Package(
                 .linkedFramework("AppKit")
             ]
         ),
+        .executableTarget(
+            name: "GlassEQDiagnostics",
+            dependencies: [
+                "GlassEQDiagnosticsSupport",
+                "GlassEQCore",
+                "GlassEQAudio"
+            ]
+        ),
         .testTarget(
             name: "GlassEQCoreTests",
             dependencies: ["GlassEQCore"]
@@ -106,6 +119,10 @@ let package = Package(
                 "GlassEQSettings",
                 "GlassEQSettingsIPC"
             ]
+        ),
+        .testTarget(
+            name: "GlassEQDiagnosticsTests",
+            dependencies: ["GlassEQDiagnosticsSupport"]
         )
     ],
     swiftLanguageModes: [.v6]
