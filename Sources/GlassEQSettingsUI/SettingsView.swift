@@ -1,0 +1,1884 @@
+import AppKit
+import GlassEQCore
+import GlassEQSettingsIPC
+import SwiftUI
+
+typealias SettingsSnapshot = SettingsSnapshotDTO
+typealias ImportFormat = SettingsImportFormat
+
+private extension SettingsImportFormat {
+    var title: String {
+        switch self {
+        case .autoEQ:
+            localized("AutoEQ / EqualizerAPO")
+        case .rew:
+            localized("REW")
+        }
+    }
+}
+
+private let settingsResourcesBundle: Bundle = {
+    let resourceBundleName = "GlassEQ_GlassEQSettingsUI.bundle"
+    let candidates = [
+        Bundle.main.resourceURL?.appendingPathComponent(resourceBundleName),
+        Bundle.main.bundleURL.appendingPathComponent(resourceBundleName),
+        Bundle.main.bundleURL
+            .deletingLastPathComponent()
+            .appendingPathComponent(resourceBundleName)
+    ].compactMap { $0 }
+
+    for candidate in candidates {
+        if let bundle = Bundle(url: candidate) {
+            return bundle
+        }
+    }
+
+    return Bundle.main
+}()
+
+private func localized(_ value: String.LocalizationValue) -> String {
+    String(localized: value, bundle: settingsResourcesBundle)
+}
+
+private func localizedDecimal(
+    _ value: Double,
+    minimumFractionDigits: Int,
+    maximumFractionDigits: Int,
+    signed: Bool = false
+) -> String {
+    let formatter = NumberFormatter()
+    formatter.locale = .autoupdatingCurrent
+    formatter.numberStyle = .decimal
+    formatter.minimumFractionDigits = minimumFractionDigits
+    formatter.maximumFractionDigits = maximumFractionDigits
+    if signed {
+        formatter.positivePrefix = formatter.plusSign
+    }
+    return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+}
+
+private func localizedInteger(_ value: Int) -> String {
+    value.formatted(.number.locale(.autoupdatingCurrent))
+}
+
+private func localizedInteger(_ value: UInt32) -> String {
+    UInt64(value).formatted(.number.locale(.autoupdatingCurrent))
+}
+
+private func localizedInteger(_ value: UInt64) -> String {
+    value.formatted(.number.locale(.autoupdatingCurrent))
+}
+
+private func localizedDecibels(_ value: Double, fractionDigits: Int = 1) -> String {
+    let number = localizedDecimal(
+        value,
+        minimumFractionDigits: fractionDigits,
+        maximumFractionDigits: fractionDigits,
+        signed: true
+    )
+    return localized("\(number) dB")
+}
+
+private func localizedFrequency(_ value: Double) -> String {
+    if value >= 1_000 {
+        let number = localizedDecimal(value / 1_000, minimumFractionDigits: 1, maximumFractionDigits: 1)
+        return localized("\(number) kHz")
+    }
+    let number = localizedDecimal(value, minimumFractionDigits: 0, maximumFractionDigits: 0)
+    return localized("\(number) Hz")
+}
+
+private func localizedFrameCount(_ value: Int) -> String {
+    let number = localizedInteger(value)
+    return value == 1 ? localized("\(number) frame") : localized("\(number) frames")
+}
+
+private func localizedFrameCount(_ value: UInt32) -> String {
+    let number = localizedInteger(value)
+    return value == 1 ? localized("\(number) frame") : localized("\(number) frames")
+}
+
+private func localizedLatency(milliseconds: Double) -> String {
+    let number = localizedDecimal(milliseconds, minimumFractionDigits: 2, maximumFractionDigits: 2)
+    return localized("\(number) ms")
+}
+
+private extension Notification.Name {
+    static let glassEQBringSettingsToFront = Notification.Name("com.glasseq.bringSettingsToFront")
+}
+
+@MainActor
+public enum SettingsWindowFocus {
+    public static func request() {
+        NotificationCenter.default.post(name: .glassEQBringSettingsToFront, object: nil)
+    }
+}
+
+public struct SettingsView: View {
+    @Bindable var model: GlassEQSettingsViewModel
+    @State private var snapshot: SettingsSnapshot
+    @State private var tab = EditorSection.editor
+
+    public init(model: GlassEQSettingsViewModel) {
+        self._model = Bindable(wrappedValue: model)
+        _snapshot = State(initialValue: model.snapshot)
+    }
+
+    public var body: some View {
+        HStack(spacing: 0) {
+            ProfileSidebar(
+                profiles: snapshot.profiles,
+                mappedProfileID: snapshot.currentOutputMappedProfileID,
+                selectedProfileID: snapshot.selectedProfileID,
+                onSelect: selectProfile,
+                onCreateGraphic31: createGraphic31Profile,
+                onCreateGraphic10: createGraphic10Profile,
+                onCreateParametric: createParametricProfile,
+                onDuplicate: duplicateSelectedProfile,
+                onDelete: deleteSelectedProfile,
+                canDeleteSelectedProfile: canDeleteSelectedProfile
+            )
+                .frame(width: 260)
+
+            Divider()
+
+            ProfileDetail(
+                snapshot: snapshot,
+                draftProfile: $snapshot.draftProfile,
+                tab: $tab,
+                hasUnsavedDraft: hasUnsavedDraft,
+                onApply: applyDraft,
+                onRevert: revertDraft,
+                onUseForCurrentOutput: useDraftForCurrentOutput,
+                onSetFallback: setFallbackToDraft,
+                                onImport: importProfile,
+                                onPreview: previewDraft,
+                                onStopPreview: stopPreview,
+                                onResetDiagnostics: resetDiagnostics,
+                                onRetryAudioEngine: retryAudioEngine,
+                                onOpenPrivacySettings: openPrivacySettings
+                            )
+                .frame(minWidth: 640, maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .background(FinderStyleWindowConfigurator())
+        .overlay(alignment: .bottom) {
+            if let message = model.commandErrorMessage {
+                Text(message)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Color.macOSSystemRed)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color(nsColor: .controlBackgroundColor), in: .rect(cornerRadius: 8))
+                    .padding()
+            }
+        }
+        .onChange(of: model.snapshotVersion) { _, _ in
+            refreshSnapshotFromModel()
+        }
+        .onChange(of: model.isConnected) { _, _ in
+            refreshSnapshotFromModel()
+        }
+        .onAppear {
+            refreshSnapshotFromModel()
+            updateMetricsPolling()
+        }
+        .onDisappear {
+            stopMetricsPolling()
+        }
+        .onChange(of: tab) { _, _ in
+            updateMetricsPolling()
+        }
+    }
+
+    private var selectedProfile: EQProfile {
+        snapshot.profiles.first(where: { $0.id == snapshot.selectedProfileID }) ?? snapshot.draftProfile
+    }
+
+    private var hasUnsavedDraft: Bool {
+        snapshot.draftProfile != selectedProfile
+    }
+
+    private var canDeleteSelectedProfile: Bool {
+        snapshot.profiles.count > 1 && snapshot.selectedProfileID != snapshot.activeProfileID
+    }
+
+    private func selectProfile(_ id: UUID) {
+        guard let profile = snapshot.profiles.first(where: { $0.id == id }) else {
+            return
+        }
+        snapshot.selectedProfileID = id
+        snapshot.draftProfile = profile
+    }
+
+    private func applyDraft() {
+        perform(.applyProfile(snapshot.draftProfile))
+    }
+
+    private func revertDraft() {
+        snapshot.draftProfile = selectedProfile
+    }
+
+    private func useDraftForCurrentOutput() {
+        perform(.useProfileForCurrentOutput(snapshot.draftProfile))
+    }
+
+    private func setFallbackToDraft() {
+        perform(.setFallback(snapshot.draftProfile))
+    }
+
+    private func importProfile(format: ImportFormat, name: String, text: String) async -> Bool {
+        let response = await model.perform(.importProfile(format: format, name: name, text: text))
+        syncFromModel()
+        return response?.importSucceeded ?? false
+    }
+
+    private func previewDraft() {
+        perform(.preview(snapshot.draftProfile))
+    }
+
+    private func stopPreview() {
+        perform(.stopPreview)
+    }
+
+    private func resetDiagnostics() {
+        perform(.resetDiagnostics)
+    }
+
+    private func retryAudioEngine() {
+        perform(.retryAudioEngine)
+    }
+
+    private func openPrivacySettings() {
+        perform(.openPrivacySettings)
+    }
+
+    private func createGraphic31Profile() {
+        perform(.createProfile(.graphic31))
+    }
+
+    private func createGraphic10Profile() {
+        perform(.createProfile(.graphic10))
+    }
+
+    private func createParametricProfile() {
+        perform(.createProfile(.parametric))
+    }
+
+    private func duplicateSelectedProfile() {
+        perform(.duplicateProfile(snapshot.selectedProfileID))
+    }
+
+    private func deleteSelectedProfile() {
+        perform(.deleteProfile(snapshot.selectedProfileID))
+    }
+
+    private func syncFromModel() {
+        snapshot = model.snapshot
+    }
+
+    private func refreshMetricsFromModel() {
+        snapshot.metrics = model.snapshot.metrics
+    }
+
+    private func refreshSnapshotFromModel() {
+        let latest = model.snapshot
+
+        guard latest.profiles.contains(where: { $0.id == snapshot.selectedProfileID }) else {
+            snapshot = latest
+            return
+        }
+
+        let selectedProfileID = snapshot.selectedProfileID
+        let draftProfile = hasUnsavedDraft
+            ? snapshot.draftProfile
+            : latest.profiles.first(where: { $0.id == selectedProfileID }) ?? snapshot.draftProfile
+        snapshot = latest
+        snapshot.selectedProfileID = selectedProfileID
+        snapshot.draftProfile = draftProfile
+    }
+
+    private func updateMetricsPolling() {
+        if tab == .output {
+            perform(.startMetricsPolling)
+            refreshMetricsFromModel()
+        } else {
+            stopMetricsPolling()
+        }
+    }
+
+    private func stopMetricsPolling() {
+        perform(.stopMetricsPolling)
+    }
+
+    private func perform(_ command: SettingsCommand) {
+        Task { @MainActor in
+            await model.perform(command)
+            syncFromModel()
+        }
+    }
+}
+
+private struct FinderStyleWindowConfigurator: NSViewRepresentable {
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> FirstResponderSinkView {
+        let view = FirstResponderSinkView()
+        context.coordinator.view = view
+        context.coordinator.installObserver()
+        return view
+    }
+
+    func updateNSView(_ view: FirstResponderSinkView, context: Context) {
+        context.coordinator.view = view
+        DispatchQueue.main.async {
+            context.coordinator.configureWindowIfAvailable()
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        weak var view: FirstResponderSinkView?
+        private var didInitialFront = false
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        func installObserver() {
+            NotificationCenter.default.removeObserver(self, name: .glassEQBringSettingsToFront, object: nil)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(bringSettingsToFrontNotification),
+                name: .glassEQBringSettingsToFront,
+                object: nil
+            )
+        }
+
+        func configureWindowIfAvailable() {
+            guard let view, let window = view.window else {
+                return
+            }
+            window.isOpaque = true
+            window.backgroundColor = .windowBackgroundColor
+            window.titlebarAppearsTransparent = true
+            window.initialFirstResponder = view
+
+            guard !didInitialFront else {
+                return
+            }
+            didInitialFront = true
+            bringToFront()
+        }
+
+        @objc private func bringSettingsToFrontNotification() {
+            bringToFront()
+        }
+
+        private func bringToFront() {
+            guard let view, let window = view.window else {
+                return
+            }
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            window.makeFirstResponder(view)
+        }
+    }
+
+    final class FirstResponderSinkView: NSView {
+        override var acceptsFirstResponder: Bool {
+            true
+        }
+    }
+}
+
+private struct ActivePopoverButtonTint: ViewModifier {
+    var color: Color
+    var isActive: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isActive {
+            content
+                .buttonStyle(.borderedProminent)
+                .tint(color)
+        } else {
+            content
+        }
+    }
+}
+
+private struct GlassPanelModifier: ViewModifier {
+    var padding: CGFloat = 16
+    var cornerRadius: CGFloat = 16
+    var usesGlassEffect = false
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if usesGlassEffect {
+            content
+                .padding(padding)
+                .background(.regularMaterial, in: .rect(cornerRadius: cornerRadius))
+                .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+                .overlay(panelBorder)
+        } else {
+            content
+                .padding(padding)
+                .background(Color(nsColor: .controlBackgroundColor), in: .rect(cornerRadius: cornerRadius))
+                .overlay(panelBorder)
+        }
+    }
+
+    private var panelBorder: some View {
+        RoundedRectangle(cornerRadius: cornerRadius)
+            .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+    }
+}
+
+private extension View {
+    func glassPanel(padding: CGFloat = 16, cornerRadius: CGFloat = 16, usesGlassEffect: Bool = false) -> some View {
+        modifier(GlassPanelModifier(padding: padding, cornerRadius: cornerRadius, usesGlassEffect: usesGlassEffect))
+    }
+}
+
+private extension Color {
+    static let macOSSystemGreen = Color(nsColor: .systemGreen)
+    static let macOSSystemRed = Color(nsColor: .systemRed)
+    static let macOSSystemYellow = Color(nsColor: .systemYellow)
+}
+
+private struct SettingRow<Content: View>: View {
+    var title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 88, alignment: .leading)
+            content
+        }
+    }
+}
+
+private struct GraphLegendItem: View {
+    var color: Color
+    var title: String
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 7, height: 7)
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct EQAnalysisSignature: Equatable, Sendable {
+    var mode: EQMode
+    var channelMode: EQChannelMode
+    var preampDB: Double
+    var filters: [EQFilter]
+    var leftPreampDB: Double
+    var leftFilters: [EQFilter]
+    var rightPreampDB: Double
+    var rightFilters: [EQFilter]
+
+    init(profile: EQProfile) {
+        self.mode = profile.mode
+        self.channelMode = profile.channelMode
+        self.preampDB = profile.preampDB
+        self.filters = profile.filters
+        self.leftPreampDB = profile.leftPreampDB
+        self.leftFilters = profile.leftFilters
+        self.rightPreampDB = profile.rightPreampDB
+        self.rightFilters = profile.rightFilters
+    }
+}
+
+private struct EQAnalysisSnapshot: Equatable, Sendable {
+    var signature: EQAnalysisSignature
+    var channelMode: EQChannelMode
+    var recommendedPreampDB: Double
+    var linkedPoints: [FrequencyResponsePoint]
+    var leftPoints: [FrequencyResponsePoint]
+    var rightPoints: [FrequencyResponsePoint]
+
+    init(profile: EQProfile) {
+        self.signature = EQAnalysisSignature(profile: profile)
+        self.channelMode = profile.channelMode
+        self.recommendedPreampDB = EQProfileAnalysis.recommendedPreampDB(profile: profile)
+
+        switch profile.channelMode {
+        case .linked:
+            self.linkedPoints = FrequencyResponse.points(for: profile.filters, preampDB: profile.preampDB)
+            self.leftPoints = []
+            self.rightPoints = []
+        case .stereo:
+            self.linkedPoints = []
+            self.leftPoints = FrequencyResponse.points(for: profile.leftFilters, preampDB: profile.leftPreampDB)
+            self.rightPoints = FrequencyResponse.points(for: profile.rightFilters, preampDB: profile.rightPreampDB)
+        }
+    }
+
+    var accessibilitySummary: String {
+        switch channelMode {
+        case .linked:
+            return localized(
+                "Linked curve from \(localizedDecibels(minMagnitude(in: linkedPoints))) to \(localizedDecibels(maxMagnitude(in: linkedPoints))); recommended preamp \(localizedDecibels(recommendedPreampDB))"
+            )
+        case .stereo:
+            return localized(
+                "Left curve from \(localizedDecibels(minMagnitude(in: leftPoints))) to \(localizedDecibels(maxMagnitude(in: leftPoints))); right curve from \(localizedDecibels(minMagnitude(in: rightPoints))) to \(localizedDecibels(maxMagnitude(in: rightPoints))); recommended preamp \(localizedDecibels(recommendedPreampDB))"
+            )
+        }
+    }
+
+    private func minMagnitude(in points: [FrequencyResponsePoint]) -> Double {
+        points.map(\.magnitudeDB).min() ?? 0
+    }
+
+    private func maxMagnitude(in points: [FrequencyResponsePoint]) -> Double {
+        points.map(\.magnitudeDB).max() ?? 0
+    }
+}
+
+private struct ProfileSidebar: View {
+    var profiles: [EQProfile]
+    var mappedProfileID: UUID?
+    var selectedProfileID: UUID
+    var onSelect: (UUID) -> Void
+    var onCreateGraphic31: () -> Void
+    var onCreateGraphic10: () -> Void
+    var onCreateParametric: () -> Void
+    var onDuplicate: () -> Void
+    var onDelete: () -> Void
+    var canDeleteSelectedProfile: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text(localized("Profiles"))
+                .font(.title2.weight(.semibold))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding([.horizontal, .top])
+
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(profiles) { profile in
+                        Button {
+                            onSelect(profile.id)
+                        } label: {
+                            HStack {
+                                Text(profile.name)
+                                    .lineLimit(1)
+                                Spacer()
+                                if profile.id == mappedProfileID {
+                                    Image(systemName: "speaker.wave.2.fill")
+                                        .foregroundStyle(.secondary)
+                                        .accessibilityHidden(true)
+                                }
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(.rect)
+                            .background(
+                                profile.id == selectedProfileID
+                                    ? Color.accentColor.opacity(0.16)
+                                    : Color.clear,
+                                in: .rect(cornerRadius: 8)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityLabel(Text(profile.name))
+                        .accessibilityValue(Text(profileAccessibilityValue(profile)))
+                        .accessibilityHint(Text(localized("Selects this profile for editing")))
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 10)
+            }
+
+            Divider()
+
+            VStack(spacing: 10) {
+                HStack {
+                    Button {
+                        onCreateGraphic31()
+                    } label: {
+                        Image(systemName: "31.circle")
+                            .frame(width: 28, height: 28)
+                            .contentShape(.rect)
+                    }
+                    .help(localized("New 31-band profile"))
+                    .accessibilityLabel(Text(localized("New 31-band profile")))
+                    .accessibilityHint(Text(localized("Creates a 31-band graphic equalizer profile")))
+
+                    Button {
+                        onCreateGraphic10()
+                    } label: {
+                        Image(systemName: "10.circle")
+                            .frame(width: 28, height: 28)
+                            .contentShape(.rect)
+                    }
+                    .help(localized("New 10-band profile"))
+                    .accessibilityLabel(Text(localized("New 10-band profile")))
+                    .accessibilityHint(Text(localized("Creates a 10-band graphic equalizer profile")))
+
+                    Button {
+                        onCreateParametric()
+                    } label: {
+                        Image(systemName: "waveform.path.ecg")
+                            .frame(width: 28, height: 28)
+                            .contentShape(.rect)
+                    }
+                    .help(localized("New parametric profile"))
+                    .accessibilityLabel(Text(localized("New parametric profile")))
+                    .accessibilityHint(Text(localized("Creates a parametric equalizer profile")))
+
+                    Spacer()
+
+                    Button {
+                        onDuplicate()
+                    } label: {
+                        Image(systemName: "plus.square.on.square")
+                            .frame(width: 28, height: 28)
+                            .contentShape(.rect)
+                    }
+                    .help(localized("Duplicate profile"))
+                    .accessibilityLabel(Text(localized("Duplicate profile")))
+                    .accessibilityHint(Text(localized("Copies the selected profile")))
+
+                    Button(role: .destructive) {
+                        onDelete()
+                    } label: {
+                        Image(systemName: "trash")
+                            .frame(width: 28, height: 28)
+                            .contentShape(.rect)
+                    }
+                    .help(canDeleteSelectedProfile ? localized("Delete profile") : localized("Switch away from the active profile before deleting it"))
+                    .disabled(!canDeleteSelectedProfile)
+                    .opacity(canDeleteSelectedProfile ? 1 : 0.35)
+                    .accessibilityLabel(Text(localized("Delete profile")))
+                    .accessibilityValue(Text(canDeleteSelectedProfile ? localized("Available") : localized("Unavailable for active profile")))
+                    .accessibilityHint(Text(canDeleteSelectedProfile ? localized("Deletes the selected profile") : localized("Switch away from the active profile before deleting it")))
+                }
+                .buttonStyle(.borderless)
+            }
+            .padding(16)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func profileAccessibilityValue(_ profile: EQProfile) -> String {
+        var values: [String] = []
+        if profile.id == selectedProfileID {
+            values.append(localized("Selected"))
+        }
+        if profile.id == mappedProfileID {
+            values.append(localized("Mapped to current output"))
+        }
+        return values.isEmpty ? localized("Not selected") : values.joined(separator: ", ")
+    }
+}
+
+private struct ProfileDetail: View {
+    var snapshot: SettingsSnapshot
+    @Binding var draftProfile: EQProfile
+    @Binding var tab: EditorSection
+    var hasUnsavedDraft: Bool
+    var onApply: () -> Void
+    var onRevert: () -> Void
+    var onUseForCurrentOutput: () -> Void
+    var onSetFallback: () -> Void
+    var onImport: (ImportFormat, String, String) async -> Bool
+    var onPreview: () -> Void
+    var onStopPreview: () -> Void
+    var onResetDiagnostics: () -> Void
+    var onRetryAudioEngine: () -> Void
+    var onOpenPrivacySettings: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            constrainedContent {
+                ProfileHeader(
+                    snapshot: snapshot,
+                    draftProfile: $draftProfile,
+                    tab: $tab
+                )
+            }
+
+            ScrollView {
+                constrainedContent {
+                    Group {
+                        switch tab {
+                        case .editor:
+                            EditorTab(
+                                draftProfile: $draftProfile
+                            )
+                        case .importer:
+                            ImportTab(profile: draftProfile, onImport: onImport)
+                        case .output:
+                            OutputTab(
+                                snapshot: snapshot,
+                                onUseForCurrentOutput: onUseForCurrentOutput,
+                                onSetFallback: onSetFallback,
+                                onResetDiagnostics: onResetDiagnostics,
+                                onRetryAudioEngine: onRetryAudioEngine,
+                                onOpenPrivacySettings: onOpenPrivacySettings
+                            )
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.bottom, 4)
+                }
+            }
+            .scrollIndicators(.visible)
+
+            if tab == .editor {
+                constrainedContent {
+                    ApplyBar(
+                        hasUnsavedDraft: hasUnsavedDraft,
+                        currentOutputUID: snapshot.currentOutputUID,
+                        isPreviewing: snapshot.isPreviewing,
+                        onApply: onApply,
+                        onRevert: onRevert,
+                        onPreview: onPreview,
+                        onStopPreview: onStopPreview,
+                        onUseForCurrentOutput: onUseForCurrentOutput
+                    )
+                    .glassPanel(padding: 16, usesGlassEffect: false)
+                }
+            }
+        }
+        .padding(18)
+    }
+
+    private func constrainedContent<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        content()
+            .frame(maxWidth: 1180, alignment: .topLeading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+}
+
+private struct ProfileHeader: View {
+    var snapshot: SettingsSnapshot
+    @Binding var draftProfile: EQProfile
+    @Binding var tab: EditorSection
+    @State private var isRenaming = false
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 6) {
+                if isRenaming {
+                    HStack(spacing: 8) {
+                        TextField(localized("Profile name"), text: $draftProfile.name)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 280)
+                            .accessibilityLabel(Text(localized("Profile name")))
+                        Button(localized("Done")) {
+                            isRenaming = false
+                        }
+                        .controlSize(.large)
+                    }
+                } else {
+                    HStack(spacing: 6) {
+                        Text(draftProfile.name)
+                            .font(.title2.weight(.semibold))
+                            .lineLimit(1)
+                        Button {
+                            isRenaming = true
+                        } label: {
+                            Image(systemName: "pencil")
+                                .frame(width: 28, height: 28)
+                                .contentShape(.rect)
+                        }
+                        .buttonStyle(.borderless)
+                        .help(localized("Rename profile"))
+                        .accessibilityLabel(Text(localized("Rename profile")))
+                        .accessibilityHint(Text(localized("Edits the selected profile name")))
+                    }
+                }
+
+                Text(localized("\(draftProfile.mode.title) profile, \(snapshot.currentOutputName)"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .accessibilityLabel(Text(localized("Profile summary")))
+            }
+
+            Spacer()
+
+            Picker(localized("Section"), selection: $tab) {
+                ForEach(EditorSection.allCases) { section in
+                    Text(section.title).tag(section)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 320)
+            .accessibilityLabel(Text(localized("Section")))
+            .accessibilityValue(Text(tab.title))
+            .accessibilityHint(Text(localized("Switches between editor, import, and output details")))
+        }
+        .glassPanel(padding: 16)
+    }
+}
+
+private enum EditorSection: String, CaseIterable, Identifiable {
+    case editor
+    case importer
+    case output
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .editor:
+            localized("Editor")
+        case .importer:
+            localized("Import")
+        case .output:
+            localized("Output")
+        }
+    }
+}
+
+private enum EQEditChannel: String, CaseIterable, Identifiable {
+    case left
+    case right
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .left:
+            localized("Left")
+        case .right:
+            localized("Right")
+        }
+    }
+}
+
+private extension EQChannelMode {
+    var accessibilityTitle: String {
+        switch self {
+        case .linked:
+            localized("Linked")
+        case .stereo:
+            localized("Separate left and right")
+        }
+    }
+}
+
+private struct EditorTab: View {
+    @Binding var draftProfile: EQProfile
+    @State private var editChannel = EQEditChannel.left
+    @State private var analysis: EQAnalysisSnapshot
+    @State private var analysisTask: Task<Void, Never>?
+
+    init(draftProfile: Binding<EQProfile>) {
+        self._draftProfile = draftProfile
+        self._analysis = State(initialValue: EQAnalysisSnapshot(profile: draftProfile.wrappedValue))
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 14) {
+                SettingRow(title: localized("Profile type")) {
+                    Picker(localized("Profile type"), selection: Binding(
+                        get: { draftProfile.mode },
+                        set: { mode in
+                            draftProfile.mode = mode
+                            normalizeFilters(for: mode)
+                        }
+                    )) {
+                        ForEach(EQMode.allCases, id: \.self) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 300)
+                    .accessibilityLabel(Text(localized("Profile type")))
+                    .accessibilityValue(Text(draftProfile.mode.title))
+                    .accessibilityHint(Text(localized("Changes the equalizer profile type")))
+                }
+
+                SettingRow(title: localized("Channels")) {
+                    Picker(localized("Channels"), selection: Binding(
+                        get: { draftProfile.channelMode },
+                        set: { setChannelMode($0) }
+                    )) {
+                        Text(localized("Linked")).tag(EQChannelMode.linked)
+                        Text(localized("Separate L/R")).tag(EQChannelMode.stereo)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 230)
+                    .accessibilityLabel(Text(localized("Channels")))
+                    .accessibilityValue(Text(draftProfile.channelMode.accessibilityTitle))
+                    .accessibilityHint(Text(localized("Chooses whether channels share one EQ or use separate left and right settings")))
+                }
+
+                if draftProfile.channelMode == .stereo {
+                    SettingRow(title: localized("Editing")) {
+                        Picker(localized("Editing"), selection: $editChannel) {
+                            ForEach(EQEditChannel.allCases) { channel in
+                                Text(channel.title).tag(channel)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(maxWidth: 160)
+                        .accessibilityLabel(Text(localized("Editing channel")))
+                        .accessibilityValue(Text(editChannel.title))
+                        .accessibilityHint(Text(localized("Chooses which stereo channel is being edited")))
+                    }
+                }
+
+                SliderRow(
+                    title: localized("Preamp"),
+                    value: activePreampBinding,
+                    range: -24...12,
+                    step: 0.1,
+                    suffix: "dB"
+                )
+
+                    SettingRow(title: localized("Bypass")) {
+                    Toggle(localized("Bypass"), isOn: $draftProfile.isBypassed)
+                        .labelsHidden()
+                        .accessibilityLabel(Text(localized("Bypass")))
+                        .accessibilityValue(Text(draftProfile.isBypassed ? localized("On") : localized("Off")))
+                        .accessibilityHint(Text(localized("Turns equalizer processing off without changing settings")))
+                }
+
+                HeadroomRow(profile: $draftProfile, recommendedPreampDB: analysis.recommendedPreampDB)
+            }
+            .glassPanel(padding: 20, usesGlassEffect: false)
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text(localized("Frequency Response"))
+                        .font(.headline)
+                    Spacer()
+                    if draftProfile.channelMode == .stereo {
+                        GraphLegendItem(color: .blue, title: localized("Left"))
+                        GraphLegendItem(color: .orange, title: localized("Right"))
+                    }
+                }
+                FrequencyResponseGraph(analysis: analysis)
+                    .frame(height: 165)
+                    .accessibilityLabel(Text(localized("Frequency response graph")))
+                    .accessibilityValue(Text(analysis.accessibilitySummary))
+                    .accessibilityHint(Text(localized("Shows the estimated gain curve from 20 Hz to 20 kHz")))
+            }
+            .glassPanel(padding: 20, usesGlassEffect: false)
+
+            if draftProfile.mode == .parametric {
+                ParametricFilterEditor(filters: activeFiltersBinding)
+            } else {
+                GraphicFilterEditor(filters: activeFiltersBinding)
+                    .glassPanel(padding: 20, usesGlassEffect: false)
+            }
+
+        }
+        .onAppear {
+            refreshAnalysisIfNeeded(debounced: false)
+        }
+        .onChange(of: analysisSignature) { _, _ in
+            refreshAnalysisIfNeeded(debounced: true)
+        }
+        .onDisappear {
+            analysisTask?.cancel()
+        }
+    }
+
+    private var analysisSignature: EQAnalysisSignature {
+        EQAnalysisSignature(profile: draftProfile)
+    }
+
+    private func refreshAnalysisIfNeeded(debounced: Bool) {
+        let profile = draftProfile
+        let signature = EQAnalysisSignature(profile: profile)
+        guard analysis.signature != signature else {
+            return
+        }
+
+        analysisTask?.cancel()
+        let shouldDebounce = debounced
+            && analysis.signature.mode == signature.mode
+            && analysis.signature.channelMode == signature.channelMode
+        analysisTask = Task { @MainActor in
+            if shouldDebounce {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            guard !Task.isCancelled else {
+                return
+            }
+
+            let nextAnalysis = await Task.detached(priority: .userInitiated) {
+                EQAnalysisSnapshot(profile: profile)
+            }.value
+
+            guard !Task.isCancelled,
+                  EQAnalysisSignature(profile: draftProfile) == nextAnalysis.signature else {
+                return
+            }
+            analysis = nextAnalysis
+        }
+    }
+
+    private func normalizeFilters(for mode: EQMode) {
+        let filters: [EQFilter]
+        switch mode {
+        case .parametric:
+            filters = [EQFilter(kind: .peak, frequency: 1_000, gainDB: 0, q: 1)]
+        case .graphic10:
+            filters = GraphicEQBands.tenBand.map {
+                EQFilter(kind: .peak, frequency: $0, gainDB: 0, q: GraphicEQBands.graphicQ)
+            }
+        case .graphic31:
+            filters = GraphicEQBands.thirtyOneBand.map {
+                EQFilter(kind: .peak, frequency: $0, gainDB: 0, q: GraphicEQBands.graphicQ)
+            }
+        }
+        draftProfile.filters = filters
+        draftProfile.leftFilters = filters
+        draftProfile.rightFilters = filters
+    }
+
+    private var activePreampBinding: Binding<Double> {
+        switch (draftProfile.channelMode, editChannel) {
+        case (.stereo, .left):
+            $draftProfile.leftPreampDB
+        case (.stereo, .right):
+            $draftProfile.rightPreampDB
+        default:
+            $draftProfile.preampDB
+        }
+    }
+
+    private var activeFiltersBinding: Binding<[EQFilter]> {
+        switch (draftProfile.channelMode, editChannel) {
+        case (.stereo, .left):
+            $draftProfile.leftFilters
+        case (.stereo, .right):
+            $draftProfile.rightFilters
+        default:
+            $draftProfile.filters
+        }
+    }
+
+    private func setChannelMode(_ mode: EQChannelMode) {
+        guard mode != draftProfile.channelMode else {
+            return
+        }
+
+        switch mode {
+        case .linked:
+            let sourceFilters = editChannel == .right ? draftProfile.rightFilters : draftProfile.leftFilters
+            let sourcePreamp = editChannel == .right ? draftProfile.rightPreampDB : draftProfile.leftPreampDB
+            draftProfile.filters = sourceFilters
+            draftProfile.preampDB = sourcePreamp
+        case .stereo:
+            draftProfile.leftFilters = draftProfile.filters
+            draftProfile.rightFilters = draftProfile.filters
+            draftProfile.leftPreampDB = draftProfile.preampDB
+            draftProfile.rightPreampDB = draftProfile.preampDB
+            editChannel = .left
+        }
+
+        draftProfile.channelMode = mode
+    }
+}
+
+private struct ApplyBar: View {
+    var hasUnsavedDraft: Bool
+    var currentOutputUID: String
+    var isPreviewing: Bool
+    var onApply: () -> Void
+    var onRevert: () -> Void
+    var onPreview: () -> Void
+    var onStopPreview: () -> Void
+    var onUseForCurrentOutput: () -> Void
+
+    var body: some View {
+        HStack {
+            Text(hasUnsavedDraft ? localized("Unsaved changes") : localized("All changes saved"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(Text(localized("Profile edit state")))
+                .accessibilityValue(Text(hasUnsavedDraft ? localized("Unsaved changes") : localized("All changes saved")))
+            Spacer()
+            Button(localized("Revert")) {
+                onRevert()
+            }
+            .disabled(!hasUnsavedDraft)
+            .controlSize(.large)
+
+            Button(localized("Apply")) {
+                onApply()
+            }
+            .keyboardShortcut(.return, modifiers: .command)
+            .disabled(!hasUnsavedDraft)
+            .controlSize(.large)
+
+            Button(isPreviewing ? localized("Stop Preview") : localized("Preview")) {
+                isPreviewing ? onStopPreview() : onPreview()
+            }
+            .controlSize(.large)
+            .accessibilityValue(Text(isPreviewing ? localized("Previewing") : localized("Not previewing")))
+
+            Button(localized("Assign to current output")) {
+                onUseForCurrentOutput()
+            }
+            .disabled(currentOutputUID.isEmpty)
+            .controlSize(.large)
+            .accessibilityHint(Text(currentOutputUID.isEmpty ? localized("No current output is available") : localized("Maps the selected profile to the current output device")))
+        }
+    }
+}
+
+private struct HeadroomRow: View {
+    @Binding var profile: EQProfile
+    var recommendedPreampDB: Double
+
+    var body: some View {
+        let needsHeadroom = recommendedPreampDB < activePreamp - 0.1
+        HStack {
+            Text(localized("Headroom"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 88, alignment: .leading)
+            Text(needsHeadroom ? localized("Recommend \(localizedDecibels(recommendedPreampDB))") : localized("OK"))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(needsHeadroom ? Color.orange : Color.secondary)
+                .accessibilityLabel(Text(localized("Headroom")))
+                .accessibilityValue(Text(needsHeadroom ? localized("Recommend \(localizedDecibels(recommendedPreampDB))") : localized("OK")))
+            Spacer()
+            Button(localized("Apply")) {
+                apply(recommendedPreampDB)
+            }
+            .disabled(!needsHeadroom)
+            .controlSize(.large)
+            .accessibilityHint(Text(localized("Applies the recommended preamp to avoid clipping")))
+        }
+    }
+
+    private var activePreamp: Double {
+        switch profile.channelMode {
+        case .linked:
+            profile.preampDB
+        case .stereo:
+            max(profile.leftPreampDB, profile.rightPreampDB)
+        }
+    }
+
+    private func apply(_ value: Double) {
+        switch profile.channelMode {
+        case .linked:
+            profile.preampDB = value
+        case .stereo:
+            profile.leftPreampDB = min(profile.leftPreampDB, value)
+            profile.rightPreampDB = min(profile.rightPreampDB, value)
+        }
+    }
+}
+
+private struct FrequencyResponseGraph: View {
+    var analysis: EQAnalysisSnapshot
+
+    var body: some View {
+        Canvas { context, size in
+            let bounds = CGRect(origin: .zero, size: size)
+            let plotRect = bounds.insetBy(dx: 38, dy: 18).offsetBy(dx: 4, dy: -3)
+            context.fill(Path(bounds), with: .color(Color(nsColor: .controlBackgroundColor).opacity(0.55)))
+            drawGrid(context: context, rect: plotRect)
+            drawAxisLabels(context: context, rect: plotRect, bounds: bounds)
+
+            switch analysis.channelMode {
+            case .linked:
+                draw(points: analysis.linkedPoints, color: .accentColor, context: context, rect: plotRect)
+            case .stereo:
+                draw(points: analysis.leftPoints, color: .blue, context: context, rect: plotRect)
+                draw(points: analysis.rightPoints, color: .orange, context: context, rect: plotRect)
+            }
+        }
+        .clipShape(.rect(cornerRadius: 14))
+        .accessibilityElement(children: .ignore)
+    }
+
+    private func drawGrid(context: GraphicsContext, rect: CGRect) {
+        var path = Path()
+        for db in [-24.0, -12.0, -6.0, 0.0, 6.0, 12.0] {
+            let y = yPosition(for: db, in: rect)
+            path.move(to: CGPoint(x: rect.minX, y: y))
+            path.addLine(to: CGPoint(x: rect.maxX, y: y))
+        }
+        for frequency in [20.0, 100.0, 1_000.0, 10_000.0, 20_000.0] {
+            let x = xPosition(for: frequency, in: rect)
+            path.move(to: CGPoint(x: x, y: rect.minY))
+            path.addLine(to: CGPoint(x: x, y: rect.maxY))
+        }
+        context.stroke(path, with: .color(.secondary.opacity(0.25)), lineWidth: 1)
+
+        var zero = Path()
+        let zeroY = yPosition(for: 0, in: rect)
+        zero.move(to: CGPoint(x: rect.minX, y: zeroY))
+        zero.addLine(to: CGPoint(x: rect.maxX, y: zeroY))
+        context.stroke(zero, with: .color(.secondary.opacity(0.55)), lineWidth: 1.4)
+    }
+
+    private func drawAxisLabels(context: GraphicsContext, rect: CGRect, bounds: CGRect) {
+        for db in [12.0, 6.0, 0.0, -6.0, -12.0, -24.0] {
+            context.draw(
+                Text(db.dbAxisLabel)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary),
+                at: CGPoint(x: bounds.minX + 17, y: yPosition(for: db, in: rect)),
+                anchor: .center
+            )
+        }
+
+        for frequency in [20.0, 100.0, 1_000.0, 10_000.0, 20_000.0] {
+            context.draw(
+                Text(frequency.axisFrequencyLabel)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary),
+                at: CGPoint(x: xPosition(for: frequency, in: rect), y: bounds.maxY - 10),
+                anchor: .center
+            )
+        }
+    }
+
+    private func draw(points: [FrequencyResponsePoint], color: Color, context: GraphicsContext, rect: CGRect) {
+        guard points.count > 1 else {
+            return
+        }
+        let minDB = -24.0
+        let maxDB = 12.0
+        var path = Path()
+        for (index, point) in points.enumerated() {
+            let position = CGPoint(
+                x: xPosition(for: point.frequency, in: rect),
+                y: yPosition(for: min(max(point.magnitudeDB, minDB), maxDB), in: rect)
+            )
+            index == 0 ? path.move(to: position) : path.addLine(to: position)
+        }
+        context.stroke(path, with: .color(color), lineWidth: 2)
+    }
+
+    private func xPosition(for frequency: Double, in rect: CGRect) -> CGFloat {
+        let lower = log10(20.0)
+        let upper = log10(20_000.0)
+        let fraction = (log10(frequency) - lower) / (upper - lower)
+        return rect.minX + rect.width * fraction
+    }
+
+    private func yPosition(for magnitudeDB: Double, in rect: CGRect) -> CGFloat {
+        let minDB = -24.0
+        let maxDB = 12.0
+        let fraction = 1 - ((magnitudeDB - minDB) / (maxDB - minDB))
+        return rect.minY + rect.height * fraction
+    }
+}
+
+private struct GraphicFilterEditor: View {
+    @Binding var filters: [EQFilter]
+
+    var body: some View {
+        VStack(spacing: 10) {
+            ForEach($filters) { $filter in
+                HStack {
+                    Text(filter.frequency.frequencyLabel)
+                        .font(.caption.monospacedDigit())
+                        .frame(width: 64, alignment: .trailing)
+                    Slider(value: $filter.gainDB, in: -12...12, step: 0.1)
+                        .frame(maxWidth: 640)
+                        .accessibilityLabel(Text(localized("Gain at \(filter.frequency.frequencyLabel)")))
+                        .accessibilityValue(Text(filter.gainDB.dbLabel))
+                        .accessibilityHint(Text(localized("Adjusts this graphic EQ band")))
+                    Text(filter.gainDB.dbLabel)
+                        .font(.caption.monospacedDigit())
+                        .frame(width: 56, alignment: .trailing)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(Text(localized("Graphic filter row")))
+                .accessibilityValue(Text(localized("\(filter.frequency.frequencyLabel), \(filter.gainDB.dbLabel)")))
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct ParametricFilterEditor: View {
+    @Binding var filters: [EQFilter]
+    @State private var selectedFilterID: UUID?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text(localized("Filters"))
+                        .font(.headline)
+                    Button {
+                        let filter = EQFilter(kind: .peak, frequency: 1_000, gainDB: 0, q: 1)
+                        filters.append(filter)
+                        selectedFilterID = filter.id
+                    } label: {
+                        Label(localized("Add Filter"), systemImage: "plus")
+                            .frame(minHeight: 28)
+                            .contentShape(.rect)
+                    }
+                    .controlSize(.large)
+                    .accessibilityHint(Text(localized("Adds a new parametric filter and selects it")))
+                    Spacer()
+                }
+
+                FilterListHeader()
+
+                LazyVStack(spacing: 4) {
+                    ForEach(filters) { filter in
+                        CompactFilterRow(
+                            filter: filter,
+                            isSelected: filter.id == effectiveSelectedFilterID
+                        ) {
+                            selectedFilterID = filter.id
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            .frame(minWidth: 260, idealWidth: 320, maxWidth: 420)
+            .glassPanel(padding: 20, usesGlassEffect: false)
+
+            if let binding = selectedFilterBinding {
+                ParametricFilterInspector(
+                    filter: binding,
+                    onDelete: {
+                        let id = binding.wrappedValue.id
+                        filters.removeAll { $0.id == id }
+                        selectedFilterID = filters.first?.id
+                    }
+                )
+                .frame(minWidth: 260, maxWidth: .infinity, alignment: .topLeading)
+            } else {
+                ContentUnavailableView(localized("No Filter Selected"), systemImage: "slider.horizontal.3")
+                    .glassPanel(padding: 20, usesGlassEffect: false)
+                    .frame(maxWidth: .infinity, minHeight: 220)
+            }
+        }
+        .onChange(of: filters.map(\.id)) { _, _ in
+            selectedFilterID = effectiveSelectedFilterID
+        }
+    }
+
+    private var effectiveSelectedFilterID: UUID? {
+        if let selectedFilterID,
+           filters.contains(where: { $0.id == selectedFilterID }) {
+            return selectedFilterID
+        }
+        return filters.first?.id
+    }
+
+    private var selectedFilterBinding: Binding<EQFilter>? {
+        guard let id = effectiveSelectedFilterID,
+              let index = filters.firstIndex(where: { $0.id == id }) else {
+            return nil
+        }
+
+        return Binding(
+            get: { filters[index] },
+            set: { filters[index] = $0 }
+        )
+    }
+}
+
+private struct FilterListHeader: View {
+    var body: some View {
+        HStack {
+            Text("")
+                .frame(width: 20)
+            Text(localized("Type"))
+                .frame(width: 54, alignment: .leading)
+            Text(localized("Freq"))
+                .frame(width: 64, alignment: .trailing)
+            Text(localized("Gain"))
+                .frame(width: 64, alignment: .trailing)
+            Text(localized("Q"))
+                .frame(width: 46, alignment: .trailing)
+            Spacer()
+        }
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 10)
+    }
+}
+
+private struct CompactFilterRow: View {
+    var filter: EQFilter
+    var isSelected: Bool
+    var onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack {
+                Image(systemName: filter.isEnabled ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(filter.isEnabled ? Color.accentColor : Color.secondary)
+                    .frame(width: 20)
+                Text(filter.kind.shortTitle)
+                    .frame(width: 54, alignment: .leading)
+                Text(filter.frequency.frequencyLabel)
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 64, alignment: .trailing)
+                Text(filter.gainDB.dbLabel)
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 64, alignment: .trailing)
+                Text(qLabel)
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 46, alignment: .trailing)
+                Spacer()
+            }
+            .font(.caption)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(.rect)
+            .background(
+                isSelected
+                    ? Color.accentColor.opacity(0.22)
+                    : Color.primary.opacity(0.035),
+                in: .rect(cornerRadius: 8)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isSelected ? Color.accentColor.opacity(0.55) : Color.clear, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityLabel(Text(localized("Filter \(filter.kind.title)")))
+        .accessibilityValue(Text(accessibilityValue))
+        .accessibilityHint(Text(localized("Selects this filter for editing")))
+    }
+
+    private var qLabel: String {
+        localizedDecimal(filter.q, minimumFractionDigits: 2, maximumFractionDigits: 2)
+    }
+
+    private var accessibilityValue: String {
+        let state = filter.isEnabled ? localized("Enabled") : localized("Disabled")
+        let selection = isSelected ? localized("Selected") : localized("Not selected")
+        return localized("\(state), \(selection), \(filter.frequency.frequencyLabel), \(filter.gainDB.dbLabel), Q \(qLabel)")
+    }
+}
+
+private struct ParametricFilterInspector: View {
+    @Binding var filter: EQFilter
+    var onDelete: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                Text(localized("Selected Filter"))
+                    .font(.headline)
+                Toggle(localized("Enabled"), isOn: $filter.isEnabled)
+                    .toggleStyle(.switch)
+                    .accessibilityLabel(Text(localized("Filter enabled")))
+                    .accessibilityValue(Text(filter.isEnabled ? localized("On") : localized("Off")))
+                    .accessibilityHint(Text(localized("Includes or bypasses this filter")))
+                Spacer()
+                Button(role: .destructive) {
+                    onDelete()
+                } label: {
+                    Image(systemName: "trash")
+                        .frame(width: 28, height: 28)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(Text(localized("Delete filter")))
+                .accessibilityHint(Text(localized("Removes the selected filter")))
+            }
+
+            HStack {
+                Text(localized("Type"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 88, alignment: .leading)
+                Picker(localized("Type"), selection: $filter.kind) {
+                    ForEach(FilterKind.allCases, id: \.self) { kind in
+                        Text(kind.title).tag(kind)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 260)
+                .accessibilityLabel(Text(localized("Filter type")))
+                .accessibilityValue(Text(filter.kind.title))
+                .accessibilityHint(Text(localized("Changes the selected filter type")))
+            }
+
+            SliderRow(title: localized("Frequency"), value: $filter.frequency, range: 20...20_000, step: 1, suffix: "Hz")
+            SliderRow(title: localized("Gain"), value: $filter.gainDB, range: -24...24, step: 0.1, suffix: "dB")
+            SliderRow(title: localized("Q"), value: $filter.q, range: 0.1...10, step: 0.01, suffix: "")
+        }
+        .glassPanel(padding: 20, usesGlassEffect: false)
+    }
+}
+
+private struct SliderRow: View {
+    var title: String
+    @Binding var value: Double
+    var range: ClosedRange<Double>
+    var step: Double
+    var suffix: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 88, alignment: .leading)
+            Slider(value: $value, in: range, step: step)
+                .frame(minWidth: 80)
+                .frame(maxWidth: 640)
+                .accessibilityLabel(Text(title))
+                .accessibilityValue(Text(label))
+                .accessibilityHint(Text(localized("Adjusts \(title.lowercased())")))
+            Text(label)
+                .font(.caption.monospacedDigit())
+                .frame(width: 64, alignment: .trailing)
+        }
+    }
+
+    private var label: String {
+        if suffix == "Hz" {
+            return value.frequencyLabel
+        }
+        if suffix == "dB" {
+            return value.dbLabel
+        }
+        return localizedDecimal(value, minimumFractionDigits: 2, maximumFractionDigits: 2)
+    }
+}
+
+private struct ImportTab: View {
+    var profile: EQProfile
+    var onImport: (ImportFormat, String, String) async -> Bool
+    @State private var importFormat: ImportFormat
+    @State private var importName: String
+    @State private var importText: String
+    @State private var isEditorVisible = false
+    @State private var isImporting = false
+
+    init(profile: EQProfile, onImport: @escaping (ImportFormat, String, String) async -> Bool) {
+        self.profile = profile
+        self.onImport = onImport
+        _importFormat = State(initialValue: .autoEQ)
+        _importName = State(initialValue: localized("Imported Profile"))
+        _importText = State(initialValue: "")
+    }
+
+    var body: some View {
+        VStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(localized("Import / Export"))
+                    .font(.headline)
+                Picker(localized("Format"), selection: $importFormat) {
+                    ForEach(ImportFormat.allCases) { format in
+                        Text(format.rawValue).tag(format)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                TextField(localized("Profile Name"), text: $importName)
+            }
+            .glassPanel()
+
+            if isEditorVisible {
+                TextEditor(text: $importText)
+                    .font(.system(.body, design: .monospaced))
+                    .scrollContentBackground(.hidden)
+                    .padding(10)
+                    .frame(minHeight: 280)
+                    .background(Color(nsColor: .textBackgroundColor).opacity(0.72), in: .rect(cornerRadius: 14))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                    )
+            } else {
+                HStack {
+                    Button {
+                        isEditorVisible = true
+                    } label: {
+                        Label(localized("Open Import Editor"), systemImage: "text.alignleft")
+                            .frame(minHeight: 28)
+                            .contentShape(.rect)
+                    }
+                    .controlSize(.large)
+                    Spacer()
+                }
+                .glassPanel(padding: 12)
+            }
+
+            HStack {
+                Button {
+                    importText = EQProfileTextExporter.exportEqualizerAPO(profile)
+                    importName = profile.name
+                    importFormat = .autoEQ
+                    isEditorVisible = true
+                } label: {
+                    Label(localized("Export Current"), systemImage: "square.and.arrow.up")
+                        .frame(minHeight: 28)
+                        .contentShape(.rect)
+                }
+                .controlSize(.large)
+
+                Spacer()
+                if isEditorVisible {
+                    Button(localized("Clear")) {
+                        importText = ""
+                        isEditorVisible = false
+                    }
+                    .disabled(importText.isEmpty || isImporting)
+                    .controlSize(.large)
+                }
+                Button {
+                    let format = importFormat
+                    let name = importName
+                    let text = importText
+                    isImporting = true
+                    Task {
+                        let imported = await onImport(format, name, text)
+                        await MainActor.run {
+                            if imported {
+                                importText = ""
+                                isEditorVisible = false
+                            }
+                            isImporting = false
+                        }
+                    }
+                } label: {
+                    Label(isImporting ? localized("Importing") : localized("Import"), systemImage: "square.and.arrow.down")
+                        .frame(minHeight: 28)
+                        .contentShape(.rect)
+                }
+                .disabled(!isEditorVisible || importText.isEmpty || isImporting)
+                .controlSize(.large)
+            }
+            .glassPanel(padding: 12)
+        }
+    }
+}
+
+private struct OutputTab: View {
+    var snapshot: SettingsSnapshot
+    var onUseForCurrentOutput: () -> Void
+    var onSetFallback: () -> Void
+    var onResetDiagnostics: () -> Void
+    var onRetryAudioEngine: () -> Void
+    var onOpenPrivacySettings: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 16) {
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(localized("Current Output"))
+                        .font(.headline)
+                    Text(snapshot.currentOutputName)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
+                    LabeledContent(localized("UID"), value: snapshot.currentOutputUID)
+                    LabeledContent(localized("Sample Rate"), value: sampleRateLabel)
+                    LabeledContent(localized("Channels"), value: localizedInteger(snapshot.currentOutputChannelCount))
+                    LabeledContent(localized("Buffer"), value: localizedFrameCount(snapshot.currentOutputBufferFrameSize))
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .glassPanel(padding: 20, usesGlassEffect: false)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(localized("Profile Mapping"))
+                        .font(.headline)
+                    LabeledContent(localized("Mapped Profile"), value: mappedProfileName)
+                    HStack {
+                        Button(localized("Use selected profile for this output")) {
+                            onUseForCurrentOutput()
+                        }
+                        .disabled(snapshot.currentOutputUID.isEmpty)
+                        .controlSize(.large)
+
+                        Button(localized("Set as fallback profile")) {
+                            onSetFallback()
+                        }
+                        .controlSize(.large)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .glassPanel(padding: 20, usesGlassEffect: false)
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(localized("Engine Status"))
+                        .font(.headline)
+                    LabeledContent(localized("Status"), value: snapshot.statusMessage)
+                    LabeledContent(localized("Active Profile"), value: snapshot.activeProfileName)
+                    HStack {
+                        Button(localized("Retry audio engine")) {
+                            onRetryAudioEngine()
+                        }
+                        .controlSize(.large)
+
+                        Button(localized("Open Privacy Settings")) {
+                            onOpenPrivacySettings()
+                        }
+                        .controlSize(.large)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .glassPanel(padding: 20, usesGlassEffect: false)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text(localized("Diagnostics"))
+                            .font(.headline)
+                        Spacer()
+                        Button(localized("Reset")) {
+                            onResetDiagnostics()
+                        }
+                        .controlSize(.large)
+                    }
+                    LabeledContent(localized("Captured"), value: localizedInteger(snapshot.metrics.capturedFrames))
+                    LabeledContent(localized("Played"), value: localizedInteger(snapshot.metrics.playedFrames))
+                    LabeledContent(localized("Underruns"), value: localizedInteger(snapshot.metrics.playbackUnderrunFrames))
+                    LabeledContent(localized("Saturated Samples"), value: localizedInteger(snapshot.metrics.saturatedSamples))
+                    LabeledContent(localized("Buffered"), value: localizedFrameCount(snapshot.metrics.currentBufferedFrames))
+                    LabeledContent(localized("Peak Buffer"), value: localizedFrameCount(snapshot.metrics.maxBufferedFrames))
+                    LabeledContent(localized("Added Latency"), value: averageAddedLatencyLabel)
+                    LabeledContent(localized("Latency Range"), value: addedLatencyRangeLabel)
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .glassPanel(padding: 20, usesGlassEffect: false)
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private var mappedProfileName: String {
+        guard let profileID = snapshot.currentOutputMappedProfileID,
+              let profile = snapshot.profiles.first(where: { $0.id == profileID }) else {
+            return localized("Fallback")
+        }
+        return profile.name
+    }
+
+    private var sampleRateLabel: String {
+        guard snapshot.currentOutputSampleRate > 0 else {
+            return localized("Unknown")
+        }
+        return localizedFrequency(snapshot.currentOutputSampleRate)
+    }
+
+    private var averageAddedLatencyLabel: String {
+        guard snapshot.metrics.playbackBufferObservations > 0 else {
+            return "No samples"
+        }
+        return formatLatency(milliseconds: framesToMilliseconds(snapshot.metrics.averagePlaybackBufferedFrames))
+    }
+
+    private var addedLatencyRangeLabel: String {
+        guard snapshot.metrics.playbackBufferObservations > 0 else {
+            return "No samples"
+        }
+        let minimum = formatLatency(milliseconds: framesToMilliseconds(Double(snapshot.metrics.minimumPlaybackBufferedFrames)))
+        let maximum = formatLatency(milliseconds: framesToMilliseconds(Double(snapshot.metrics.maxBufferedFrames)))
+        return "\(minimum)-\(maximum)"
+    }
+
+    private func framesToMilliseconds(_ frames: Double) -> Double {
+        guard snapshot.currentOutputSampleRate > 0 else {
+            return 0
+        }
+        return frames / snapshot.currentOutputSampleRate * 1_000
+    }
+
+    private func formatLatency(milliseconds: Double) -> String {
+        localizedLatency(milliseconds: milliseconds)
+    }
+}
+
+private extension EQMode {
+    var title: String {
+        switch self {
+        case .parametric:
+            localized("Parametric")
+        case .graphic10:
+            localized("10-Band")
+        case .graphic31:
+            localized("31-Band")
+        }
+    }
+}
+
+private extension FilterKind {
+    var title: String {
+        switch self {
+        case .peak:
+            localized("Peak")
+        case .lowShelf:
+            localized("Low Shelf")
+        case .highShelf:
+            localized("High Shelf")
+        case .highPass:
+            localized("High Pass")
+        case .lowPass:
+            localized("Low Pass")
+        }
+    }
+
+    var shortTitle: String {
+        switch self {
+        case .peak:
+            localized("Peak")
+        case .lowShelf:
+            localized("Low")
+        case .highShelf:
+            localized("High")
+        case .highPass:
+            "HP"
+        case .lowPass:
+            "LP"
+        }
+    }
+}
+
+private extension Double {
+    var dbLabel: String {
+        localizedDecibels(self)
+    }
+
+    var frequencyLabel: String {
+        localizedFrequency(self)
+    }
+
+    var axisFrequencyLabel: String {
+        if self >= 1_000 {
+            return localized("\(localizedDecimal(self / 1_000, minimumFractionDigits: 0, maximumFractionDigits: 0)) kHz")
+        }
+        return localized("\(localizedDecimal(self, minimumFractionDigits: 0, maximumFractionDigits: 0)) Hz")
+    }
+
+    var dbAxisLabel: String {
+        localizedDecimal(self, minimumFractionDigits: 0, maximumFractionDigits: 0, signed: self > 0)
+    }
+}

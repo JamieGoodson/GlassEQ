@@ -12,7 +12,9 @@ let package = Package(
         .library(name: "GlassEQCore", targets: ["GlassEQCore"]),
         .library(name: "GlassEQAudio", targets: ["GlassEQAudio"]),
         .library(name: "GlassEQSettingsIPC", targets: ["GlassEQSettingsIPC"]),
-        .executable(name: "GlassEQ", targets: ["GlassEQApp"])
+        .library(name: "GlassEQSettingsUI", targets: ["GlassEQSettingsUI"]),
+        .executable(name: "GlassEQ", targets: ["GlassEQApp"]),
+        .executable(name: "GlassEQSettings", targets: ["GlassEQSettings"])
     ],
     targets: [
         .target(
@@ -28,6 +30,21 @@ let package = Package(
         .target(
             name: "GlassEQSettingsIPC",
             dependencies: ["GlassEQCore"]
+        ),
+        .target(
+            name: "GlassEQSettingsUI",
+            dependencies: [
+                "GlassEQCore",
+                "GlassEQSettingsIPC"
+            ],
+            resources: [
+                .process("Resources")
+            ],
+            linkerSettings: [
+                .linkedFramework("SwiftUI"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("Security")
+            ]
         ),
         .executableTarget(
             name: "GlassEQApp",
@@ -48,6 +65,20 @@ let package = Package(
                 .linkedFramework("Security")
             ]
         ),
+        .executableTarget(
+            name: "GlassEQSettings",
+            dependencies: [
+                "GlassEQSettingsIPC",
+                "GlassEQSettingsUI"
+            ],
+            exclude: [
+                "Info.plist"
+            ],
+            linkerSettings: [
+                .linkedFramework("SwiftUI"),
+                .linkedFramework("AppKit")
+            ]
+        ),
         .testTarget(
             name: "GlassEQCoreTests",
             dependencies: ["GlassEQCore"]
@@ -65,6 +96,14 @@ let package = Package(
                 "GlassEQApp",
                 "GlassEQAudio",
                 "GlassEQCore",
+                "GlassEQSettingsIPC"
+            ]
+        ),
+        .testTarget(
+            name: "GlassEQSettingsIPCTests",
+            dependencies: [
+                "GlassEQCore",
+                "GlassEQSettings",
                 "GlassEQSettingsIPC"
             ]
         )
