@@ -2,6 +2,12 @@
 
 GlassEQ is a native macOS 26 system-output equalizer prototype written in Swift 6.
 
+## Download Current Alpha
+
+Download `GlassEQ-alpha-0.6-macos26-arm64.zip` from the [alpha-0.6 release](https://github.com/juhokoskela/GlassEQ/releases/tag/alpha-0.6).
+
+Unzip it, move `GlassEQ.app` to `/Applications`, then open it from Finder. If macOS blocks the first launch, open System Settings > Privacy & Security and allow GlassEQ to open.
+
 ## Alpha Status
 
 Current alpha builds are for technical testers only. They are ad hoc-signed, not Developer ID signed, not notarized, Apple Silicon only, and tested only on macOS 26.
