@@ -10,7 +10,9 @@ let package = Package(
     ],
     products: [
         .library(name: "GlassEQCore", targets: ["GlassEQCore"]),
-        .library(name: "GlassEQAudio", targets: ["GlassEQAudio"])
+        .library(name: "GlassEQAudio", targets: ["GlassEQAudio"]),
+        .library(name: "GlassEQSettingsIPC", targets: ["GlassEQSettingsIPC"]),
+        .executable(name: "GlassEQ", targets: ["GlassEQApp"])
     ],
     targets: [
         .target(
@@ -23,6 +25,29 @@ let package = Package(
                 .linkedFramework("CoreAudio")
             ]
         ),
+        .target(
+            name: "GlassEQSettingsIPC",
+            dependencies: ["GlassEQCore"]
+        ),
+        .executableTarget(
+            name: "GlassEQApp",
+            dependencies: [
+                "GlassEQCore",
+                "GlassEQAudio",
+                "GlassEQSettingsIPC"
+            ],
+            exclude: [
+                "Info.plist"
+            ],
+            resources: [
+                .process("Resources")
+            ],
+            linkerSettings: [
+                .linkedFramework("SwiftUI"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("Security")
+            ]
+        ),
         .testTarget(
             name: "GlassEQCoreTests",
             dependencies: ["GlassEQCore"]
@@ -32,6 +57,15 @@ let package = Package(
             dependencies: [
                 "GlassEQAudio",
                 "GlassEQCore"
+            ]
+        ),
+        .testTarget(
+            name: "GlassEQAppTests",
+            dependencies: [
+                "GlassEQApp",
+                "GlassEQAudio",
+                "GlassEQCore",
+                "GlassEQSettingsIPC"
             ]
         )
     ],
