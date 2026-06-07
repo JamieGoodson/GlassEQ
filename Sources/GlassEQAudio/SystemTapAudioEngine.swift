@@ -16,9 +16,12 @@ public struct AudioEngineMetrics: Equatable, Sendable {
     public var saturatedSamples: UInt64
     public var currentBufferedFrames: Int
     public var maxBufferedFrames: Int
+    public var maximumPlaybackBufferedFrames: Int
     public var minimumPlaybackBufferedFrames: Int
     public var averagePlaybackBufferedFrames: Double
     public var playbackBufferObservations: UInt64
+    public var maximumCaptureCallbackFrames: Int
+    public var maximumPlaybackCallbackFrames: Int
 
     public init(
         capturedFrames: UInt64 = 0,
@@ -27,9 +30,12 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         saturatedSamples: UInt64 = 0,
         currentBufferedFrames: Int = 0,
         maxBufferedFrames: Int = 0,
+        maximumPlaybackBufferedFrames: Int = 0,
         minimumPlaybackBufferedFrames: Int = 0,
         averagePlaybackBufferedFrames: Double = 0,
-        playbackBufferObservations: UInt64 = 0
+        playbackBufferObservations: UInt64 = 0,
+        maximumCaptureCallbackFrames: Int = 0,
+        maximumPlaybackCallbackFrames: Int = 0
     ) {
         self.capturedFrames = capturedFrames
         self.playedFrames = playedFrames
@@ -37,9 +43,24 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         self.saturatedSamples = saturatedSamples
         self.currentBufferedFrames = currentBufferedFrames
         self.maxBufferedFrames = maxBufferedFrames
+        self.maximumPlaybackBufferedFrames = maximumPlaybackBufferedFrames
         self.minimumPlaybackBufferedFrames = minimumPlaybackBufferedFrames
         self.averagePlaybackBufferedFrames = averagePlaybackBufferedFrames
         self.playbackBufferObservations = playbackBufferObservations
+        self.maximumCaptureCallbackFrames = maximumCaptureCallbackFrames
+        self.maximumPlaybackCallbackFrames = maximumPlaybackCallbackFrames
+    }
+}
+
+protocol TopologyRebuildMuteGuarding: AnyObject {
+    func release()
+}
+
+struct TopologyRebuildMuteGuardUnavailable: Error, LocalizedError {
+    var underlyingError: any Error
+
+    var errorDescription: String? {
+        "GlassEQ could not guarantee silence for a profile rebuild, so the current audio engine was left running."
     }
 }
 
@@ -47,29 +68,80 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     private static let preferredBufferFrameSize: UInt32 = 256
     private static let preferredBluetoothBufferFrameSize: UInt32 = 512
     private static let preferredLowSampleRateBufferFrameSize: UInt32 = 1024
+    private static let preferredCaptureBufferFrameSize: UInt32 = 256
     private static let minimumRingBufferFrames = 2048
-    private static let minimumLowSampleRateRingBufferFrames = 2048
     private static let maximumRuntimeBufferFrameSize: UInt32 = 1024
-    private static let maximumPlaybackPrimeFrames = 1024
+    private static let preferredPlaybackPrimeFrames = 512
     private static let lowSampleRateThreshold = 24_000.0
 
     private struct ControlState {
         var state: AudioEngineState = .stopped
         var status: AudioEngineStatus = .stopped
+        // Persistent capture half (one global muted tap, kept alive across output switches).
         var tapID = AudioObjectID(kAudioObjectUnknown)
         var aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
         var captureIOProcID: AudioDeviceIOProcID?
+        var runtime: AudioRuntime?
+        var tapSampleRate: Double = 0
+        var tapChannelCount: Int = 0
+        var captureRunning = false
+        // Swappable output half (rebuilt per output device; device forced to the tap rate).
         var outputIOProcID: AudioDeviceIOProcID?
         var activeOutput: AudioOutputDevice?
         var activeProfile: EQProfile?
-        var bufferFrameSizeRestoration: BufferFrameSizeRestoration?
-        var runtime: AudioRuntime?
+        var bufferFrameSizeRestorations: [String: BufferFrameSizeRestoration] = [:]
+        var sampleRateRestorations: [String: SampleRateRestoration] = [:]
     }
 
-    private struct BufferFrameSizeRestoration: Sendable {
-        var deviceID: AudioObjectID
+    struct BufferFrameSizeRestoration: Equatable, Sendable {
         var uid: String
         var originalFrameSize: UInt32
+    }
+
+    struct SampleRateRestoration: Equatable, Sendable {
+        var uid: String
+        var originalSampleRate: Double
+    }
+
+    private final class CoreAudioTopologyRebuildMuteGuard: TopologyRebuildMuteGuarding, @unchecked Sendable {
+        private let lock = NSLock()
+        private var tapID: AudioObjectID
+        private var aggregateDeviceID: AudioObjectID
+        private var ioProcID: AudioDeviceIOProcID?
+
+        init(
+            tapID: AudioObjectID,
+            aggregateDeviceID: AudioObjectID,
+            ioProcID: AudioDeviceIOProcID?
+        ) {
+            self.tapID = tapID
+            self.aggregateDeviceID = aggregateDeviceID
+            self.ioProcID = ioProcID
+        }
+
+        deinit {
+            release()
+        }
+
+        func release() {
+            lock.lock()
+            defer { lock.unlock() }
+
+            if aggregateDeviceID != kAudioObjectUnknown, let ioProcID {
+                _ = AudioDeviceStop(aggregateDeviceID, ioProcID)
+                _ = AudioDeviceDestroyIOProcID(aggregateDeviceID, ioProcID)
+            }
+            if aggregateDeviceID != kAudioObjectUnknown {
+                _ = AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
+            }
+            if tapID != kAudioObjectUnknown {
+                _ = AudioHardwareDestroyProcessTap(tapID)
+            }
+
+            ioProcID = nil
+            aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
+            tapID = AudioObjectID(kAudioObjectUnknown)
+        }
     }
 
     private final class PreparedDSPConfigBox: @unchecked Sendable {
@@ -84,6 +156,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     private final class AudioRuntime: @unchecked Sendable {
         let ringBuffer: RealtimeAudioRingBuffer
         let channelCount: Int
+        let sampleRate: Double
         private let playbackPrimeFrames: Int
         private let maxCallbackFrames: Int
         private var processor: EQProcessor
@@ -95,12 +168,16 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         private let playbackUnderrunFrames = Atomic<UInt64>(0)
         private let saturatedSamples = Atomic<UInt64>(0)
         private let maxBufferedFrames = Atomic<Int>(0)
+        private let maxPlaybackBufferedFrames = Atomic<Int>(0)
         private let minPlaybackBufferedFrames = Atomic<Int>(Int.max)
         private let totalPlaybackBufferedFrames = Atomic<UInt64>(0)
         private let playbackBufferObservations = Atomic<UInt64>(0)
+        private let maxCaptureCallbackFrames = Atomic<Int>(0)
+        private let maxPlaybackCallbackFrames = Atomic<Int>(0)
         private let bypassEnabled: Atomic<Bool>
         private let playbackPriming = Atomic<Bool>(true)
         private let outputMutedForTransition = Atomic<Bool>(false)
+        private let pendingPlaybackReset = Atomic<Bool>(false)
         private let pendingDSPConfigPointer = Atomic<UInt>(0)
         private let retiredDSPConfigHeadPointer = Atomic<UInt>(0)
         private let stopping = Atomic<Bool>(false)
@@ -116,6 +193,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             playbackPrimeFrames: Int
         ) {
             self.channelCount = max(channelCount, 1)
+            self.sampleRate = sampleRate
             self.ringBuffer = RealtimeAudioRingBuffer(
                 channelCount: self.channelCount,
                 capacityFrames: ringCapacityFrames
@@ -140,8 +218,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
         func markStopping() {
             stopping.store(true, ordering: .releasing)
-            outputMutedForTransition.store(true, ordering: .relaxed)
-            playbackPriming.store(true, ordering: .relaxed)
+            outputMutedForTransition.store(true, ordering: .releasing)
+            playbackPriming.store(true, ordering: .releasing)
         }
 
         func setBypassed(_ isBypassed: Bool) {
@@ -149,8 +227,17 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
 
         func muteOutputForTransition() {
-            outputMutedForTransition.store(true, ordering: .relaxed)
-            playbackPriming.store(true, ordering: .relaxed)
+            outputMutedForTransition.store(true, ordering: .releasing)
+            playbackPriming.store(true, ordering: .releasing)
+        }
+
+        // Called when a new output half is started. Clears any transition mute (the runtime
+        // persists across output switches now, so the mute flag would otherwise stick on and
+        // silence everything) and re-primes so playback re-anchors to the freshest audio.
+        func reprimePlayback() {
+            pendingPlaybackReset.store(true, ordering: .releasing)
+            playbackPriming.store(true, ordering: .releasing)
+            outputMutedForTransition.store(false, ordering: .releasing)
         }
 
         func resetMetrics() {
@@ -159,10 +246,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             playbackUnderrunFrames.store(0, ordering: .relaxed)
             saturatedSamples.store(0, ordering: .relaxed)
             maxBufferedFrames.store(0, ordering: .relaxed)
+            maxPlaybackBufferedFrames.store(0, ordering: .relaxed)
             minPlaybackBufferedFrames.store(Int.max, ordering: .relaxed)
             totalPlaybackBufferedFrames.store(0, ordering: .relaxed)
             playbackBufferObservations.store(0, ordering: .relaxed)
-            playbackPriming.store(true, ordering: .relaxed)
+            maxCaptureCallbackFrames.store(0, ordering: .relaxed)
+            maxPlaybackCallbackFrames.store(0, ordering: .relaxed)
+            playbackPriming.store(true, ordering: .releasing)
         }
 
         func snapshotMetrics() -> AudioEngineMetrics {
@@ -175,11 +265,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 saturatedSamples: saturatedSamples.load(ordering: .relaxed),
                 currentBufferedFrames: ringBuffer.occupancyFrames(),
                 maxBufferedFrames: maxBufferedFrames.load(ordering: .relaxed),
+                maximumPlaybackBufferedFrames: maxPlaybackBufferedFrames.load(ordering: .relaxed),
                 minimumPlaybackBufferedFrames: observations == 0 ? 0 : minimumBufferedFrames,
                 averagePlaybackBufferedFrames: observations == 0
                     ? 0
                     : Double(totalPlaybackBufferedFrames.load(ordering: .relaxed)) / Double(observations),
-                playbackBufferObservations: observations
+                playbackBufferObservations: observations,
+                maximumCaptureCallbackFrames: maxCaptureCallbackFrames.load(ordering: .relaxed),
+                maximumPlaybackCallbackFrames: maxPlaybackCallbackFrames.load(ordering: .relaxed)
             )
         }
 
@@ -219,8 +312,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                   frameCount > 0 else {
                 return
             }
+            updateMax(maxCaptureCallbackFrames, frameCount)
 
-            if outputMutedForTransition.load(ordering: .relaxed) {
+            if outputMutedForTransition.load(ordering: .acquiring) {
                 return
             }
 
@@ -290,13 +384,18 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             guard frameCount > 0 else {
                 return
             }
+            updateMax(maxPlaybackCallbackFrames, frameCount)
 
-            if outputMutedForTransition.load(ordering: .relaxed) {
+            if pendingPlaybackReset.exchange(false, ordering: .acquiringAndReleasing) {
+                _ = ringBuffer.reset()
+            }
+
+            if outputMutedForTransition.load(ordering: .acquiring) {
                 clear(outputData: outputData)
                 return
             }
 
-            if playbackPriming.load(ordering: .relaxed) {
+            if playbackPriming.load(ordering: .acquiring) {
                 let bufferedFrames = ringBuffer.occupancyFrames()
                 updateMaxBufferedFrames(bufferedFrames)
                 guard bufferedFrames >= playbackPrimeFrames else {
@@ -307,7 +406,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                     clear(outputData: outputData)
                     return
                 }
-                playbackPriming.store(false, ordering: .relaxed)
+                playbackPriming.store(false, ordering: .releasing)
             }
 
             recordPlaybackBufferedFrames(ringBuffer.occupancyFrames())
@@ -359,7 +458,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
             if underrunFrames > 0 {
                 playbackUnderrunFrames.wrappingAdd(UInt64(underrunFrames), ordering: .relaxed)
-                playbackPriming.store(true, ordering: .relaxed)
+                playbackPriming.store(true, ordering: .releasing)
             }
             updateMaxBufferedFrames(ringBuffer.occupancyFrames())
             playedFrames.wrappingAdd(UInt64(frameCount), ordering: .relaxed)
@@ -462,11 +561,15 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
 
         private func updateMaxBufferedFrames(_ occupancy: Int) {
-            var current = maxBufferedFrames.load(ordering: .relaxed)
-            while occupancy > current {
-                let result = maxBufferedFrames.compareExchange(
+            updateMax(maxBufferedFrames, occupancy)
+        }
+
+        private func updateMax(_ counter: borrowing Atomic<Int>, _ value: Int) {
+            var current = counter.load(ordering: .relaxed)
+            while value > current {
+                let result = counter.compareExchange(
                     expected: current,
-                    desired: occupancy,
+                    desired: value,
                     ordering: .relaxed
                 )
                 if result.exchanged {
@@ -479,6 +582,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         private func recordPlaybackBufferedFrames(_ frames: Int) {
             totalPlaybackBufferedFrames.wrappingAdd(UInt64(max(frames, 0)), ordering: .relaxed)
             playbackBufferObservations.wrappingAdd(1, ordering: .relaxed)
+            updateMax(maxPlaybackBufferedFrames, frames)
 
             var current = minPlaybackBufferedFrames.load(ordering: .relaxed)
             while frames < current {
@@ -653,6 +757,24 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             let sourceChannelCount = max(sourceChannelCount, 1)
             if buffers.count == 1,
                let data = buffers[0].mData?.assumingMemoryBound(to: Float.self),
+               Int(buffers[0].mNumberChannels) == 1,
+               sourceChannelCount > 1,
+               frameCount > 0,
+               sourceFrameOffset >= 0,
+               destinationFrameOffset >= 0 {
+                let destinationSamples = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.stride
+                for frameIndex in 0..<frameCount where destinationFrameOffset + frameIndex < destinationSamples {
+                    data[destinationFrameOffset + frameIndex] = SystemTapAudioEngine.monoDownmix(
+                        samples,
+                        frame: sourceFrameOffset + frameIndex,
+                        sourceChannelCount: sourceChannelCount
+                    )
+                }
+                return
+            }
+
+            if buffers.count == 1,
+               let data = buffers[0].mData?.assumingMemoryBound(to: Float.self),
                Int(buffers[0].mNumberChannels) == sourceChannelCount,
                frameCount > 0,
                sourceFrameOffset >= 0,
@@ -713,55 +835,28 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     public func start(output: AudioOutputDevice, profile: EQProfile) throws {
         try control.withLock { state in
-            let shouldRestoreBeforeRestart = Self.shouldRestoreBufferFrameSizeBeforeRestart(
-                currentOutput: state.activeOutput,
-                nextOutput: output
-            )
-            stopLocked(&state, restoreBufferFrameSizes: shouldRestoreBeforeRestart)
-            state.state = .stopped
+            let previousState = state.state
+            let previousStatus = state.status
             state.status = .starting
-
             do {
-                if state.bufferFrameSizeRestoration == nil {
-                    state.bufferFrameSizeRestoration = BufferFrameSizeRestoration(
-                        deviceID: output.id,
-                        uid: output.uid,
-                        originalFrameSize: output.bufferFrameSize
-                    )
-                }
-                let tunedOutput = tuneBufferFrameSize(for: output)
-                let channelCount = try Self.supportedRuntimeChannelCount(for: tunedOutput)
-                let runtimeBufferFrameSize = Self.runtimeBufferFrameSize(for: tunedOutput)
-                let ringCapacityFrames = max(Int(runtimeBufferFrameSize) * 3, minimumRingBufferFrames(for: tunedOutput))
-                let scratchFrames = max(Int(runtimeBufferFrameSize), Self.minimumRingBufferFrames)
-                let playbackPrimeFrames = min(
-                    ringCapacityFrames,
-                    Self.minimumPrimeFrames(for: tunedOutput, runtimeBufferFrameSize: runtimeBufferFrameSize)
-                )
-                let runtime = AudioRuntime(
-                    profile: profile,
-                    sampleRate: tunedOutput.nominalSampleRate,
-                    channelCount: channelCount,
-                    ringCapacityFrames: ringCapacityFrames,
-                    scratchFrames: scratchFrames,
-                    playbackPrimeFrames: playbackPrimeFrames
-                )
-
-                state.activeOutput = tunedOutput
-                state.activeProfile = profile
-                state.runtime = runtime
-                state.tapID = try createSystemTap(output: tunedOutput)
-                state.aggregateDeviceID = try createPrivateAggregateDevice(tapID: state.tapID)
-                state.captureIOProcID = try createCaptureIOProc(deviceID: state.aggregateDeviceID, runtime: runtime)
-                state.outputIOProcID = try createOutputIOProc(deviceID: tunedOutput.id, runtime: runtime)
-                try checkOSStatus(AudioDeviceStart(state.aggregateDeviceID, state.captureIOProcID), operation: "AudioDeviceStart(capture tap)")
-                try checkOSStatus(AudioDeviceStart(tunedOutput.id, state.outputIOProcID), operation: "AudioDeviceStart(default output)")
-
-                state.state = .running(output: tunedOutput)
-                state.status = .running(output: tunedOutput)
+                // The capture half (one global muted tap @ the tap rate) is created once and
+                // kept alive across output switches, so dry audio never leaks to a newly
+                // selected device. Only the output half is (re)built for `output`.
+                try ensureCaptureHalfLocked(&state, profile: profile)
+                try rebuildOutputHalfLocked(&state, output: output, profile: profile)
+                let active = state.activeOutput ?? output
+                state.state = .running(output: active)
+                state.status = .running(output: active)
             } catch {
+                if error is TopologyRebuildMuteGuardUnavailable {
+                    state.state = previousState
+                    state.status = previousStatus
+                    throw error
+                }
                 let failure = audioEngineFailure(from: error)
-                stopLocked(&state, restoreBufferFrameSizes: true)
+                // Any failure tears the tap down too, so the system is never left muted
+                // with nothing replaying.
+                stopLocked(&state)
                 state.state = .failed(failure.description)
                 if failure.category == .systemAudioCapturePermission {
                     state.status = .permissionRequired(failure)
@@ -774,10 +869,15 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     }
 
     public func update(profile: EQProfile) throws {
+        // Prefer a lock-free hot-swap that leaves the persistent tap untouched.
+        if updateDSP(profile: profile) {
+            return
+        }
+        // Topology-incompatible change: rebuild around the persistent tap (the tap rate is
+        // constant, so start() keeps the capture half and only swaps the DSP graph + output).
         guard let output = control.withLock({ $0.activeOutput }) else {
             return
         }
-
         let freshOutput = try CoreAudioDeviceQuery.outputDevice(id: output.id)
         try start(output: freshOutput, profile: profile)
     }
@@ -785,32 +885,35 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     @discardableResult
     public func updateDSP(profile: EQProfile) -> Bool {
         control.withLock { state in
-            guard let output = state.activeOutput,
-                  let activeProfile = state.activeProfile,
-                  let runtime = state.runtime else {
-                return false
-            }
-
-            guard Self.canHotSwapDSP(
-                from: activeProfile,
-                to: profile,
-                sampleRate: output.nominalSampleRate,
-                channelCount: runtime.channelCount
-            ) else {
-                return false
-            }
-
-            let preparedConfig = EQRenderConfiguration(
-                profile: Self.dspProfile(from: profile),
-                sampleRate: output.nominalSampleRate,
-                channelCount: runtime.channelCount
-            )
-            runtime.drainDSPConfigBoxes()
-            runtime.publishPendingDSPConfig(preparedConfig)
-            runtime.setBypassed(profile.isBypassed)
-            state.activeProfile = profile
-            return true
+            updateDSPLocked(&state, profile: profile)
         }
+    }
+
+    private func updateDSPLocked(_ state: inout ControlState, profile: EQProfile) -> Bool {
+        guard let runtime = state.runtime,
+              let activeProfile = state.activeProfile else {
+            return false
+        }
+
+        guard Self.canHotSwapDSP(
+            from: activeProfile,
+            to: profile,
+            sampleRate: runtime.sampleRate,
+            channelCount: runtime.channelCount
+        ) else {
+            return false
+        }
+
+        let preparedConfig = EQRenderConfiguration(
+            profile: Self.dspProfile(from: profile),
+            sampleRate: runtime.sampleRate,
+            channelCount: runtime.channelCount
+        )
+        runtime.drainDSPConfigBoxes()
+        runtime.publishPendingDSPConfig(preparedConfig)
+        runtime.setBypassed(profile.isBypassed)
+        state.activeProfile = profile
+        return true
     }
 
     static func canHotSwapDSP(
@@ -852,7 +955,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     public func stop() {
         control.withLock { state in
-            stopLocked(&state, restoreBufferFrameSizes: true)
+            stopLocked(&state)
         }
     }
 
@@ -866,58 +969,260 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         runtime?.resetMetrics()
     }
 
-    private func stopLocked(_ state: inout ControlState, restoreBufferFrameSizes: Bool) {
+    private func stopLocked(_ state: inout ControlState) {
         state.runtime?.markStopping()
+        stopOutputHalfLocked(&state)
+        stopCaptureHalfLocked(&state)
+        state.activeProfile = nil
+        state.state = .stopped
+        state.status = .stopped
+    }
 
-        if let output = state.activeOutput, let outputIOProcID = state.outputIOProcID {
-            _ = AudioDeviceStop(output.id, outputIOProcID)
-            _ = AudioDeviceDestroyIOProcID(output.id, outputIOProcID)
+    // MARK: - Capture half (persistent global muted tap @ the tap rate)
+
+    private func ensureCaptureHalfLocked(_ state: inout ControlState, profile: EQProfile) throws {
+        if state.captureRunning, state.runtime != nil {
+            if updateDSPLocked(&state, profile: profile) {
+                return
+            }
+            // Topology-incompatible DSP change: hold a second global muted tap while the
+            // capture half is torn down and recreated, so HAL-level muting never lapses.
+            try Self.performTopologyRebuild(
+                acquireMuteGuard: { try createTopologyRebuildMuteGuard() }
+            ) {
+                stopOutputHalfLocked(&state)
+                stopCaptureHalfLocked(&state)
+                try createCaptureHalfLocked(&state, profile: profile)
+            }
+            return
         }
+        try createCaptureHalfLocked(&state, profile: profile)
+    }
+
+    private func createCaptureHalfLocked(_ state: inout ControlState, profile: EQProfile) throws {
+        let tapID = try createSystemTap()
+        state.tapID = tapID
+
+        let format = try tapStreamFormat(tapID)
+        let tapSampleRate = format.mSampleRate > 0 ? format.mSampleRate : 48_000
+        let tapChannelCount = min(max(Int(format.mChannelsPerFrame), 1), 2)
+        state.tapSampleRate = tapSampleRate
+        state.tapChannelCount = tapChannelCount
+
+        let runtimeBufferFrameSize = Int(Self.maximumRuntimeBufferFrameSize)
+        // Low-latency tuning: a 512-frame prime (~11 ms @ 48k) — about 2x the tap's callback
+        // once we request a 256-frame capture buffer below. The ring keeps drift/transient
+        // headroom above the prime; raise the prime if underruns appear on a given device.
+        let playbackPrimeFrames = Self.preferredPlaybackPrimeFrames
+        let ringCapacityFrames = max(Self.minimumRingBufferFrames, playbackPrimeFrames * 2)
+        let scratchFrames = max(runtimeBufferFrameSize, Self.minimumRingBufferFrames)
+
+        let runtime = AudioRuntime(
+            profile: profile,
+            sampleRate: tapSampleRate,
+            channelCount: tapChannelCount,
+            ringCapacityFrames: ringCapacityFrames,
+            scratchFrames: scratchFrames,
+            playbackPrimeFrames: playbackPrimeFrames
+        )
+        state.runtime = runtime
+        state.activeProfile = profile
+
+        state.aggregateDeviceID = try createPrivateAggregateDevice(tapID: tapID)
+        // Ask the capture aggregate for small callbacks to cut latency (best-effort; not all
+        // tap aggregates honor it — if ignored, the prime above still keeps capture safe).
+        try? CoreAudioDeviceQuery.setBufferFrameSize(Self.preferredCaptureBufferFrameSize, objectID: state.aggregateDeviceID)
+        state.captureIOProcID = try createCaptureIOProc(deviceID: state.aggregateDeviceID, runtime: runtime)
+        try checkOSStatus(
+            AudioDeviceStart(state.aggregateDeviceID, state.captureIOProcID),
+            operation: "AudioDeviceStart(capture tap)"
+        )
+        state.captureRunning = true
+    }
+
+    private func stopCaptureHalfLocked(_ state: inout ControlState) {
+        state.runtime?.markStopping()
 
         if state.aggregateDeviceID != kAudioObjectUnknown, let captureIOProcID = state.captureIOProcID {
             _ = AudioDeviceStop(state.aggregateDeviceID, captureIOProcID)
             _ = AudioDeviceDestroyIOProcID(state.aggregateDeviceID, captureIOProcID)
         }
-
         if state.aggregateDeviceID != kAudioObjectUnknown {
             _ = AudioHardwareDestroyAggregateDevice(state.aggregateDeviceID)
         }
-
         if state.tapID != kAudioObjectUnknown {
             _ = AudioHardwareDestroyProcessTap(state.tapID)
         }
 
-        if restoreBufferFrameSizes {
-            restoreBufferFrameSizeIfNeeded(&state)
-        }
-
         state.runtime?.drainDSPConfigBoxes()
         state.captureIOProcID = nil
-        state.outputIOProcID = nil
         state.aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
         state.tapID = AudioObjectID(kAudioObjectUnknown)
-        state.activeOutput = nil
-        state.activeProfile = nil
         state.runtime = nil
-        state.state = .stopped
-        state.status = .stopped
+        state.tapSampleRate = 0
+        state.tapChannelCount = 0
+        state.captureRunning = false
     }
 
-    private func restoreBufferFrameSizeIfNeeded(_ state: inout ControlState) {
-        guard let restoration = state.bufferFrameSizeRestoration else {
-            return
-        }
-        defer {
-            state.bufferFrameSizeRestoration = nil
+    // MARK: - Output half (swappable; device forced to the tap rate so no resampling)
+
+    private func rebuildOutputHalfLocked(
+        _ state: inout ControlState,
+        output: AudioOutputDevice,
+        profile: EQProfile
+    ) throws {
+        guard let runtime = state.runtime else {
+            throw CoreAudioError(operation: "rebuildOutputHalf(missing runtime)", status: kAudioHardwareNotRunningError)
         }
 
-        guard let activeOutput = state.activeOutput,
-              activeOutput.id == restoration.deviceID,
-              activeOutput.uid == restoration.uid else {
-            return
+        stopOutputHalfLocked(&state)
+
+        // Match the device to the tap's fixed rate so the EQ'd stream needs no resampling.
+        let matchedOutput = try forceSampleRate(state.tapSampleRate, on: output, state: &state)
+        _ = try Self.supportedRuntimeChannelCount(for: matchedOutput)
+        if state.bufferFrameSizeRestorations[matchedOutput.uid] == nil {
+            state.bufferFrameSizeRestorations[matchedOutput.uid] = BufferFrameSizeRestoration(
+                uid: matchedOutput.uid,
+                originalFrameSize: matchedOutput.bufferFrameSize
+            )
         }
 
-        try? CoreAudioDeviceQuery.setBufferFrameSize(restoration.originalFrameSize, objectID: restoration.deviceID)
+        // Keep our replay muted while we claim and reconfigure the device. The ORDER matters:
+        // start our output IOProc (so GlassEQ owns the device) BEFORE writing the buffer size.
+        // Writing the buffer size restarts the device's hardware stream; doing it after we own
+        // the device means that restart re-engages our (muted) IOProc instead of briefly
+        // replaying the un-muted system mix. The buffer write's own property-change notification
+        // is ignored via CoreAudioSelfChangeGuard, so it no longer triggers a rebuild loop.
+        runtime.muteOutputForTransition()
+
+        guard let outputIOProcID = try createOutputIOProc(deviceID: matchedOutput.id, runtime: runtime) else {
+            throw CoreAudioError(operation: "AudioDeviceCreateIOProcID(default output)", status: kAudioHardwareUnspecifiedError)
+        }
+        do {
+            try checkOSStatus(
+                AudioDeviceStart(matchedOutput.id, outputIOProcID),
+                operation: "AudioDeviceStart(default output)"
+            )
+        } catch {
+            _ = AudioDeviceDestroyIOProcID(matchedOutput.id, outputIOProcID)
+            throw error
+        }
+        state.outputIOProcID = outputIOProcID
+
+        // Now that our output owns the device, apply the low-latency buffer size. The stream
+        // restart it triggers happens under our muted IOProc, so it plays silence, not dry audio.
+        let tunedOutput = tuneBufferFrameSize(for: matchedOutput)
+
+        // Unmute and re-anchor playback to the freshest captured audio on the new device.
+        runtime.reprimePlayback()
+
+        state.activeOutput = tunedOutput
+        state.activeProfile = profile
+    }
+
+    private func stopOutputHalfLocked(_ state: inout ControlState) {
+        if let output = state.activeOutput, let outputIOProcID = state.outputIOProcID {
+            _ = AudioDeviceStop(output.id, outputIOProcID)
+            _ = AudioDeviceDestroyIOProcID(output.id, outputIOProcID)
+        }
+        state.outputIOProcID = nil
+        restoreDeviceSettingsIfNeeded(&state)
+        state.activeOutput = nil
+    }
+
+    private func forceSampleRate(
+        _ sampleRate: Double,
+        on output: AudioOutputDevice,
+        state: inout ControlState
+    ) throws -> AudioOutputDevice {
+        guard sampleRate > 0, abs(output.nominalSampleRate - sampleRate) >= 1 else {
+            return output
+        }
+        if state.sampleRateRestorations[output.uid] == nil {
+            state.sampleRateRestorations[output.uid] = SampleRateRestoration(
+                uid: output.uid,
+                originalSampleRate: output.nominalSampleRate
+            )
+        }
+        try CoreAudioDeviceQuery.setNominalSampleRate(sampleRate, objectID: output.id)
+        for _ in 0..<3 {
+            let freshOutput = try CoreAudioDeviceQuery.outputDevice(id: output.id)
+            if abs(freshOutput.nominalSampleRate - sampleRate) < 1 {
+                return freshOutput
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        let freshOutput = try CoreAudioDeviceQuery.outputDevice(id: output.id)
+        throw AudioDeviceAvailabilityError.invalidDeviceMetadata(
+            output.id,
+            "output sample rate \(freshOutput.nominalSampleRate) does not match tap sample rate \(sampleRate)"
+        )
+    }
+
+    private func restoreDeviceSettingsIfNeeded(_ state: inout ControlState) {
+        var restoredSampleRateUIDs: [String] = []
+        for (uid, restoration) in state.sampleRateRestorations {
+            if Self.restoreSampleRateRestoration(restoration) {
+                restoredSampleRateUIDs.append(uid)
+            }
+        }
+        for uid in restoredSampleRateUIDs {
+            state.sampleRateRestorations.removeValue(forKey: uid)
+        }
+
+        var restoredBufferFrameSizeUIDs: [String] = []
+        for (uid, restoration) in state.bufferFrameSizeRestorations {
+            if Self.restoreBufferFrameSizeRestoration(restoration) {
+                restoredBufferFrameSizeUIDs.append(uid)
+            }
+        }
+        for uid in restoredBufferFrameSizeUIDs {
+            state.bufferFrameSizeRestorations.removeValue(forKey: uid)
+        }
+    }
+
+    static func restoreSampleRateRestoration(
+        _ restoration: SampleRateRestoration,
+        outputForUID: (String) throws -> AudioOutputDevice? = CoreAudioDeviceQuery.outputDevice(uid:),
+        setSampleRate: (Double, AudioObjectID) throws -> Void = CoreAudioDeviceQuery.setNominalSampleRate(_:objectID:)
+    ) -> Bool {
+        do {
+            guard let output = try outputForUID(restoration.uid) else {
+                return false
+            }
+            guard abs(output.nominalSampleRate - restoration.originalSampleRate) >= 1 else {
+                return true
+            }
+            try setSampleRate(restoration.originalSampleRate, output.id)
+            guard let verifiedOutput = try outputForUID(restoration.uid) else {
+                return false
+            }
+            return abs(verifiedOutput.nominalSampleRate - restoration.originalSampleRate) < 1
+        } catch {
+            return false
+        }
+    }
+
+    static func restoreBufferFrameSizeRestoration(
+        _ restoration: BufferFrameSizeRestoration,
+        outputForUID: (String) throws -> AudioOutputDevice? = CoreAudioDeviceQuery.outputDevice(uid:),
+        setBufferFrameSize: (UInt32, AudioObjectID) throws -> Void = CoreAudioDeviceQuery.setBufferFrameSize(_:objectID:)
+    ) -> Bool {
+        do {
+            guard let output = try outputForUID(restoration.uid) else {
+                return false
+            }
+            guard output.bufferFrameSize != restoration.originalFrameSize else {
+                return true
+            }
+            try setBufferFrameSize(restoration.originalFrameSize, output.id)
+            guard let verifiedOutput = try outputForUID(restoration.uid) else {
+                return false
+            }
+            return verifiedOutput.bufferFrameSize == restoration.originalFrameSize
+        } catch {
+            return false
+        }
     }
 
     private static func dspProfile(from profile: EQProfile) -> EQProfile {
@@ -961,18 +1266,45 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         return output.outputChannelCount
     }
 
-    static func shouldRestoreBufferFrameSizeBeforeRestart(
-        currentOutput: AudioOutputDevice?,
-        nextOutput: AudioOutputDevice
-    ) -> Bool {
-        guard let currentOutput else {
-            return false
+    static func monoDownmix(
+        _ samples: UnsafeBufferPointer<Float>,
+        frame: Int,
+        sourceChannelCount: Int
+    ) -> Float {
+        guard frame >= 0 else {
+            return 0
         }
-        return currentOutput.id != nextOutput.id || currentOutput.uid != nextOutput.uid
+        let sourceChannelCount = max(sourceChannelCount, 1)
+        let sampleBaseResult = frame.multipliedReportingOverflow(by: sourceChannelCount)
+        guard !sampleBaseResult.overflow else {
+            return 0
+        }
+        let sampleBase = sampleBaseResult.partialValue
+        guard sampleBase >= 0,
+              sampleBase < samples.count else {
+            return 0
+        }
+        guard sourceChannelCount > 1,
+              sampleBase + 1 < samples.count else {
+            return samples[sampleBase]
+        }
+        return (samples[sampleBase] + samples[sampleBase + 1]) * 0.5
     }
 
-    static func runtimeBufferFrameSize(for output: AudioOutputDevice) -> UInt32 {
-        min(max(output.bufferFrameSize, 1), Self.maximumRuntimeBufferFrameSize)
+    static func performTopologyRebuild<T>(
+        acquireMuteGuard: () throws -> any TopologyRebuildMuteGuarding,
+        rebuild: () throws -> T
+    ) throws -> T {
+        let muteGuard: any TopologyRebuildMuteGuarding
+        do {
+            muteGuard = try acquireMuteGuard()
+        } catch {
+            throw TopologyRebuildMuteGuardUnavailable(underlyingError: error)
+        }
+        defer {
+            muteGuard.release()
+        }
+        return try rebuild()
     }
 
     private func tuneBufferFrameSize(for output: AudioOutputDevice) -> AudioOutputDevice {
@@ -999,21 +1331,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         if output.isBluetoothTransport {
             return Self.preferredBluetoothBufferFrameSize
         }
-        return max(
-            Self.preferredBufferFrameSize,
-            min(output.bufferFrameSize, Self.maximumRuntimeBufferFrameSize)
-        )
-    }
-
-    private func minimumRingBufferFrames(for output: AudioOutputDevice) -> Int {
-        Self.isLowSampleRateRoute(output) ? Self.minimumLowSampleRateRingBufferFrames : Self.minimumRingBufferFrames
-    }
-
-    static func minimumPrimeFrames(for output: AudioOutputDevice, runtimeBufferFrameSize: UInt32) -> Int {
-        let preferredPrimeFrames = isLowSampleRateRoute(output)
-            ? Self.minimumLowSampleRateRingBufferFrames / 2
-            : max(Self.minimumRingBufferFrames / 2, Int(runtimeBufferFrameSize) * 2)
-        return min(max(Int(runtimeBufferFrameSize), preferredPrimeFrames), Self.maximumPlaybackPrimeFrames)
+        // Low-latency: request a small output buffer rather than keeping the device's larger
+        // default. Clamped to the device's supported range by the caller (tuneBufferFrameSize).
+        return Self.preferredBufferFrameSize
     }
 
     private static func isLowSampleRateRoute(_ output: AudioOutputDevice) -> Bool {
@@ -1024,14 +1344,44 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         min(max(frameSize, range.minimum), range.maximum)
     }
 
-    private func createSystemTap(output: AudioOutputDevice) throws -> AudioObjectID {
+    private func createTopologyRebuildMuteGuard() throws -> any TopologyRebuildMuteGuarding {
+        let tapID = try createSystemTap(name: "GlassEQ Profile Rebuild Mute Tap")
+        var aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
+        var ioProcID: AudioDeviceIOProcID?
+
+        do {
+            aggregateDeviceID = try createPrivateAggregateDevice(tapID: tapID)
+            ioProcID = try createSilenceIOProc(deviceID: aggregateDeviceID)
+            try checkOSStatus(
+                AudioDeviceStart(aggregateDeviceID, ioProcID),
+                operation: "AudioDeviceStart(profile rebuild mute tap)"
+            )
+            return CoreAudioTopologyRebuildMuteGuard(
+                tapID: tapID,
+                aggregateDeviceID: aggregateDeviceID,
+                ioProcID: ioProcID
+            )
+        } catch {
+            if aggregateDeviceID != kAudioObjectUnknown, let ioProcID {
+                _ = AudioDeviceStop(aggregateDeviceID, ioProcID)
+                _ = AudioDeviceDestroyIOProcID(aggregateDeviceID, ioProcID)
+            }
+            if aggregateDeviceID != kAudioObjectUnknown {
+                _ = AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
+            }
+            _ = AudioHardwareDestroyProcessTap(tapID)
+            throw error
+        }
+    }
+
+    private func createSystemTap(name: String = "GlassEQ System Output Tap") throws -> AudioObjectID {
         let ownProcess = try currentAudioProcessObjectID()
-        let description = CATapDescription(
-            excludingProcesses: [ownProcess],
-            deviceUID: output.uid,
-            stream: 0
-        )
-        description.name = "GlassEQ System Output Tap"
+        // Global tap (not bound to a device): one muted tap removes the dry system mix from
+        // every output device and survives default-output switches without rebuild, so dry
+        // audio never leaks to a newly selected device during the route handoff. Verified on
+        // hardware across built-in / USB / Bluetooth / HDMI and 44.1k–192k device rates.
+        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcess])
+        description.name = name
         description.uuid = UUID()
         description.isPrivate = true
         description.muteBehavior = CATapMuteBehavior.muted
@@ -1042,6 +1392,21 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             operation: "AudioHardwareCreateProcessTap"
         )
         return tapID
+    }
+
+    private func tapStreamFormat(_ tapID: AudioObjectID) throws -> AudioStreamBasicDescription {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyFormat,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        try checkOSStatus(
+            AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &asbd),
+            operation: "AudioObjectGetPropertyData(tap format)"
+        )
+        return asbd
     }
 
     private func createPrivateAggregateDevice(tapID: AudioObjectID) throws -> AudioObjectID {
@@ -1080,6 +1445,19 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         return ioProcID
     }
 
+    private func createSilenceIOProc(deviceID: AudioObjectID) throws -> AudioDeviceIOProcID? {
+        var ioProcID: AudioDeviceIOProcID?
+
+        try checkOSStatus(
+            AudioDeviceCreateIOProcIDWithBlock(&ioProcID, deviceID, nil) { _, _, _, outputData, _ in
+                Self.clear(outputData: outputData)
+            },
+            operation: "AudioDeviceCreateIOProcIDWithBlock(profile rebuild mute tap)"
+        )
+
+        return ioProcID
+    }
+
     private func createOutputIOProc(deviceID: AudioObjectID, runtime: AudioRuntime) throws -> AudioDeviceIOProcID? {
         var ioProcID: AudioDeviceIOProcID?
 
@@ -1091,6 +1469,23 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         )
 
         return ioProcID
+    }
+
+    private static func clear(outputData: UnsafeMutablePointer<AudioBufferList>) {
+        for buffer in UnsafeMutableAudioBufferListPointer(outputData) {
+            guard let data = buffer.mData else {
+                continue
+            }
+            let byteCount = Int(buffer.mDataByteSize)
+            let maxByteCount = Int(CoreAudioDeviceQuery.maxBufferFrameSize)
+                * CoreAudioDeviceQuery.maxChannelCount
+                * MemoryLayout<Float>.stride
+            guard byteCount >= 0,
+                  byteCount <= maxByteCount else {
+                continue
+            }
+            data.initializeMemory(as: UInt8.self, repeating: 0, count: byteCount)
+        }
     }
 
     private func tapUID(_ tapID: AudioObjectID) throws -> String {
