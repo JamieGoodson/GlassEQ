@@ -294,6 +294,12 @@ private actor ProfileStoreWriter {
     }
 }
 
+private actor EngineWorkExecutor {
+    func run<T: Sendable>(_ operation: @Sendable () -> T) -> T {
+        operation()
+    }
+}
+
 @MainActor
 @Observable
 final class GlassEQAppModel {
@@ -335,6 +341,7 @@ final class GlassEQAppModel {
     private var engineStartGeneration = 0
     private var pendingEngineStartOutput: AudioOutputDevice?
     private let storeWriter: ProfileStoreWriter
+    @ObservationIgnored private let engineWorkExecutor = EngineWorkExecutor()
     @ObservationIgnored lazy var settingsCoordinator = SettingsCoordinator(model: self)
 
     private enum EngineWork: Sendable {
@@ -1036,8 +1043,11 @@ final class GlassEQAppModel {
 
         let engine = engine
         let defaultOutputLookup = defaultOutputLookup
+        let engineWorkExecutor = engineWorkExecutor
         let workTask = Task.detached(priority: .userInitiated) {
-            Self.performEngineWork(work, engine: engine, defaultOutputLookup: defaultOutputLookup)
+            await engineWorkExecutor.run {
+                Self.performEngineWork(work, engine: engine, defaultOutputLookup: defaultOutputLookup)
+            }
         }
 
         engineStartTask = Task { @MainActor [weak self] in

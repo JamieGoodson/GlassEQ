@@ -259,7 +259,7 @@ struct GlassEQAppModelLifecycleTests {
         let firstOutput = makeOutput(uid: "first-output", name: "First Output", id: 200)
         let secondOutput = makeOutput(uid: "second-output", name: "Second Output", id: 300)
         let engine = FakeAudioEngine()
-        engine.startDelaySeconds = 0.08
+        engine.startDelaySecondsByUID[firstOutput.uid] = 0.08
         let lookup = FakeDefaultOutputLookup(.success(firstOutput))
         let observers = FakeDefaultOutputObserverFactory()
         let model = makeModel(
@@ -288,6 +288,9 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.currentOutputName == secondOutput.name)
         #expect(model.statusMessage == localized("Processing \(secondOutput.name) with \(model.activeProfile.name)"))
         #expect(engine.stopCallCount == 0)
+
+        try? await Task.sleep(for: .milliseconds(120))
+        #expect(engine.state == .running(output: secondOutput))
     }
 
     @Test
@@ -1247,6 +1250,7 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
     var updateError: Error?
     var updateDSPResult = true
     var startDelaySeconds: TimeInterval = 0
+    var startDelaySecondsByUID: [String: TimeInterval] = [:]
     private(set) var startCalls: [StartCall] = []
     private(set) var updateCalls: [EQProfile] = []
     private(set) var updateDSPCalls: [EQProfile] = []
@@ -1257,8 +1261,9 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
 
     func start(output: AudioOutputDevice, profile: EQProfile) throws {
         startCalls.append(StartCall(output: output, profile: profile))
-        if startDelaySeconds > 0 {
-            Thread.sleep(forTimeInterval: startDelaySeconds)
+        let delay = startDelaySecondsByUID[output.uid] ?? startDelaySeconds
+        if delay > 0 {
+            Thread.sleep(forTimeInterval: delay)
         }
         if let startError {
             state = .failed("Start failed")
