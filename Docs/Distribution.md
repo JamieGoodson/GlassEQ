@@ -81,7 +81,8 @@ For alpha packaging, also run:
 
 ```sh
 ./Scripts/build-release-app.sh
-codesign --verify --strict --deep --verbose=2 .build/release-app/GlassEQ.app
+codesign --verify --strict --verbose=2 .build/release-app/GlassEQ.app/Contents/Helpers/GlassEQSettings.app
+codesign --verify --strict --verbose=2 .build/release-app/GlassEQ.app
 codesign -d --entitlements :- .build/release-app/GlassEQ.app
 spctl --assess --type execute --verbose=4 .build/release-app/GlassEQ.app
 ```
