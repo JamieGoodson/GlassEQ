@@ -316,7 +316,7 @@ struct GlassEQAppModelLifecycleTests {
         let firstOutput = makeOutput(uid: "first-output", name: "First Output", id: 200)
         let secondOutput = makeOutput(uid: "second-output", name: "Second Output", id: 300)
         let engine = FakeAudioEngine()
-        engine.startDelaySecondsByUID[firstOutput.uid] = 0.08
+        engine.blockStart(for: firstOutput.uid)
         let lookup = FakeDefaultOutputLookup(.success(firstOutput))
         let observers = FakeDefaultOutputObserverFactory()
         let model = makeModel(
@@ -332,9 +332,11 @@ struct GlassEQAppModelLifecycleTests {
         await waitUntil {
             engine.startCalls.count == 1
         }
+        #expect(engine.waitUntilStartIsBlocked(for: firstOutput.uid, timeout: .now() + 1))
 
         lookup.result = .success(secondOutput)
         observer.emit(.success(secondOutput))
+        engine.unblockStart(for: firstOutput.uid)
         await waitUntil {
             model.lifecycleState == .running
                 && model.currentOutputUID == secondOutput.uid
@@ -354,7 +356,7 @@ struct GlassEQAppModelLifecycleTests {
     func userStopDuringSlowStartCleansUpAfterCancelledStartFinishes() async {
         let output = makeOutput(uid: "slow-start-output", name: "Slow Start Output", id: 200)
         let engine = FakeAudioEngine()
-        engine.startDelaySeconds = 0.08
+        engine.blockStart(for: output.uid)
         let lookup = FakeDefaultOutputLookup(.success(output))
         let observers = FakeDefaultOutputObserverFactory()
         let model = makeModel(
@@ -369,8 +371,10 @@ struct GlassEQAppModelLifecycleTests {
         await waitUntil {
             engine.startCalls.count == 1
         }
+        #expect(engine.waitUntilStartIsBlocked(for: output.uid, timeout: .now() + 1))
 
         model.stop()
+        engine.unblockStart(for: output.uid)
 
         await waitUntil {
             engine.stopCallCount == 2
@@ -779,7 +783,7 @@ struct GlassEQAppModelLifecycleTests {
             model.lifecycleState == .running && engine.startCalls.count == 1
         }
 
-        engine.startDelaySeconds = 0.08
+        engine.blockStart(for: output.uid)
         model.handleWillSleep()
         model.handleDidWake()
         await waitUntil {
@@ -789,6 +793,7 @@ struct GlassEQAppModelLifecycleTests {
         await waitUntil {
             model.lifecycleState == .waking && engine.startCalls.count == 2
         }
+        #expect(engine.waitUntilStartIsBlocked(for: output.uid, timeout: .now() + 1))
 
         try model.apply(profile: applied)
         try model.useForCurrentOutput(profile: mapped)
@@ -805,6 +810,7 @@ struct GlassEQAppModelLifecycleTests {
         #expect(engine.setBypassedCalls.isEmpty)
         #expect(model.profileStore.profile(forOutputUID: output.uid).id == mapped.id)
 
+        engine.unblockStart(for: output.uid)
         await waitUntil {
             model.lifecycleState == .running
                 && engine.startCalls.last?.profile.id == mapped.id
@@ -1786,6 +1792,7 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
     private var _updateDSPResult = true
     private var _startDelaySeconds: TimeInterval = 0
     private var _startDelaySecondsByUID: [String: TimeInterval] = [:]
+    private var _startBlockersByUID: [String: FakeStartBlocker] = [:]
     private var _startCalls: [StartCall] = []
     private var _updateCalls: [EQProfile] = []
     private var _updateDSPCalls: [EQProfile] = []
@@ -1869,14 +1876,37 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         withLock { _events }
     }
 
+    func blockStart(for outputUID: String) {
+        withLock {
+            _startBlockersByUID[outputUID] = FakeStartBlocker()
+        }
+    }
+
+    func waitUntilStartIsBlocked(for outputUID: String, timeout: DispatchTime) -> Bool {
+        withLock {
+            _startBlockersByUID[outputUID]
+        }?.waitUntilEntered(timeout: timeout) ?? false
+    }
+
+    func unblockStart(for outputUID: String) {
+        let blocker = withLock {
+            _startBlockersByUID.removeValue(forKey: outputUID)
+        }
+        blocker?.unblock()
+    }
+
     func start(output: AudioOutputDevice, profile: EQProfile) throws {
-        let delay = withLock {
+        let startControl = withLock {
             _events.append("start:\(output.uid)")
             _startCalls.append(StartCall(output: output, profile: profile))
-            return _startDelaySecondsByUID[output.uid] ?? _startDelaySeconds
+            return (
+                delay: _startDelaySecondsByUID[output.uid] ?? _startDelaySeconds,
+                blocker: _startBlockersByUID[output.uid]
+            )
         }
-        if delay > 0 {
-            Thread.sleep(forTimeInterval: delay)
+        startControl.blocker?.waitUntilUnblocked()
+        if startControl.delay > 0 {
+            Thread.sleep(forTimeInterval: startControl.delay)
         }
         if let startError = withLock({ _startError }) {
             withLock {
@@ -1956,5 +1986,23 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         lock.lock()
         defer { lock.unlock() }
         return body()
+    }
+}
+
+private final class FakeStartBlocker: @unchecked Sendable {
+    private let entered = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+
+    func waitUntilUnblocked() {
+        entered.signal()
+        _ = release.wait(timeout: .now() + 5)
+    }
+
+    func waitUntilEntered(timeout: DispatchTime) -> Bool {
+        entered.wait(timeout: timeout) == .success
+    }
+
+    func unblock() {
+        release.signal()
     }
 }
