@@ -35,7 +35,7 @@ public struct ProfileImportLimits: Equatable, Sendable {
         maxLineCount: 10_000,
         maxFiltersPerChannel: 128,
         maxTotalFilters: 256,
-        frequencyRange: 1...96_000,
+        frequencyRange: 1...24_000,
         gainRange: -120...120,
         preampRange: -120...120,
         qRange: 0.01...100
@@ -194,26 +194,29 @@ public enum EQProfileTextImporter {
         }
 
         let hasStereoFilters = !leftFilters.isEmpty || !rightFilters.isEmpty
-        guard !filters.isEmpty || hasStereoFilters || preampDB != 0 || leftPreampDB != nil || rightPreampDB != nil else {
+        let hasStereoData = hasStereoFilters || leftPreampDB != nil || rightPreampDB != nil
+        guard !filters.isEmpty || hasStereoData || preampDB != 0 else {
             throw ProfileImportError.noSupportedFilters
         }
 
-        if hasStereoFilters {
+        if hasStereoData {
             let fallbackFilters = filters
+            let resolvedLeftFilters = leftFilters.isEmpty ? fallbackFilters : leftFilters
+            let resolvedRightFilters = rightFilters.isEmpty ? fallbackFilters : rightFilters
             return EQProfile(
                 name: profileName,
-                mode: .parametric,
+                mode: inferredMode(leftFilters: resolvedLeftFilters, rightFilters: resolvedRightFilters),
                 channelMode: .stereo,
                 preampDB: preampDB,
                 filters: fallbackFilters,
                 leftPreampDB: leftPreampDB ?? preampDB,
-                leftFilters: leftFilters.isEmpty ? fallbackFilters : leftFilters,
+                leftFilters: resolvedLeftFilters,
                 rightPreampDB: rightPreampDB ?? preampDB,
-                rightFilters: rightFilters.isEmpty ? fallbackFilters : rightFilters
+                rightFilters: resolvedRightFilters
             )
         }
 
-        return EQProfile(name: profileName, mode: .parametric, preampDB: preampDB, filters: filters)
+        return EQProfile(name: profileName, mode: inferredMode(filters: filters), preampDB: preampDB, filters: filters)
     }
 
     public static func importREW(
@@ -233,7 +236,7 @@ public enum EQProfileTextImporter {
             }
 
             let tokens = line
-                .replacingOccurrences(of: ",", with: " ")
+                .replacingOccurrences(of: ":", with: " ")
                 .split(whereSeparator: \.isWhitespace)
                 .map(String.init)
 
@@ -246,9 +249,7 @@ public enum EQProfileTextImporter {
                 continue
             }
 
-            let kind = tokens.contains { $0.caseInsensitiveCompare("PK") == .orderedSame || $0.caseInsensitiveCompare("Modal") == .orderedSame }
-                ? FilterKind.peak
-                : FilterKind.peak
+            let kind = parseREWKind(in: tokens)
 
             guard let frequency = try requiredValue(afterAnyOf: ["Fc", "F"], in: tokens, field: "frequency", line: lineNumber) ??
                 firstNumberFollowingFrequencyUnit(in: tokens, line: lineNumber) else {
@@ -259,9 +260,7 @@ public enum EQProfileTextImporter {
             let gain = try value(beforeUnit: "dB", in: tokens, field: "gain", line: lineNumber) ?? 0
             try validate(gain, in: limits.gainRange, field: "gain", line: lineNumber)
 
-            let q = try optionalValue(after: "Q", in: tokens, field: "Q", line: lineNumber) ??
-                lastNumericToken(in: tokens, field: "Q", line: lineNumber) ??
-                0.707_106_781_18
+            let q = try optionalValue(after: "Q", in: tokens, field: "Q", line: lineNumber) ?? 0.707_106_781_18
             try validate(q, in: limits.qRange, field: "Q", line: lineNumber)
 
             try append(
@@ -278,7 +277,7 @@ public enum EQProfileTextImporter {
             throw ProfileImportError.noSupportedFilters
         }
 
-        return EQProfile(name: profileName, mode: .parametric, filters: filters)
+        return EQProfile(name: profileName, mode: inferredMode(filters: filters), filters: filters)
     }
 
     private static func parseEqualizerAPOKind(_ token: String) -> FilterKind? {
@@ -296,6 +295,18 @@ public enum EQProfileTextImporter {
         default:
             return nil
         }
+    }
+
+    private static func parseREWKind(in tokens: [String]) -> FilterKind {
+        if tokens.contains(where: { $0.caseInsensitiveCompare("Modal") == .orderedSame }) {
+            return .peak
+        }
+        for token in tokens {
+            if let kind = parseEqualizerAPOKind(token) {
+                return kind
+            }
+        }
+        return .peak
     }
 
     private static func optionalValue(after label: String, in tokens: [String], field: String, line: Int) throws -> Double? {
@@ -353,22 +364,7 @@ public enum EQProfileTextImporter {
 
     private static func firstNumericToken<S: Sequence>(in tokens: S, field: String, line: Int) throws -> Double? where S.Element == String {
         for token in tokens {
-            if let value = Double(token) {
-                guard value.isFinite else {
-                    throw ProfileImportError.invalidNumber(line: line, field: field, value: token)
-                }
-                return value
-            }
-        }
-        return nil
-    }
-
-    private static func lastNumericToken(in tokens: [String], field: String, line: Int) throws -> Double? {
-        for token in tokens.reversed() {
-            if let value = Double(token) {
-                guard value.isFinite else {
-                    throw ProfileImportError.invalidNumber(line: line, field: field, value: token)
-                }
+            if let value = try parseNumberIfPresent(token, field: field, line: line) {
                 return value
             }
         }
@@ -376,10 +372,38 @@ public enum EQProfileTextImporter {
     }
 
     private static func parseNumber(_ token: String, field: String, line: Int) throws -> Double {
-        guard let value = Double(token), value.isFinite else {
+        guard let value = try parseNumberIfPresent(token, field: field, line: line) else {
             throw ProfileImportError.invalidNumber(line: line, field: field, value: token)
         }
         return value
+    }
+
+    private static func parseNumberIfPresent(_ token: String, field: String, line: Int) throws -> Double? {
+        guard !isHexFloatToken(token) else {
+            throw ProfileImportError.invalidNumber(line: line, field: field, value: token)
+        }
+        guard let value = Double(normalizedDecimalToken(token)) else {
+            return nil
+        }
+        guard value.isFinite else {
+            throw ProfileImportError.invalidNumber(line: line, field: field, value: token)
+        }
+        return value
+    }
+
+    private static func normalizedDecimalToken(_ token: String) -> String {
+        guard token.contains(","),
+              !token.contains("."),
+              token.filter({ $0 == "," }).count == 1 else {
+            return token
+        }
+        return token.replacingOccurrences(of: ",", with: ".")
+    }
+
+    private static func isHexFloatToken(_ token: String) -> Bool {
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let unsigned = trimmed.hasPrefix("+") || trimmed.hasPrefix("-") ? String(trimmed.dropFirst()) : trimmed
+        return unsigned.lowercased().hasPrefix("0x")
     }
 
     private static func validate(_ value: Double, in range: ClosedRange<Double>, field: String, line: Int) throws {
@@ -446,6 +470,43 @@ public enum EQProfileTextImporter {
         rightFilters: [EQFilter]
     ) -> Int {
         filters.count + leftFilters.count + rightFilters.count
+    }
+
+    private static func inferredMode(filters: [EQFilter]) -> EQMode {
+        graphicMode(for: filters) ?? .parametric
+    }
+
+    private static func inferredMode(leftFilters: [EQFilter], rightFilters: [EQFilter]) -> EQMode {
+        guard let leftMode = graphicMode(for: leftFilters),
+              let rightMode = graphicMode(for: rightFilters),
+              leftMode == rightMode else {
+            return .parametric
+        }
+        return leftMode
+    }
+
+    private static func graphicMode(for filters: [EQFilter]) -> EQMode? {
+        let activeFilters = filters.filter(\.isEnabled)
+        guard activeFilters.allSatisfy({ $0.kind == .peak }) else {
+            return nil
+        }
+        if matchesGraphicBands(activeFilters, bands: GraphicEQBands.tenBand) {
+            return .graphic10
+        }
+        if matchesGraphicBands(activeFilters, bands: GraphicEQBands.thirtyOneBand) {
+            return .graphic31
+        }
+        return nil
+    }
+
+    private static func matchesGraphicBands(_ filters: [EQFilter], bands: [Double]) -> Bool {
+        guard filters.count == bands.count else {
+            return false
+        }
+        return zip(filters, bands).allSatisfy { filter, band in
+            abs(filter.frequency - band) <= 0.1 &&
+                abs(filter.q - GraphicEQBands.graphicQ) <= 0.01
+        }
     }
 }
 

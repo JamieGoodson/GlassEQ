@@ -64,6 +64,53 @@ struct ProfileImporterTests {
     }
 
     @Test
+    func importsEqualizerAPOChannelPreampsWithoutFiltersAsStereoProfile() throws {
+        let text = """
+        Preamp: -1 dB
+
+        Channel: L
+        Preamp: -3 dB
+
+        Channel: R
+        Preamp: -4 dB
+        """
+
+        let profile = try EQProfileTextImporter.importAutoEQ(text)
+
+        #expect(profile.channelMode == .stereo)
+        #expect(profile.preampDB == -1)
+        #expect(profile.leftPreampDB == -3)
+        #expect(profile.rightPreampDB == -4)
+        #expect(profile.filters.isEmpty)
+        #expect(profile.leftFilters.isEmpty)
+        #expect(profile.rightFilters.isEmpty)
+    }
+
+    @Test
+    func importsEqualizerAPOChannelPreampsWithLinkedFiltersAsStereoFallback() throws {
+        let text = """
+        Preamp: -1 dB
+        Filter 1: ON PK Fc 1000 Hz Gain 2 dB Q 1
+
+        Channel: L
+        Preamp: -3 dB
+
+        Channel: R
+        Preamp: -4 dB
+        """
+
+        let profile = try EQProfileTextImporter.importAutoEQ(text)
+
+        #expect(profile.channelMode == .stereo)
+        #expect(profile.preampDB == -1)
+        #expect(profile.leftPreampDB == -3)
+        #expect(profile.rightPreampDB == -4)
+        #expect(profile.filters.count == 1)
+        #expect(profile.leftFilters == profile.filters)
+        #expect(profile.rightFilters == profile.filters)
+    }
+
+    @Test
     func importsREWText() throws {
         let text = """
         Filter 1: ON PK Fc 45.0 Hz Gain -4.5 dB Q 3.20
@@ -76,6 +123,87 @@ struct ProfileImporterTests {
         #expect(profile.filters[0].frequency == 45)
         #expect(profile.filters[0].gainDB == -4.5)
         #expect(profile.filters[0].q == 3.2)
+    }
+
+    @Test
+    func importsREWFilterKindsAndDecimalCommas() throws {
+        let text = """
+        Filter 1: ON LS Fc 80,5 Hz Gain 3,5 dB Q 0,70
+        Filter 2: ON HS Fc 12000 Hz Gain -2 dB Q 0.80
+        Filter 3: ON HP Fc 30 Hz Gain 0 dB Q 0.707
+        Filter 4: ON LP Fc 18000 Hz Gain 0 dB Q 0.707
+        """
+
+        let profile = try EQProfileTextImporter.importREW(text)
+
+        #expect(profile.filters.map(\.kind) == [.lowShelf, .highShelf, .highPass, .lowPass])
+        #expect(profile.filters[0].frequency == 80.5)
+        #expect(profile.filters[0].gainDB == 3.5)
+        #expect(profile.filters[0].q == 0.7)
+    }
+
+    @Test
+    func importsREWMissingQAsDefaultInsteadOfLastNumericToken() throws {
+        let profile = try EQProfileTextImporter.importREW("Filter 1: ON PK Fc 45.0 Hz Gain -4.5 dB")
+
+        #expect(profile.filters.count == 1)
+        #expect(profile.filters[0].q == 0.707_106_781_18)
+    }
+
+    @Test
+    func rejectsHexFloatNumericTokens() throws {
+        do {
+            _ = try EQProfileTextImporter.importREW("Filter 1: ON PK Fc 0x1p10 Hz Gain 0 dB Q 1")
+            Issue.record("Expected hex float to fail")
+        } catch let error as ProfileImportError {
+            #expect(error == .invalidNumber(line: 1, field: "frequency", value: "0x1p10"))
+        }
+    }
+
+    @Test
+    func importsGraphicProfileRoundTripAsGraphicMode() throws {
+        let exported = EQProfileTextExporter.exportEqualizerAPO(.flatGraphic10)
+
+        let profile = try EQProfileTextImporter.importAutoEQ(exported)
+
+        #expect(profile.mode == .graphic10)
+        #expect(profile.filters.count == GraphicEQBands.tenBand.count)
+    }
+
+    @Test
+    func importsGraphicBandFrequenciesWithNonGraphicQAsParametric() throws {
+        let text = GraphicEQBands.tenBand.enumerated().map { index, frequency in
+            "Filter \(index + 1): ON PK Fc \(frequency) Hz Gain 0 dB Q 1.00"
+        }.joined(separator: "\n")
+
+        let profile = try EQProfileTextImporter.importAutoEQ(text)
+
+        #expect(profile.mode == .parametric)
+        #expect(profile.filters.map(\.frequency) == GraphicEQBands.tenBand)
+    }
+
+    @Test
+    func importsStereoGraphicProfileAndPersistsWithEmptyLinkedFilters() throws {
+        let stereoGraphic = EQProfile(
+            name: "Stereo Graphic",
+            mode: .graphic10,
+            channelMode: .stereo,
+            filters: [],
+            leftFilters: EQProfile.flatGraphic10.filters,
+            rightFilters: EQProfile.flatGraphic10.filters
+        )
+        let exported = EQProfileTextExporter.exportEqualizerAPO(stereoGraphic)
+
+        let profile = try EQProfileTextImporter.importAutoEQ(exported)
+        let store = ProfileStore(profiles: [profile], fallbackProfileID: profile.id)
+        let decoded = try ProfilePersistence.decode(ProfilePersistence.encode(store))
+
+        #expect(profile.mode == .graphic10)
+        #expect(profile.channelMode == .stereo)
+        #expect(profile.filters.isEmpty)
+        #expect(profile.leftFilters.count == GraphicEQBands.tenBand.count)
+        #expect(profile.rightFilters.count == GraphicEQBands.tenBand.count)
+        #expect(decoded.profiles == [profile])
     }
 
     @Test
@@ -149,14 +277,14 @@ struct ProfileImporterTests {
     func rejectsAutoEQNumericFieldsOutsideLimitsWithLineNumber() throws {
         let text = """
         Preamp: -3 dB
-        Filter 1: ON PK Fc 97000 Hz Gain 0 dB Q 1
+        Filter 1: ON PK Fc 25000 Hz Gain 0 dB Q 1
         """
 
         do {
             _ = try EQProfileTextImporter.importAutoEQ(text)
             Issue.record("Expected frequency limit to fail")
         } catch let error as ProfileImportError {
-            #expect(error == .valueOutOfRange(line: 2, field: "frequency", value: 97_000, range: 1...96_000))
+            #expect(error == .valueOutOfRange(line: 2, field: "frequency", value: 25_000, range: 1...24_000))
             #expect(error.errorDescription?.contains("Line 2") == true)
         }
     }
