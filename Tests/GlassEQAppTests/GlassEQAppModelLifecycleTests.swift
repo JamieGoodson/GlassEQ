@@ -977,6 +977,36 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsLaunchValidationFailureTerminatesPartiallyStartedHelper() async throws {
+        let model = makeModel()
+        let launcher = SleepingSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: FailingSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        coordinator.openSettings()
+
+        let process = try #require(launcher.launchedProcesses.first)
+        defer {
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+        for _ in 0..<250 {
+            if !process.isRunning {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(!process.isRunning)
+        #expect(model.statusMessage.contains("Settings failed to open"))
+    }
+
+    @Test
     func settingsHelperValidationChecksContainmentBundleIDAndSigningPolicy() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("GlassEQHelperValidation-\(UUID().uuidString)", isDirectory: true)
@@ -1053,6 +1083,81 @@ struct GlassEQAppModelLifecycleTests {
             hostBundleURL: hostURL,
             codeSigningValidator: adHoc
         )
+    }
+
+    @Test
+    func settingsHelperRunningValidationFallsBackWhenLaunchServicesHasNoBundleURL() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GlassEQHelperRunningValidation-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+        }
+        let hostURL = root.appendingPathComponent("GlassEQ.app", isDirectory: true)
+        let helperURL = hostURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Helpers", isDirectory: true)
+            .appendingPathComponent("GlassEQSettings.app", isDirectory: true)
+        try makeFakeAppBundle(
+            at: helperURL,
+            bundleIdentifier: SettingsHelperVerifier.helperBundleIdentifier,
+            executableName: "GlassEQSettings"
+        )
+        let validator = FakeCodeSigningValidator(signatures: [
+            hostURL.standardizedFileURL.path: SettingsCodeSignatureInfo(signingIdentifier: SettingsHelperVerifier.hostBundleIdentifier, teamIdentifier: "TEAMID"),
+            helperURL.standardizedFileURL.path: SettingsCodeSignatureInfo(signingIdentifier: SettingsHelperVerifier.helperBundleIdentifier, teamIdentifier: "TEAMID"),
+            "pid:123": SettingsCodeSignatureInfo(signingIdentifier: SettingsHelperVerifier.helperBundleIdentifier, teamIdentifier: "TEAMID")
+        ])
+
+        try SettingsHelperVerifier.validateRunningProcess(
+            processIdentifier: 123,
+            expectedHelperURL: helperURL,
+            hostBundleURL: hostURL,
+            runningBundleURL: { _ in nil },
+            processExecutableURL: { _ in helperExecutableURL(for: helperURL) },
+            codeSigningValidator: validator
+        )
+    }
+
+    @Test
+    func settingsHelperRunningValidationRejectsUnexpectedResolvedBundleURL() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GlassEQHelperRunningValidation-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+        }
+        let hostURL = root.appendingPathComponent("GlassEQ.app", isDirectory: true)
+        let helperURL = hostURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Helpers", isDirectory: true)
+            .appendingPathComponent("GlassEQSettings.app", isDirectory: true)
+        let otherURL = root.appendingPathComponent("OtherSettings.app", isDirectory: true)
+        try makeFakeAppBundle(
+            at: helperURL,
+            bundleIdentifier: SettingsHelperVerifier.helperBundleIdentifier,
+            executableName: "GlassEQSettings"
+        )
+        try makeFakeAppBundle(
+            at: otherURL,
+            bundleIdentifier: SettingsHelperVerifier.helperBundleIdentifier,
+            executableName: "GlassEQSettings"
+        )
+        let validator = FakeCodeSigningValidator(signatures: [
+            hostURL.standardizedFileURL.path: SettingsCodeSignatureInfo(signingIdentifier: SettingsHelperVerifier.hostBundleIdentifier, teamIdentifier: "TEAMID"),
+            helperURL.standardizedFileURL.path: SettingsCodeSignatureInfo(signingIdentifier: SettingsHelperVerifier.helperBundleIdentifier, teamIdentifier: "TEAMID"),
+            otherURL.standardizedFileURL.path: SettingsCodeSignatureInfo(signingIdentifier: SettingsHelperVerifier.helperBundleIdentifier, teamIdentifier: "TEAMID"),
+            "pid:123": SettingsCodeSignatureInfo(signingIdentifier: SettingsHelperVerifier.helperBundleIdentifier, teamIdentifier: "TEAMID")
+        ])
+
+        #expect(throws: SettingsCommandFailure.self) {
+            try SettingsHelperVerifier.validateRunningProcess(
+                processIdentifier: 123,
+                expectedHelperURL: helperURL,
+                hostBundleURL: hostURL,
+                runningBundleURL: { _ in otherURL },
+                processExecutableURL: { _ in helperExecutableURL(for: otherURL) },
+                codeSigningValidator: validator
+            )
+        }
     }
 }
 
@@ -1145,6 +1250,14 @@ private func makeFakeAppBundle(
     FileManager.default.createFile(atPath: executableURL.path, contents: Data("#!/bin/sh\n".utf8))
 }
 
+private func helperExecutableURL(for helperURL: URL) -> URL {
+    helperURL
+        .appendingPathComponent("Contents", isDirectory: true)
+        .appendingPathComponent("MacOS", isDirectory: true)
+        .appendingPathComponent("GlassEQSettings", isDirectory: false)
+        .standardizedFileURL
+}
+
 private func settleAsyncWork() async {
     try? await Task.sleep(for: .milliseconds(20))
 }
@@ -1190,6 +1303,52 @@ private struct FakeCodeSigningValidator: SettingsCodeSigningValidating {
             throw SettingsCommandFailure(message: "Missing fake signature")
         }
         return signature
+    }
+
+    func signatureInfo(forProcessIdentifier processIdentifier: pid_t) throws -> SettingsCodeSignatureInfo {
+        guard let signature = signatures["pid:\(processIdentifier)"] ?? signatures.values.first else {
+            throw SettingsCommandFailure(message: "Missing fake process signature")
+        }
+        return signature
+    }
+}
+
+private struct FailingSettingsHelperLaunchValidator: SettingsHelperLaunchValidating {
+    func validatedExecutableURL(for helperURL: URL) throws -> URL {
+        URL(fileURLWithPath: "/bin/sleep")
+    }
+
+    func validateRunningProcess(processIdentifier: pid_t, expectedHelperURL: URL) throws {
+        throw SettingsCommandFailure(message: "Intentional post-launch validation failure")
+    }
+}
+
+private final class SleepingSettingsHelperLauncher: SettingsHelperLaunching {
+    private(set) var launchedProcesses: [Process] = []
+
+    func launch(
+        executableURL: URL,
+        arguments: [String],
+        terminationHandler: @escaping @Sendable (Process) -> Void
+    ) throws -> SettingsHelperLaunch {
+        let process = Process()
+        let helperInput = Pipe()
+        let helperOutput = Pipe()
+        let helperError = Pipe()
+        process.executableURL = executableURL
+        process.arguments = ["60"]
+        process.standardInput = helperInput.fileHandleForReading
+        process.standardOutput = helperOutput.fileHandleForWriting
+        process.standardError = helperError.fileHandleForWriting
+        process.terminationHandler = terminationHandler
+        try process.run()
+        launchedProcesses.append(process)
+        return SettingsHelperLaunch(
+            process: process,
+            input: helperInput,
+            output: helperOutput,
+            error: helperError
+        )
     }
 }
 

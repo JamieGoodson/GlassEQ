@@ -9,23 +9,95 @@ private struct UncheckedSendable<Value>: @unchecked Sendable {
     var value: Value
 }
 
+struct SettingsHelperLaunch {
+    var process: Process
+    var input: Pipe
+    var output: Pipe
+    var error: Pipe
+}
+
+protocol SettingsHelperLaunching {
+    func launch(
+        executableURL: URL,
+        arguments: [String],
+        terminationHandler: @escaping @Sendable (Process) -> Void
+    ) throws -> SettingsHelperLaunch
+}
+
+struct ProcessSettingsHelperLauncher: SettingsHelperLaunching {
+    func launch(
+        executableURL: URL,
+        arguments: [String],
+        terminationHandler: @escaping @Sendable (Process) -> Void
+    ) throws -> SettingsHelperLaunch {
+        let process = Process()
+        let helperInput = Pipe()
+        let helperOutput = Pipe()
+        let helperError = Pipe()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.standardInput = helperInput.fileHandleForReading
+        process.standardOutput = helperOutput.fileHandleForWriting
+        process.standardError = helperError.fileHandleForWriting
+        process.terminationHandler = terminationHandler
+        try process.run()
+        return SettingsHelperLaunch(
+            process: process,
+            input: helperInput,
+            output: helperOutput,
+            error: helperError
+        )
+    }
+}
+
+protocol SettingsHelperLaunchValidating {
+    func validatedExecutableURL(for helperURL: URL) throws -> URL
+    func validateRunningProcess(processIdentifier: pid_t, expectedHelperURL: URL) throws
+}
+
+struct DefaultSettingsHelperLaunchValidator: SettingsHelperLaunchValidating {
+    func validatedExecutableURL(for helperURL: URL) throws -> URL {
+        try SettingsHelperVerifier.validatedExecutableURL(for: helperURL)
+    }
+
+    func validateRunningProcess(processIdentifier: pid_t, expectedHelperURL: URL) throws {
+        try SettingsHelperVerifier.validateRunningProcess(
+            processIdentifier: processIdentifier,
+            expectedHelperURL: expectedHelperURL
+        )
+    }
+}
+
 @MainActor
 final class SettingsCoordinator: NSObject {
     private weak var model: GlassEQAppModel?
+    private let helperLauncher: any SettingsHelperLaunching
+    private let helperValidator: any SettingsHelperLaunchValidating
+    private let settingsHelperURLProvider: () throws -> URL
     private var launchToken: String?
     private var runningApplication: NSRunningApplication?
     private var helperProcess: Process?
     private var pipeWriter: FileHandle?
     private var pipeReader: FileHandle?
     private var pipeErrorReader: FileHandle?
-    private var pipeDecoder = SettingsPipeLineDecoder()
+    private var pipeReadPump: SettingsPipeReadPump?
+    private var pipeReadDelivery: SettingsPipeOrderedMainActorDelivery?
+    private var pipeWritePump: SettingsPipeWritePump?
     private var settingsConnected = false
     private var pendingFocusRequest = false
-    private var suppressModelChangeEvents = false
+    private var suppressedModelChangeDepth = 0
     private var lastSentSnapshot: SettingsSnapshot?
 
-    init(model: GlassEQAppModel) {
+    init(
+        model: GlassEQAppModel,
+        helperLauncher: any SettingsHelperLaunching = ProcessSettingsHelperLauncher(),
+        helperValidator: any SettingsHelperLaunchValidating = DefaultSettingsHelperLaunchValidator(),
+        settingsHelperURLProvider: (() throws -> URL)? = nil
+    ) {
         self.model = model
+        self.helperLauncher = helperLauncher
+        self.helperValidator = helperValidator
+        self.settingsHelperURLProvider = settingsHelperURLProvider ?? { try Self.defaultSettingsHelperURL() }
         super.init()
     }
 
@@ -41,13 +113,13 @@ final class SettingsCoordinator: NSObject {
         }
 
         do {
-            let token = prepareSession()
+            let token = try prepareSession()
             pendingFocusRequest = true
             try launchHelper(token: token)
         } catch {
             model?.statusMessage = localized("Settings failed to open: \(error.localizedDescription)")
             model?.notifyModelDidChangeFromCoordinator()
-            cleanupSession(terminateHelper: false)
+            cleanupSession(terminateHelper: true)
         }
     }
 
@@ -56,8 +128,13 @@ final class SettingsCoordinator: NSObject {
         cleanupSession(terminateHelper: true)
     }
 
+    func shutdownAndWait() async {
+        send(.shutdown)
+        await cleanupSessionAndWait(terminateHelper: true)
+    }
+
     func modelDidChange() {
-        guard !suppressModelChangeEvents,
+        guard suppressedModelChangeDepth == 0,
               let model else {
             return
         }
@@ -79,41 +156,53 @@ final class SettingsCoordinator: NSObject {
         send(.metricsChanged(metrics))
     }
 
-    private func prepareSession() -> String {
-        let token = UUID().uuidString
+    private func prepareSession() throws -> String {
+        let token = try Self.makeSessionToken()
         launchToken = token
         settingsConnected = false
         pendingFocusRequest = false
-        suppressModelChangeEvents = false
+        suppressedModelChangeDepth = 0
         lastSentSnapshot = nil
-        pipeDecoder = SettingsPipeLineDecoder()
         return token
     }
 
-    private func launchHelper(token: String) throws {
-        let helperURL = try settingsHelperURL()
-        let executableURL = try SettingsHelperVerifier.validatedExecutableURL(for: helperURL)
-
-        let process = Process()
-        let helperInput = Pipe()
-        let helperOutput = Pipe()
-        let helperError = Pipe()
-        process.executableURL = executableURL
-        process.arguments = [
-            "--glasseq-settings-token", token,
-            "--glasseq-main-pid", String(ProcessInfo.processInfo.processIdentifier)
-        ]
-        process.standardInput = helperInput.fileHandleForReading
-        process.standardOutput = helperOutput.fileHandleForWriting
-        process.standardError = helperError.fileHandleForWriting
-        process.terminationHandler = { [weak self] _ in
-            Task { @MainActor in
-                self?.cleanupSession(terminateHelper: false)
-            }
+    private static func makeSessionToken() throws -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard status == errSecSuccess else {
+            throw SettingsCommandFailure(message: localized("Secure random token generation failed: \(status)"))
         }
-        try process.run()
+        return Data(bytes)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private func launchHelper(token: String) throws {
+        let helperURL = try settingsHelperURLProvider()
+        let executableURL = try helperValidator.validatedExecutableURL(for: helperURL)
+        let launch = try helperLauncher.launch(
+            executableURL: executableURL,
+            arguments: [
+                "--glasseq-main-pid", String(ProcessInfo.processInfo.processIdentifier)
+            ],
+            terminationHandler: { [weak self] _ in
+                Task { @MainActor in
+                    self?.cleanupSession(terminateHelper: false)
+                }
+            }
+        )
+        let process = launch.process
+        let helperInput = launch.input
+        let helperOutput = launch.output
+        let helperError = launch.error
         helperProcess = process
         pipeWriter = helperInput.fileHandleForWriting
+        pipeWritePump = SettingsPipeWritePump(
+            label: "com.glasseq.settings-coordinator.pipe-write",
+            fileHandle: helperInput.fileHandleForWriting
+        )
         pipeReader = helperOutput.fileHandleForReading
         pipeErrorReader = helperError.fileHandleForReading
         installPipeReader(helperOutput.fileHandleForReading)
@@ -121,10 +210,20 @@ final class SettingsCoordinator: NSObject {
             _ = handle.availableData
         }
         runningApplication = NSRunningApplication(processIdentifier: process.processIdentifier)
-        focusSettings()
+        do {
+            try helperValidator.validateRunningProcess(
+                processIdentifier: process.processIdentifier,
+                expectedHelperURL: helperURL
+            )
+            writePipeMessage(.bootstrap(sessionToken: token))
+            focusSettings()
+        } catch {
+            cleanupSession(terminateHelper: true)
+            throw error
+        }
     }
 
-    private func settingsHelperURL() throws -> URL {
+    private static func defaultSettingsHelperURL() throws -> URL {
         let bundleURL = Bundle.main.bundleURL
         let helperURL: URL
         if bundleURL.pathExtension == "app" {
@@ -142,6 +241,19 @@ final class SettingsCoordinator: NSObject {
         }
         return helperURL
     }
+
+    #if DEBUG
+    var hasActiveSessionResourcesForTesting: Bool {
+        helperProcess != nil ||
+            pipeWriter != nil ||
+            pipeReader != nil ||
+            pipeErrorReader != nil ||
+            pipeReadPump != nil ||
+            pipeWritePump != nil ||
+            launchToken != nil ||
+            runningApplication != nil
+    }
+    #endif
 
     private func perform(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
         guard let model else {
@@ -161,36 +273,34 @@ final class SettingsCoordinator: NSObject {
         guard let launchToken else {
             return
         }
-        do {
-            try writePipeMessage(.event(sessionToken: launchToken, event: event))
-        } catch {
-            failPipeSession(error)
-        }
+        writePipeMessage(.event(sessionToken: launchToken, event: event))
     }
 
     private func installPipeReader(_ readHandle: FileHandle) {
-        let decoder = pipeDecoder
-        readHandle.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else {
-                Task { @MainActor in
-                    self?.cleanupSession(terminateHelper: false)
-                }
-                return
-            }
-            Task {
-                do {
-                    let messages = try await decoder.append(data)
-                    await MainActor.run {
+        let delivery = SettingsPipeOrderedMainActorDelivery(
+            label: "com.glasseq.settings-coordinator.pipe-read.delivery"
+        )
+        let pump = SettingsPipeReadPump(
+            label: "com.glasseq.settings-coordinator.pipe-read",
+            onMessages: { [weak self, delivery] result in
+                delivery.enqueue {
+                    switch result {
+                    case .success(let messages):
                         self?.handlePipeMessages(messages)
-                    }
-                } catch {
-                    await MainActor.run {
+                    case .failure(let error):
                         self?.failPipeSession(error)
                     }
                 }
+            },
+            onEndOfFile: { [weak self, delivery] in
+                delivery.enqueue {
+                    self?.cleanupSession(terminateHelper: false)
+                }
             }
-        }
+        )
+        pipeReadDelivery = delivery
+        pipeReadPump = pump
+        pump.install(on: readHandle)
     }
 
     private func handlePipeMessages(_ messages: [SettingsPipeMessage]) {
@@ -210,6 +320,8 @@ final class SettingsCoordinator: NSObject {
         try message.validateSessionToken(launchToken)
 
         switch message {
+        case .bootstrap:
+            break
         case let .request(_, id, .connect, _):
             handleConnect(requestID: id)
         case let .request(_, id, .command, command):
@@ -246,15 +358,15 @@ final class SettingsCoordinator: NSObject {
                 return
             }
             do {
-                suppressModelChangeEvents = true
+                suppressedModelChangeDepth += 1
                 let response = try await perform(command)
-                suppressModelChangeEvents = false
+                suppressedModelChangeDepth = max(suppressedModelChangeDepth - 1, 0)
                 if let snapshot = response.snapshot {
                     lastSentSnapshot = snapshot
                 }
                 sendResponse(response, requestID: requestID)
             } catch {
-                suppressModelChangeEvents = false
+                suppressedModelChangeDepth = max(suppressedModelChangeDepth - 1, 0)
                 sendError(error.localizedDescription, requestID: requestID)
             }
         }
@@ -344,32 +456,37 @@ final class SettingsCoordinator: NSObject {
         guard let launchToken else {
             return
         }
-        do {
-            try writePipeMessage(.response(sessionToken: launchToken, id: requestID, response: response, error: nil))
-        } catch {
-            failPipeSession(error)
-        }
+        writePipeMessage(.response(sessionToken: launchToken, id: requestID, response: response, error: nil))
     }
 
     private func sendError(_ message: String, requestID: String) {
         guard let launchToken else {
             return
         }
-        do {
-            try writePipeMessage(.response(sessionToken: launchToken, id: requestID, response: nil, error: message))
-        } catch {
-            failPipeSession(error)
-        }
+        writePipeMessage(.response(sessionToken: launchToken, id: requestID, response: nil, error: message))
     }
 
-    private func writePipeMessage(_ message: SettingsPipeMessage) throws {
-        guard let pipeWriter else {
-            throw SettingsCommandFailure(message: localized("Settings IPC pipe is not connected."))
+    private func writePipeMessage(_ message: SettingsPipeMessage) {
+        guard let pipeWritePump else {
+            failPipeSession(SettingsCommandFailure(message: localized("Settings IPC pipe is not connected.")))
+            return
         }
-        do {
-            try pipeWriter.write(contentsOf: SettingsPipeCodec.encodeLine(message))
-        } catch {
-            throw SettingsCommandFailure(message: localized("Settings IPC write failed: \(error.localizedDescription)"))
+        let expectedToken = message.sessionToken
+        let expectedPump = pipeWritePump
+        pipeWritePump.enqueue(message) { [weak self] result in
+            guard case .failure(let error) = result else {
+                return
+            }
+            Task { @MainActor in
+                guard let self,
+                      self.launchToken == expectedToken,
+                      self.pipeWritePump === expectedPump else {
+                    return
+                }
+                self.failPipeSession(SettingsCommandFailure(
+                    message: localized("Settings IPC write failed: \(error.localizedDescription)")
+                ))
+            }
         }
     }
 
@@ -383,34 +500,56 @@ final class SettingsCoordinator: NSObject {
         model?.notifyModelDidChangeFromCoordinator()
     }
 
-    private func cleanupSession(terminateHelper: Bool) {
+    @discardableResult
+    private func cleanupSession(terminateHelper: Bool) -> Task<Void, Never>? {
         model?.stopMetricsPolling()
         let processToTerminate = terminateHelper ? helperProcess : nil
-        pipeReader?.readabilityHandler = nil
+        let writePumpToDrain = pipeWritePump
+        let writerToCloseDirectly = writePumpToDrain == nil ? pipeWriter : nil
+        pipeReadDelivery?.invalidate()
+        pipeReadDelivery = nil
+        pipeReadPump?.invalidate(handle: pipeReader)
+        pipeReadPump = nil
+        pipeWritePump = nil
         pipeErrorReader?.readabilityHandler = nil
         try? pipeReader?.close()
         try? pipeErrorReader?.close()
-        try? pipeWriter?.close()
+        if let writerToCloseDirectly {
+            try? writerToCloseDirectly.close()
+        }
         pipeReader = nil
         pipeErrorReader = nil
         pipeWriter = nil
         launchToken = nil
         pendingFocusRequest = false
-        suppressModelChangeEvents = false
+        suppressedModelChangeDepth = 0
         lastSentSnapshot = nil
         runningApplication = nil
         helperProcess = nil
         settingsConnected = false
-        if let processToTerminate {
-            SettingsHelperTerminator.terminate(process: processToTerminate)
+        if writePumpToDrain != nil || processToTerminate != nil {
+            return Task {
+                if let writePumpToDrain {
+                    _ = await writePumpToDrain.drainAndClose()
+                }
+                if let processToTerminate {
+                    await SettingsHelperTerminator.terminate(process: processToTerminate).value
+                }
+            }
         }
+        return nil
+    }
+
+    private func cleanupSessionAndWait(terminateHelper: Bool) async {
+        let terminationTask = cleanupSession(terminateHelper: terminateHelper)
+        await terminationTask?.value
     }
 }
 
 private enum SettingsHelperTerminator {
-    static func terminate(process: Process) {
+    static func terminate(process: Process) -> Task<Void, Never> {
         let terminator = ProcessTerminator(process: process)
-        Task.detached(priority: .utility) {
+        return Task.detached(priority: .utility) {
             await terminator.run()
         }
     }
@@ -453,6 +592,7 @@ struct SettingsCodeSignatureInfo: Equatable, Sendable {
 
 protocol SettingsCodeSigningValidating {
     func signatureInfo(for url: URL) throws -> SettingsCodeSignatureInfo
+    func signatureInfo(forProcessIdentifier processIdentifier: pid_t) throws -> SettingsCodeSignatureInfo
 }
 
 enum SettingsHelperVerifier {
@@ -486,16 +626,11 @@ enum SettingsHelperVerifier {
             throw SettingsCommandFailure(message: localized("GlassEQSettings.app has an unexpected bundle identifier."))
         }
 
-        let executableName = helperBundle.object(forInfoDictionaryKey: "CFBundleExecutable") as? String ?? "GlassEQSettings"
-        let executableURL = standardizedHelperURL
-            .appendingPathComponent("Contents", isDirectory: true)
-            .appendingPathComponent("MacOS", isDirectory: true)
-            .appendingPathComponent(executableName, isDirectory: false)
-            .standardizedFileURL
-        guard executableURL.path.hasPrefix(standardizedHelperURL.path + "/"),
-              fileManager.fileExists(atPath: executableURL.path) else {
-            throw SettingsCommandFailure(message: localized("GlassEQSettings executable was not found in the app bundle."))
-        }
+        let executableURL = try helperExecutableURL(
+            for: standardizedHelperURL,
+            helperBundle: helperBundle,
+            fileManager: fileManager
+        )
 
         let helperSignature = try codeSigningValidator.signatureInfo(for: standardizedHelperURL)
         if let signingIdentifier = helperSignature.signingIdentifier,
@@ -520,6 +655,97 @@ enum SettingsHelperVerifier {
 
         return executableURL
     }
+
+    static func validateRunningProcess(
+        processIdentifier: pid_t,
+        expectedHelperURL: URL,
+        hostBundleURL: URL = Bundle.main.bundleURL,
+        fileManager: FileManager = .default,
+        runningBundleURL: (pid_t) -> URL? = { NSRunningApplication(processIdentifier: $0)?.bundleURL },
+        processExecutableURL: (pid_t) -> URL? = runningExecutableURL(processIdentifier:),
+        codeSigningValidator: any SettingsCodeSigningValidating = SecuritySettingsCodeSigningValidator()
+    ) throws {
+        let standardizedExpectedHelperURL = expectedHelperURL.standardizedFileURL
+        let standardizedHostURL = hostBundleURL.standardizedFileURL
+        let resolvedBundleURL = runningBundleURL(processIdentifier)?.standardizedFileURL
+        let bundleURL = resolvedBundleURL ?? standardizedExpectedHelperURL
+
+        if let resolvedBundleURL,
+           resolvedBundleURL.path != standardizedExpectedHelperURL.path {
+            throw SettingsCommandFailure(message: localized("GlassEQSettings.app resolved to an unexpected location after launch."))
+        }
+
+        guard fileManager.fileExists(atPath: bundleURL.path),
+              let helperBundle = Bundle(url: bundleURL),
+              helperBundle.bundleIdentifier == helperBundleIdentifier else {
+            throw SettingsCommandFailure(message: localized("GlassEQSettings.app could not be resolved after launch."))
+        }
+        let expectedExecutableURL = try helperExecutableURL(
+            for: bundleURL,
+            helperBundle: helperBundle,
+            fileManager: fileManager
+        )
+        guard let actualExecutableURL = processExecutableURL(processIdentifier)?.standardizedFileURL,
+              actualExecutableURL.path == expectedExecutableURL.path else {
+            throw SettingsCommandFailure(message: localized("GlassEQSettings executable could not be resolved after launch."))
+        }
+
+        let helperSignature = try codeSigningValidator.signatureInfo(for: bundleURL)
+        if let signingIdentifier = helperSignature.signingIdentifier,
+           signingIdentifier != helperBundleIdentifier {
+            throw SettingsCommandFailure(message: localized("GlassEQSettings.app has an unexpected code-signing identifier."))
+        }
+
+        let processSignature = try? codeSigningValidator.signatureInfo(forProcessIdentifier: processIdentifier)
+        if let processSignature {
+            if let signingIdentifier = processSignature.signingIdentifier,
+               signingIdentifier != helperBundleIdentifier {
+                throw SettingsCommandFailure(message: localized("GlassEQSettings.app has an unexpected code-signing identifier."))
+            }
+        }
+
+        let hostSignature = try? codeSigningValidator.signatureInfo(for: standardizedHostURL)
+        guard let hostTeamIdentifier = hostSignature?.teamIdentifier,
+              !hostTeamIdentifier.isEmpty else {
+            return
+        }
+        guard helperSignature.teamIdentifier == hostTeamIdentifier else {
+            throw SettingsCommandFailure(message: localized("GlassEQSettings.app was not signed by the same team as GlassEQ."))
+        }
+        if let processSignature,
+           processSignature.teamIdentifier != hostTeamIdentifier {
+            throw SettingsCommandFailure(message: localized("GlassEQSettings.app was not signed by the same team as GlassEQ."))
+        }
+    }
+
+    private static func helperExecutableURL(
+        for standardizedHelperURL: URL,
+        helperBundle: Bundle,
+        fileManager: FileManager
+    ) throws -> URL {
+        let executableName = helperBundle.object(forInfoDictionaryKey: "CFBundleExecutable") as? String ?? "GlassEQSettings"
+        let executableURL = standardizedHelperURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent(executableName, isDirectory: false)
+            .standardizedFileURL
+        guard executableURL.path.hasPrefix(standardizedHelperURL.path + "/"),
+              fileManager.fileExists(atPath: executableURL.path) else {
+            throw SettingsCommandFailure(message: localized("GlassEQSettings executable was not found in the app bundle."))
+        }
+        return executableURL
+    }
+
+    private static func runningExecutableURL(processIdentifier: pid_t) -> URL? {
+        var pathBuffer = [CChar](repeating: 0, count: 4_096)
+        let length = proc_pidpath(processIdentifier, &pathBuffer, UInt32(pathBuffer.count))
+        guard length > 0 else {
+            return nil
+        }
+        let bytes = pathBuffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        let path = String(decoding: bytes, as: UTF8.self)
+        return URL(fileURLWithPath: path).standardizedFileURL
+    }
 }
 
 struct SecuritySettingsCodeSigningValidator: SettingsCodeSigningValidating {
@@ -536,17 +762,42 @@ struct SecuritySettingsCodeSigningValidator: SettingsCodeSigningValidating {
             throw SettingsCommandFailure(message: localized("Code signing validation failed for \(url.lastPathComponent): \(status)"))
         }
 
+        return try signatureInfo(from: staticCode, label: url.lastPathComponent)
+    }
+
+    func signatureInfo(forProcessIdentifier processIdentifier: pid_t) throws -> SettingsCodeSignatureInfo {
+        var code: SecCode?
+        let attributes = [kSecGuestAttributePid as String: processIdentifier] as CFDictionary
+        var status = SecCodeCopyGuestWithAttributes(nil, attributes, SecCSFlags(), &code)
+        guard status == errSecSuccess, let code else {
+            throw SettingsCommandFailure(message: localized("Code signing validation failed for process \(processIdentifier): \(status)"))
+        }
+
+        status = SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), nil)
+        guard status == errSecSuccess else {
+            throw SettingsCommandFailure(message: localized("Code signing validation failed for process \(processIdentifier): \(status)"))
+        }
+
+        var staticCode: SecStaticCode?
+        status = SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode)
+        guard status == errSecSuccess, let staticCode else {
+            throw SettingsCommandFailure(message: localized("Code signing information was unavailable for process \(processIdentifier): \(status)"))
+        }
+
+        return try signatureInfo(from: staticCode, label: "process \(processIdentifier)")
+    }
+
+    private func signatureInfo(from code: SecStaticCode, label: String) throws -> SettingsCodeSignatureInfo {
         var info: CFDictionary?
-        status = SecCodeCopySigningInformation(
-            staticCode,
+        let status = SecCodeCopySigningInformation(
+            code,
             SecCSFlags(rawValue: kSecCSSigningInformation),
             &info
         )
         guard status == errSecSuccess,
               let dictionary = info as? [String: Any] else {
-            throw SettingsCommandFailure(message: localized("Code signing information was unavailable for \(url.lastPathComponent)."))
+            throw SettingsCommandFailure(message: localized("Code signing information was unavailable for \(label)."))
         }
-
         return SettingsCodeSignatureInfo(
             signingIdentifier: dictionary[kSecCodeInfoIdentifier as String] as? String,
             teamIdentifier: dictionary[kSecCodeInfoTeamIdentifier as String] as? String
