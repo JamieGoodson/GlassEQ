@@ -1,33 +1,96 @@
 # GlassEQ
 
-GlassEQ is a native macOS 26 system-output equalizer prototype written in Swift 6.
+A native macOS equalizer that processes your **entire system audio** in real time without installing a virtual audio device, a loopback driver, or a system extension.
 
-## Download Current Alpha
+[![macOS 26](https://img.shields.io/badge/macOS-26-black)](#supported-target)
+[![Apple Silicon](https://img.shields.io/badge/arch-Apple%20Silicon-black)](#supported-target)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-ea4aaa?logo=githubsponsors)](https://github.com/sponsors/juhokoskela)
 
-Download `GlassEQ-alpha-0.6-macos26-arm64.zip` from the [alpha-0.6 release](https://github.com/juhokoskela/GlassEQ/releases/tag/alpha-0.6).
+## What makes GlassEQ different
 
-Unzip it, move `GlassEQ.app` to `/Applications`, then open it from Finder. If macOS blocks the first launch, open System Settings > Privacy & Security and allow GlassEQ to open.
+Most system-wide equalizers on macOS work by installing a **virtual output device** that you have to select and manage yourself, e.g. eqMac, or loopback drivers in the Soundflower / BlackHole family. Your real output gets hidden behind a fake one, and routing breaks every time you switch headphones or unplug.
 
-## Alpha Status
+GlassEQ takes a different route. It uses **Core Audio process taps**, Apple's modern system-audio-capture API to read the system mix directly, apply EQ to it, and replay the processed audio to the output you're already using.
 
-Current alpha builds are for technical testers only. They are ad hoc-signed, not Developer ID signed, not notarized, Apple Silicon only, and tested only on macOS 26.
+- **No virtual device, no driver, no system extension.** GlassEQ's tap and its aggregate device are both private, so nothing new ever shows up in your Sound settings. It's an ordinary sandboxed app that asks for one thing: audio-capture permission.
+- **macOS stays in charge of routing.** GlassEQ observes the default output and follows it. You never pick an output inside the app.
+- **Per-output profiles.** Each device gets its own EQ curve, matched automatically by its Core Audio UID. Plug in your studio monitors and the monitor profile loads, switch to AirPods and their profile takes over.
+- **Light and real-time-safe.** The DSP is a hand-written biquad cascade (no FFT, no convolution), so the resident footprint stays around **25–30 MB**. The audio render path never allocates, locks, or touches disk, and profile edits hot-swap without dropping a sample.
+- **Native to macOS 26.** A menu bar app built on the system's Liquid Glass styling with a separate settings window for editing.
 
-macOS Gatekeeper will reject the app by default. Testers need to be comfortable opening an ad hoc-signed app, granting system audio capture permission, collecting diagnostics, and reporting hardware-specific audio issues.
+![GlassEQ menu bar popover, showing the active output and its mapped profile](Docs/Screenshots/menu-bar.png)
 
-For browser-downloaded alpha builds, first launch requires System Settings > Privacy & Security > allow GlassEQ to open.
+*GlassEQ lives in the menu bar and follows whatever output macOS is using.*
 
-See [Docs/AlphaTesting.md](Docs/AlphaTesting.md), [Docs/Distribution.md](Docs/Distribution.md), and [Docs/ReleaseNotes-alpha-0.6.md](Docs/ReleaseNotes-alpha-0.6.md) before installing a build.
+## Download & install
 
-The first implementation milestone focuses on the audio core:
+Grab `GlassEQ-alpha-0.7-macos26-arm64.zip` from the [alpha-0.7 release](https://github.com/juhokoskela/GlassEQ/releases/tag/alpha-0.7), then:
 
-- Core Audio default-output discovery and change monitoring.
-- Core Audio process/system tap capture and playback to the current default output.
-- Real-time-oriented EQ DSP with parametric, 10-band graphic, and 31-band graphic profiles.
-- AutoEQ / EqualizerAPO and REW text import.
-- Per-output profile mapping by Core Audio device UID.
-- SwiftUI menu bar app shell.
+1. Unzip it.
+2. Move `GlassEQ.app` to `/Applications`.
+3. Open it from Finder.
 
-## Pinned Toolchain
+The alpha is ad hoc-signed and not yet notarized ([you can help change that](#support-the-project)), so macOS asks you to confirm the first launch: open **System Settings → Privacy & Security**, find the GlassEQ notice, and click **Open Anyway**. It opens normally after that.
+
+On first run GlassEQ asks for **system audio capture permission** — that's what lets it read and equalize the system mix. Grant it and you're set.
+
+### About this alpha
+
+GlassEQ is an early alpha: Apple Silicon only, tested on macOS 26, with no automatic updates or crash reporting yet. Expect the occasional rough edge, and please report any hardware-specific audio issues you run into. See [Docs/AlphaTesting.md](Docs/AlphaTesting.md), [Docs/Distribution.md](Docs/Distribution.md), and [Docs/ReleaseNotes-alpha-0.7.md](Docs/ReleaseNotes-alpha-0.7.md) before installing a build.
+
+## How it works
+
+1. GlassEQ opens a **private, muted global process tap** that excludes itself, pulling the dry system mix out of the output without creating a feedback loop.
+2. Tapped audio runs through the active EQ profile in real time.
+3. The processed audio is replayed to the current default output device, which GlassEQ pins to the tap's sample rate so nothing has to be resampled.
+4. When you change outputs, the tap stays alive and only the output stage is rebuilt, so dry audio never leaks to the new device during the handoff.
+
+The result is low, predictable latency. The built-in diagnostics report it directly (about **11 ms added latency** on a 48 kHz / 512-frame route, with no underruns or clipped samples):
+
+![GlassEQ settings — Output tab, showing current output, profile mapping, engine status, and live diagnostics](Docs/Screenshots/output.png)
+
+## Features
+
+- **Three EQ modes:** parametric, 10-band graphic, and 31-band graphic.
+- **Linked or independent stereo** channels, with a per-profile preamp and a headroom indicator.
+- **Live frequency-response graph** and instant preview while you edit.
+- **Profile import** from AutoEQ / EqualizerAPO and REW text, allowing you to paste a headphone-correction curve straight in.
+- **Per-output profile mapping** by Core Audio device UID, with a fallback profile for unmapped devices.
+- **Soft-clip saturation** that tames overshoot instead of hard-clipping.
+- **Built-in diagnostics** (captured/played frames, underruns, buffer occupancy, latency).
+
+![GlassEQ settings — Editor tab, with the frequency-response graph and parametric filters](Docs/Screenshots/editor.png)
+
+### Memory footprint
+
+During normal listening GlassEQ is just a menu bar app and the audio engine, consuming around 25-30 MB of memory. The EQ editor runs as a **separate helper process** that's launched only while the settings window is open and terminated when you close it, so the SwiftUI interface never weighs on the always-on audio path.
+
+### Security & privacy
+
+- Sandboxed: requests only the audio-capture permission it needs to function.
+- The settings helper is code-signature-checked (expected identity, same signing team) before it's launched and talks to the main app over a token-authenticated local pipe – no networking, no shared files.
+- No telemetry, no analytics, no cloud sync. Diagnostics run locally and print device details only to your terminal.
+
+## Known limitations
+
+- **AirPlay outputs are not yet supported.** The DSP engine currently fails to start on AirPlay receivers. GlassEQ fails open, so audio keeps playing to the AirPlay device just without EQ and switching to any other output (built-in, USB, Bluetooth, HDMI) restores processing cleanly.
+- **Stereo only.** GlassEQ processes mono and 2-channel outputs, multichannel / surround outputs aren't supported yet.
+- **Bluetooth** routes can still surface Core Audio edge cases, please report device model, macOS version, and steps to reproduce.
+- No automatic updates, no crash reporting, no x86_64 build.
+
+<a id="supported-target"></a>
+**Supported target:** macOS 26.0 or newer, Apple Silicon / arm64 only.
+
+## Support the project
+
+GlassEQ is free and MIT-licensed. The biggest thing standing between the current alpha and a build that opens without the Gatekeeper workaround is an Apple Developer Program membership ($99/year), which is required to ship a **Developer ID-signed, notarized** app.
+
+If you'd like to help get there, the **Sponsor** button at the top of this repository goes directly toward that cost. Every bit helps move GlassEQ from "ad hoc-signed alpha" to "double-click to open."
+
+## Build from source
+
+### Pinned toolchain
 
 - Xcode: 26.5, build 17F42.
 - SDK: macOS 26.5.
@@ -35,15 +98,15 @@ The first implementation milestone focuses on the audio core:
 - SwiftPM: `// swift-tools-version: 6.3`.
 - Deployment target: macOS 26.0.
 
-## Local Setup
+### Setup
 
-After installing Xcode, accept the license in Terminal:
+After installing Xcode, accept the license:
 
 ```sh
 sudo xcodebuild -license
 ```
 
-Then verify and test:
+Then verify, test, and run:
 
 ```sh
 xcodebuild -version
@@ -53,9 +116,9 @@ swift run GlassEQ
 swift run GlassEQDiagnostics 2
 ```
 
-## Alpha Packaging
+`GlassEQDiagnostics` runs a short smoke test against the current default output and prints local device details plus capture/playback metrics.
 
-Create an ad hoc-signed technical-alpha artifact:
+### Creating an alpha build
 
 ```sh
 ./Scripts/build-release-app.sh
@@ -63,7 +126,7 @@ Create an ad hoc-signed technical-alpha artifact:
 
 The script builds a release app bundle, embeds the app icon, ad hoc-signs the bundle, and writes a zip under `.build/dist/`.
 
-The expected Gatekeeper assessment result is rejection because the alpha is not Developer ID signed or notarized:
+Gatekeeper assessment is *expected to fail* because the alpha is not Developer ID signed or notarized:
 
 ```sh
 codesign -d --entitlements :- .build/release-app/GlassEQ.app
@@ -72,7 +135,13 @@ spctl --assess --type execute --verbose=4 .build/release-app/GlassEQ.app
 
 The entitlements output should include `com.apple.security.app-sandbox` and `com.apple.security.device.audio-input`, both set to `true`.
 
-## Product Boundaries
+## Architecture
+
+macOS owns output switching, GlassEQ follows it. A persistent muted tap forms the capture half of the engine and survives output changes, while the output half is rebuilt per device. The render path stays free of allocation, locks, disk, logging, and SwiftUI state. The Core Audio bridge is isolated under `GlassEQAudio` so device-format and hardware work can be hardened without disturbing the UI and profile code.
+
+See [Docs/Architecture.md](Docs/Architecture.md) for the full ownership model and runtime flow.
+
+## What GlassEQ doesn't do
 
 GlassEQ intentionally does not implement per-app routing, a virtual output selector, plugin hosting, microphone recording, telemetry, or cloud sync.
 
