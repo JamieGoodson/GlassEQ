@@ -1537,10 +1537,14 @@ final class GlassEQAppModel {
             return nil
         case .repairedReferences(let summary):
             return profileStoreRepairStatus(summary)
+        case .repairedInvalidStore:
+            return localized("Profile store was invalid; backed it up and repaired valid profiles")
         case .recoveredDefaults:
             return localized("Profile store was invalid; backed it up and restored defaults")
         case .backupFailed:
             return localized("Profile store was invalid; using defaults, but backup failed")
+        case let .unsupportedSchemaVersion(version, maximumSupported):
+            return localized("Profile store was written by a newer GlassEQ version (schema \(version)); using defaults without modifying it. This build supports schema \(maximumSupported).")
         }
     }
 
@@ -1550,6 +1554,9 @@ final class GlassEQAppModel {
         }
         if summary.repairedFallbackProfileID {
             return localized("Profile store repaired: fallback reset")
+        }
+        if summary.removedInvalidProfiles > 0 {
+            return localized("Profile store repaired: removed invalid profile")
         }
         if summary.removedOutputMappings > 0 || summary.deduplicatedOutputMappings > 0 {
             return localized("Profile store repaired: removed unavailable output mapping")
