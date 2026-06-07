@@ -1047,6 +1047,7 @@ final class GlassEQAppModel {
                 workTask.cancel()
             }
             guard !Task.isCancelled else {
+                self?.cleanupCancelledEngineWork(result, generation: generation)
                 return
             }
             self?.completeEngineWork(result, generation: generation)
@@ -1063,12 +1064,11 @@ final class GlassEQAppModel {
             let output: AudioOutputDevice
             switch work {
             case .start(let requestedOutput, let profile):
-                attemptedOutput = requestedOutput
-                try engine.start(output: requestedOutput, profile: profile)
-                if Task.isCancelled {
-                    engine.stop()
+                guard !Task.isCancelled else {
                     return .cancelled
                 }
+                attemptedOutput = requestedOutput
+                try engine.start(output: requestedOutput, profile: profile)
                 if case .running(let activeOutput) = engine.state {
                     output = activeOutput
                 } else {
@@ -1077,12 +1077,11 @@ final class GlassEQAppModel {
             case .restart(let profile):
                 switch engine.state {
                 case .running(let runningOutput):
-                    attemptedOutput = runningOutput
-                    try engine.update(profile: profile)
-                    if Task.isCancelled {
-                        engine.stop()
+                    guard !Task.isCancelled else {
                         return .cancelled
                     }
+                    attemptedOutput = runningOutput
+                    try engine.update(profile: profile)
                     guard case .running(let activeOutput) = engine.state else {
                         return .failure(
                             EngineWorkFailure(message: localized("Default output unavailable")),
@@ -1097,10 +1096,6 @@ final class GlassEQAppModel {
                         return .cancelled
                     }
                     try engine.start(output: defaultOutput, profile: profile)
-                    if Task.isCancelled {
-                        engine.stop()
-                        return .cancelled
-                    }
                     if case .running(let activeOutput) = engine.state {
                         output = activeOutput
                     } else {
@@ -1111,6 +1106,29 @@ final class GlassEQAppModel {
             return .success(output)
         } catch {
             return .failure(error, attemptedOutput)
+        }
+    }
+
+    private func cleanupCancelledEngineWork(_ result: EngineWorkResult, generation: Int) {
+        // Cancellation is cooperative: the detached worker may finish `engine.start` after this
+        // model has already moved on. Never let a stale worker stop the shared engine while a
+        // newer generation is pending or running; only clean up if the app's current intent is no
+        // running engine at all.
+        guard generation != engineStartGeneration,
+              engineStartTask == nil else {
+            return
+        }
+        guard case .success = result else {
+            return
+        }
+        guard lifecycleState == .stopped
+                || lifecycleState == .sleeping
+                || lifecycleState == .terminating else {
+            return
+        }
+        engine.stop()
+        if lifecycleState == .stopped {
+            engineMetrics = engine.snapshotMetrics()
         }
     }
 

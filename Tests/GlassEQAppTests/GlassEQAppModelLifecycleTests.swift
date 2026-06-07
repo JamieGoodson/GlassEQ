@@ -287,6 +287,38 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.currentOutputUID == secondOutput.uid)
         #expect(model.currentOutputName == secondOutput.name)
         #expect(model.statusMessage == localized("Processing \(secondOutput.name) with \(model.activeProfile.name)"))
+        #expect(engine.stopCallCount == 0)
+    }
+
+    @Test
+    func userStopDuringSlowStartCleansUpAfterCancelledStartFinishes() async {
+        let output = makeOutput(uid: "slow-start-output", name: "Slow Start Output", id: 200)
+        let engine = FakeAudioEngine()
+        engine.startDelaySeconds = 0.08
+        let lookup = FakeDefaultOutputLookup(.success(output))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            engine.startCalls.count == 1
+        }
+
+        model.stop()
+
+        await waitUntil {
+            engine.stopCallCount == 2
+        }
+
+        #expect(engine.stopCallCount == 2)
+        #expect(!model.isRunning)
+        #expect(model.lifecycleState == .stopped)
     }
 
     @Test

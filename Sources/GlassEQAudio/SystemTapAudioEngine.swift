@@ -1078,12 +1078,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         stopOutputHalfLocked(&state)
 
         // Match the device to the tap's fixed rate so the EQ'd stream needs no resampling.
+        let originalBufferFrameSize = output.bufferFrameSize
         let matchedOutput = try forceSampleRate(state.tapSampleRate, on: output, state: &state)
         _ = try Self.supportedRuntimeChannelCount(for: matchedOutput)
-        if state.bufferFrameSizeRestorations[matchedOutput.uid] == nil {
-            state.bufferFrameSizeRestorations[matchedOutput.uid] = BufferFrameSizeRestoration(
-                uid: matchedOutput.uid,
-                originalFrameSize: matchedOutput.bufferFrameSize
+        if state.bufferFrameSizeRestorations[output.uid] == nil {
+            state.bufferFrameSizeRestorations[output.uid] = BufferFrameSizeRestoration(
+                uid: output.uid,
+                originalFrameSize: originalBufferFrameSize
             )
         }
 
