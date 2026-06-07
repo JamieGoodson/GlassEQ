@@ -312,7 +312,7 @@ public enum SettingsPipeCodec {
         _ message: SettingsPipeMessage,
         maximumLineBytes: Int = Self.maximumLineBytes
     ) throws -> Data {
-        var data = try SettingsXPCCodec.encoder.encode(message)
+        var data = try SettingsPipeJSONCodec.encoder.encode(message)
         guard data.count + 1 <= maximumLineBytes else {
             throw SettingsPipeError.frameTooLarge(byteCount: data.count + 1, maximum: maximumLineBytes)
         }
@@ -321,7 +321,7 @@ public enum SettingsPipeCodec {
     }
 
     public static func decodeLine(_ data: Data) throws -> SettingsPipeMessage {
-        try SettingsXPCCodec.decoder.decode(SettingsPipeMessage.self, from: data)
+        try SettingsPipeJSONCodec.decoder.decode(SettingsPipeMessage.self, from: data)
     }
 }
 
@@ -386,59 +386,7 @@ public actor SettingsPipeLineDecoder {
     }
 }
 
-public final class SettingsXPCEnvelope: NSObject, NSSecureCoding {
-    public static var supportsSecureCoding: Bool { true }
-
-    public let data: Data
-
-    public init(data: Data) {
-        self.data = data
-        super.init()
-    }
-
-    public required init?(coder: NSCoder) {
-        guard let data = coder.decodeObject(of: NSData.self, forKey: "data") as Data? else {
-            return nil
-        }
-        self.data = data
-        super.init()
-    }
-
-    public func encode(with coder: NSCoder) {
-        coder.encode(data as NSData, forKey: "data")
-    }
-
-    public static func encode<T: Encodable>(_ value: T, encoder: JSONEncoder = SettingsXPCCodec.encoder) throws -> SettingsXPCEnvelope {
-        try SettingsXPCEnvelope(data: encoder.encode(value))
-    }
-
-    public func decode<T: Decodable>(_ type: T.Type, decoder: JSONDecoder = SettingsXPCCodec.decoder) throws -> T {
-        try decoder.decode(type, from: data)
-    }
-}
-
-public enum SettingsXPCCodec {
-    public static let encoder = JSONEncoder()
-    public static let decoder = JSONDecoder()
-}
-
-@objc public protocol GlassEQSettingsHostXPC: NSObjectProtocol {
-    func connect(token: String, withReply reply: @escaping (SettingsXPCEnvelope?, NSString?) -> Void)
-    func performCommand(_ envelope: SettingsXPCEnvelope, withReply reply: @escaping (SettingsXPCEnvelope?, NSString?) -> Void)
-    func disconnect()
-}
-
-@objc public protocol GlassEQSettingsClientXPC: NSObjectProtocol {
-    func receiveEvent(_ envelope: SettingsXPCEnvelope)
-    func terminate()
-}
-
-public enum SettingsXPCInterfaceFactory {
-    public static func hostInterface() -> NSXPCInterface {
-        NSXPCInterface(with: GlassEQSettingsHostXPC.self)
-    }
-
-    public static func clientInterface() -> NSXPCInterface {
-        NSXPCInterface(with: GlassEQSettingsClientXPC.self)
-    }
+enum SettingsPipeJSONCodec {
+    static let encoder = JSONEncoder()
+    static let decoder = JSONDecoder()
 }

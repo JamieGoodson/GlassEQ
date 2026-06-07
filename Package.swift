@@ -117,7 +117,8 @@ let package = Package(
             dependencies: [
                 "GlassEQCore",
                 "GlassEQSettings",
-                "GlassEQSettingsIPC"
+                "GlassEQSettingsIPC",
+                "GlassEQSettingsUI"
             ]
         ),
         .testTarget(
