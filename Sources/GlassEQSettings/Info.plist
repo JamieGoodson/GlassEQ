@@ -4,8 +4,12 @@
 <dict>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>GlassEQ Settings</string>
     <key>CFBundleExecutable</key>
     <string>GlassEQSettings</string>
+    <key>CFBundleIconFile</key>
+    <string>GlassEQ</string>
     <key>CFBundleIdentifier</key>
     <string>com.glasseq.app.settings</string>
     <key>CFBundleInfoDictionaryVersion</key>

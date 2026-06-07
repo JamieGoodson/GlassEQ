@@ -140,8 +140,6 @@ public struct SettingsView: View {
             )
                 .frame(width: 260)
 
-            Divider()
-
             ProfileDetail(
                 snapshot: snapshot,
                 draftProfile: $snapshot.draftProfile,
@@ -162,6 +160,10 @@ public struct SettingsView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .background(FinderStyleWindowConfigurator())
+        // Run the content up under the (transparent, separator-less) titlebar so there's no bar
+        // or hairline between the window controls and the content, and the sidebar card sits
+        // beneath the traffic lights — matching System Settings.
+        .ignoresSafeArea(.container, edges: .top)
         .overlay(alignment: .bottom) {
             if let message = model.commandErrorMessage {
                 Text(message)
@@ -342,6 +344,7 @@ private struct FinderStyleWindowConfigurator: NSViewRepresentable {
     final class Coordinator: NSObject {
         weak var view: FirstResponderSinkView?
         private var didInitialFront = false
+        private var observingWindow = false
 
         deinit {
             NotificationCenter.default.removeObserver(self)
@@ -361,10 +364,14 @@ private struct FinderStyleWindowConfigurator: NSViewRepresentable {
             guard let view, let window = view.window else {
                 return
             }
+            // Solid base layer that the sidebar card and content cards float on. The hidden title
+            // bar (.windowStyle(.hiddenTitleBar) on the scene) handles the window chrome; the
+            // content is pulled up under the controls by .ignoresSafeArea(.top) in the body.
             window.isOpaque = true
             window.backgroundColor = .windowBackgroundColor
-            window.titlebarAppearsTransparent = true
             window.initialFirstResponder = view
+            startObservingGeometry(of: window)
+            positionSettingsWindowControls(in: window)
 
             guard !didInitialFront else {
                 return
@@ -372,6 +379,25 @@ private struct FinderStyleWindowConfigurator: NSViewRepresentable {
             didInitialFront = true
             bringToFront()
         }
+
+        private func startObservingGeometry(of window: NSWindow) {
+            guard !observingWindow else {
+                return
+            }
+            observingWindow = true
+            let center = NotificationCenter.default
+            for name in [NSWindow.didResizeNotification, NSWindow.didBecomeKeyNotification, NSWindow.didExitFullScreenNotification] {
+                center.addObserver(self, selector: #selector(windowGeometryDidChange(_:)), name: name, object: window)
+            }
+        }
+
+        @objc private func windowGeometryDidChange(_ note: Notification) {
+            guard let window = note.object as? NSWindow else {
+                return
+            }
+            positionSettingsWindowControls(in: window)
+        }
+
 
         @objc private func bringSettingsToFrontNotification() {
             bringToFront()
@@ -392,62 +418,80 @@ private struct FinderStyleWindowConfigurator: NSViewRepresentable {
         override var acceptsFirstResponder: Bool {
             true
         }
-    }
-}
 
-private struct ActivePopoverButtonTint: ViewModifier {
-    var color: Color
-    var isActive: Bool
-
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if isActive {
-            content
-                .buttonStyle(.borderedProminent)
-                .tint(color)
-        } else {
-            content
+        // Position the controls as soon as we're in the window — before it's shown — so they don't
+        // visibly jump from the default position when the settings window opens.
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let window {
+                positionSettingsWindowControls(in: window)
+            }
         }
     }
 }
 
-private struct GlassPanelModifier: ViewModifier {
+// Top inset for the sidebar header and content pane so they clear the window controls (which are
+// nudged downward by `windowControlTopMargin`).
+private let settingsTitlebarInset: CGFloat = 38
+
+// Distance from the window's top edge to the top of the traffic lights. `.hiddenTitleBar` parks
+// them ~9pt from the top (centered in the 32pt titlebar); System Settings sits them lower.
+private let windowControlTopMargin: CGFloat = 16
+
+// Distance from the window's left edge to the leftmost traffic light (default is ~9pt).
+private let windowControlLeadingMargin: CGFloat = 13
+
+// Leading inset for the sidebar's content text. Kept independent of the traffic lights so the
+// selection capsule keeps its inset; the lights sit slightly to its left, like System Settings.
+private let sidebarContentLeading: CGFloat = 19
+
+// Moves the traffic lights to (windowControlLeadingMargin, windowControlTopMargin), preserving
+// their spacing. Idempotent — safe to re-apply on geometry changes and to call early (before the
+// window is shown) so the controls don't visibly jump into place on open.
+@MainActor
+private func positionSettingsWindowControls(in window: NSWindow) {
+    let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton]
+        .compactMap { window.standardWindowButton($0) }
+    guard let titlebar = buttons.first?.superview,
+          let leftmost = buttons.map(\.frame.minX).min() else {
+        return
+    }
+    let dx = windowControlLeadingMargin - leftmost
+    for button in buttons {
+        let targetX = button.frame.minX + dx
+        let targetY = max(0, titlebar.bounds.height - windowControlTopMargin - button.frame.height)
+        if abs(button.frame.origin.x - targetX) > 0.5 || abs(button.frame.origin.y - targetY) > 0.5 {
+            button.setFrameOrigin(NSPoint(x: targetX, y: targetY))
+        }
+    }
+}
+
+private let sidebarCardInset: CGFloat = 6
+private let sidebarCardCornerRadius: CGFloat = 14
+
+private struct CardPanelModifier: ViewModifier {
     var padding: CGFloat = 16
     var cornerRadius: CGFloat = 16
-    var usesGlassEffect = false
 
-    @ViewBuilder
     func body(content: Content) -> some View {
-        if usesGlassEffect {
-            content
-                .padding(padding)
-                .background(.regularMaterial, in: .rect(cornerRadius: cornerRadius))
-                .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
-                .overlay(panelBorder)
-        } else {
-            content
-                .padding(padding)
-                .background(Color(nsColor: .controlBackgroundColor), in: .rect(cornerRadius: cornerRadius))
-                .overlay(panelBorder)
-        }
-    }
-
-    private var panelBorder: some View {
-        RoundedRectangle(cornerRadius: cornerRadius)
-            .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        content
+            .padding(padding)
+            .background(Color(nsColor: .controlBackgroundColor), in: .rect(cornerRadius: cornerRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+            )
     }
 }
 
 private extension View {
-    func glassPanel(padding: CGFloat = 16, cornerRadius: CGFloat = 16, usesGlassEffect: Bool = false) -> some View {
-        modifier(GlassPanelModifier(padding: padding, cornerRadius: cornerRadius, usesGlassEffect: usesGlassEffect))
+    func cardPanel(padding: CGFloat = 16, cornerRadius: CGFloat = 16) -> some View {
+        modifier(CardPanelModifier(padding: padding, cornerRadius: cornerRadius))
     }
 }
 
 private extension Color {
-    static let macOSSystemGreen = Color(nsColor: .systemGreen)
     static let macOSSystemRed = Color(nsColor: .systemRed)
-    static let macOSSystemYellow = Color(nsColor: .systemYellow)
 }
 
 private struct SettingRow<Content: View>: View {
@@ -564,11 +608,6 @@ private struct ProfileSidebar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Text(localized("Profiles"))
-                .font(.title2.weight(.semibold))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding([.horizontal, .top])
-
             ScrollView {
                 LazyVStack(spacing: 4) {
                     ForEach(profiles) { profile in
@@ -581,17 +620,18 @@ private struct ProfileSidebar: View {
                                 Spacer()
                                 if profile.id == mappedProfileID {
                                     Image(systemName: "speaker.wave.2.fill")
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(profile.id == selectedProfileID ? Color.white.opacity(0.85) : Color.secondary)
                                         .accessibilityHidden(true)
                                 }
                             }
+                            .foregroundStyle(profile.id == selectedProfileID ? Color.white : Color.primary)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 8)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(.rect)
                             .background(
                                 profile.id == selectedProfileID
-                                    ? Color.accentColor.opacity(0.16)
+                                    ? Color.accentColor
                                     : Color.clear,
                                 in: .rect(cornerRadius: 8)
                             )
@@ -603,8 +643,13 @@ private struct ProfileSidebar: View {
                         .accessibilityHint(Text(localized("Selects this profile for editing")))
                     }
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 10)
+                // Align the row text (which sits 10pt inside the selection capsule) with the
+                // sidebar's content leading.
+                .padding(.horizontal, sidebarContentLeading - sidebarCardInset - 10)
+                // No header now: inset the first row below the window controls, aligning it with
+                // the content header on the right.
+                .padding(.top, settingsTitlebarInset - sidebarCardInset)
+                .padding(.bottom, 10)
             }
 
             Divider()
@@ -673,9 +718,19 @@ private struct ProfileSidebar: View {
                 }
                 .buttonStyle(.borderless)
             }
-            .padding(16)
+            .padding(.horizontal, sidebarContentLeading - sidebarCardInset)
+            .padding(.vertical, 16)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: sidebarCardCornerRadius, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: sidebarCardCornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: sidebarCardCornerRadius, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.16), radius: 4, x: 0, y: 1)
+        // Small, even buffer on all sides. Kept small so the window controls still land on the
+        // card (with .hiddenTitleBar, macOS parks them near the top) rather than in the margin.
+        .padding(sidebarCardInset)
     }
 
     private func profileAccessibilityValue(_ profile: EQProfile) -> String {
@@ -738,10 +793,15 @@ private struct ProfileDetail: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .topLeading)
-                    .padding(.bottom, 4)
+                    // Breathing room so the last editor panel scrolls clear of the footer
+                    // instead of being cut against it.
+                    .padding(.bottom, 24)
                 }
             }
             .scrollIndicators(.visible)
+            .frame(minHeight: 0, maxHeight: .infinity, alignment: .topLeading)
+            .clipped()
+            .layoutPriority(1)
 
             if tab == .editor {
                 constrainedContent {
@@ -755,16 +815,23 @@ private struct ProfileDetail: View {
                         onStopPreview: onStopPreview,
                         onUseForCurrentOutput: onUseForCurrentOutput
                     )
-                    .glassPanel(padding: 16, usesGlassEffect: false)
+                    .cardPanel(padding: 16)
                 }
+                .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(2)
             }
         }
-        .padding(18)
+        .padding(.horizontal, 18)
+        .padding(.bottom, 18)
+        .padding(.top, settingsTitlebarInset)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     private func constrainedContent<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
         content()
-            .frame(maxWidth: 1180, alignment: .topLeading)
+            // Cap the editor column so controls (preamp row, chart) don't stretch on wide windows.
+            .frame(maxWidth: 860, alignment: .topLeading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 }
@@ -829,7 +896,7 @@ private struct ProfileHeader: View {
             .accessibilityValue(Text(tab.title))
             .accessibilityHint(Text(localized("Switches between editor, import, and output details")))
         }
-        .glassPanel(padding: 16)
+        .cardPanel(padding: 16)
     }
 }
 
@@ -891,8 +958,8 @@ private struct EditorTab: View {
     }
 
     var body: some View {
-        VStack(spacing: 16) {
-            VStack(alignment: .leading, spacing: 14) {
+        VStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
                 SettingRow(title: localized("Profile type")) {
                     Picker(localized("Profile type"), selection: Binding(
                         get: { draftProfile.mode },
@@ -963,7 +1030,7 @@ private struct EditorTab: View {
 
                 HeadroomRow(profile: $draftProfile, recommendedPreampDB: analysis.recommendedPreampDB)
             }
-            .glassPanel(padding: 20, usesGlassEffect: false)
+            .cardPanel(padding: 16)
 
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
@@ -981,13 +1048,13 @@ private struct EditorTab: View {
                     .accessibilityValue(Text(analysis.accessibilitySummary))
                     .accessibilityHint(Text(localized("Shows the estimated gain curve from 20 Hz to 20 kHz")))
             }
-            .glassPanel(padding: 20, usesGlassEffect: false)
+            .cardPanel(padding: 16)
 
             if draftProfile.mode == .parametric {
                 ParametricFilterEditor(filters: activeFiltersBinding)
             } else {
                 GraphicFilterEditor(filters: activeFiltersBinding)
-                    .glassPanel(padding: 20, usesGlassEffect: false)
+                    .cardPanel(padding: 16)
             }
 
         }
@@ -1101,6 +1168,44 @@ private struct EditorTab: View {
     }
 }
 
+// Footer action button. A custom style is the only way to make the disabled state less faint than
+// the system default (which can't be lightened on a native `.disabled()` button), and the flatter
+// look reads more like a precise tool than a consumer app.
+private struct ToolbarButtonStyle: ButtonStyle {
+    var prominent = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        ToolbarButtonLabel(configuration: configuration, prominent: prominent)
+    }
+
+    private struct ToolbarButtonLabel: View {
+        let configuration: ButtonStyleConfiguration
+        let prominent: Bool
+        @Environment(\.isEnabled) private var isEnabled
+
+        var body: some View {
+            let shape = RoundedRectangle(cornerRadius: 7, style: .continuous)
+            return configuration.label
+                .font(.body)
+                .lineLimit(1)
+                .padding(.horizontal, 12)
+                .frame(minHeight: 30)
+                .foregroundStyle(prominent ? Color.white : Color.primary)
+                .background(fillColor(pressed: configuration.isPressed), in: shape)
+                .overlay { shape.stroke(Color.primary.opacity(prominent ? 0 : 0.14), lineWidth: 1) }
+                .opacity(isEnabled ? 1 : 0.5)
+                .contentShape(shape)
+        }
+
+        private func fillColor(pressed: Bool) -> Color {
+            if prominent {
+                return Color.accentColor.opacity(pressed ? 0.82 : 1)
+            }
+            return Color.primary.opacity(pressed ? 0.14 : 0.07)
+        }
+    }
+}
+
 private struct ApplyBar: View {
     var hasUnsavedDraft: Bool
     var currentOutputUID: String
@@ -1123,26 +1228,26 @@ private struct ApplyBar: View {
                 onRevert()
             }
             .disabled(!hasUnsavedDraft)
-            .controlSize(.large)
+            .buttonStyle(ToolbarButtonStyle())
 
             Button(localized("Apply")) {
                 onApply()
             }
             .keyboardShortcut(.return, modifiers: .command)
             .disabled(!hasUnsavedDraft)
-            .controlSize(.large)
+            .buttonStyle(ToolbarButtonStyle(prominent: true))
 
             Button(isPreviewing ? localized("Stop Preview") : localized("Preview")) {
                 isPreviewing ? onStopPreview() : onPreview()
             }
-            .controlSize(.large)
+            .buttonStyle(ToolbarButtonStyle())
             .accessibilityValue(Text(isPreviewing ? localized("Previewing") : localized("Not previewing")))
 
             Button(localized("Assign to current output")) {
                 onUseForCurrentOutput()
             }
             .disabled(currentOutputUID.isEmpty)
-            .controlSize(.large)
+            .buttonStyle(ToolbarButtonStyle())
             .accessibilityHint(Text(currentOutputUID.isEmpty ? localized("No current output is available") : localized("Maps the selected profile to the current output device")))
         }
     }
@@ -1229,13 +1334,13 @@ private struct FrequencyResponseGraph: View {
             path.move(to: CGPoint(x: x, y: rect.minY))
             path.addLine(to: CGPoint(x: x, y: rect.maxY))
         }
-        context.stroke(path, with: .color(.secondary.opacity(0.25)), lineWidth: 1)
+        context.stroke(path, with: .color(.secondary.opacity(0.35)), lineWidth: 1)
 
         var zero = Path()
         let zeroY = yPosition(for: 0, in: rect)
         zero.move(to: CGPoint(x: rect.minX, y: zeroY))
         zero.addLine(to: CGPoint(x: rect.maxX, y: zeroY))
-        context.stroke(zero, with: .color(.secondary.opacity(0.55)), lineWidth: 1.4)
+        context.stroke(zero, with: .color(.secondary.opacity(0.7)), lineWidth: 1.5)
     }
 
     private func drawAxisLabels(context: GraphicsContext, rect: CGRect, bounds: CGRect) {
@@ -1274,7 +1379,7 @@ private struct FrequencyResponseGraph: View {
             )
             index == 0 ? path.move(to: position) : path.addLine(to: position)
         }
-        context.stroke(path, with: .color(color), lineWidth: 2)
+        context.stroke(path, with: .color(color), lineWidth: 2.5)
     }
 
     private func xPosition(for frequency: Double, in rect: CGRect) -> CGFloat {
@@ -1359,7 +1464,7 @@ private struct ParametricFilterEditor: View {
                 .padding(.vertical, 2)
             }
             .frame(minWidth: 260, idealWidth: 320, maxWidth: 420)
-            .glassPanel(padding: 20, usesGlassEffect: false)
+            .cardPanel(padding: 16)
 
             if let binding = selectedFilterBinding {
                 ParametricFilterInspector(
@@ -1373,8 +1478,8 @@ private struct ParametricFilterEditor: View {
                 .frame(minWidth: 260, maxWidth: .infinity, alignment: .topLeading)
             } else {
                 ContentUnavailableView(localized("No Filter Selected"), systemImage: "slider.horizontal.3")
-                    .glassPanel(padding: 20, usesGlassEffect: false)
-                    .frame(maxWidth: .infinity, minHeight: 220)
+                    .cardPanel(padding: 16)
+                    .frame(maxWidth: .infinity, minHeight: 150)
             }
         }
         .onChange(of: filters.map(\.id)) { _, _ in
@@ -1530,7 +1635,7 @@ private struct ParametricFilterInspector: View {
             SliderRow(title: localized("Gain"), value: $filter.gainDB, range: -24...24, step: 0.1, suffix: "dB")
             SliderRow(title: localized("Q"), value: $filter.q, range: 0.1...10, step: 0.01, suffix: "")
         }
-        .glassPanel(padding: 20, usesGlassEffect: false)
+        .cardPanel(padding: 16)
     }
 }
 
@@ -1601,7 +1706,7 @@ private struct ImportTab: View {
 
                 TextField(localized("Profile Name"), text: $importName)
             }
-            .glassPanel()
+            .cardPanel()
 
             if isEditorVisible {
                 TextEditor(text: $importText)
@@ -1626,7 +1731,7 @@ private struct ImportTab: View {
                     .controlSize(.large)
                     Spacer()
                 }
-                .glassPanel(padding: 12)
+                .cardPanel(padding: 12)
             }
 
             HStack {
@@ -1674,7 +1779,7 @@ private struct ImportTab: View {
                 .disabled(!isEditorVisible || importText.isEmpty || isImporting)
                 .controlSize(.large)
             }
-            .glassPanel(padding: 12)
+            .cardPanel(padding: 12)
         }
     }
 }
@@ -1702,14 +1807,14 @@ private struct OutputTab: View {
                     LabeledContent(localized("Buffer"), value: localizedFrameCount(snapshot.currentOutputBufferFrameSize))
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
-                .glassPanel(padding: 20, usesGlassEffect: false)
+                .cardPanel(padding: 16)
 
                 VStack(alignment: .leading, spacing: 10) {
                     Text(localized("Profile Mapping"))
                         .font(.headline)
                     LabeledContent(localized("Mapped Profile"), value: mappedProfileName)
                     HStack {
-                        Button(localized("Use selected profile for this output")) {
+                        Button(localized("Use for this output")) {
                             onUseForCurrentOutput()
                         }
                         .disabled(snapshot.currentOutputUID.isEmpty)
@@ -1722,7 +1827,7 @@ private struct OutputTab: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
-                .glassPanel(padding: 20, usesGlassEffect: false)
+                .cardPanel(padding: 16)
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
 
@@ -1745,7 +1850,7 @@ private struct OutputTab: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
-                .glassPanel(padding: 20, usesGlassEffect: false)
+                .cardPanel(padding: 16)
 
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -1762,12 +1867,15 @@ private struct OutputTab: View {
                     LabeledContent(localized("Underruns"), value: localizedInteger(snapshot.metrics.playbackUnderrunFrames))
                     LabeledContent(localized("Saturated Samples"), value: localizedInteger(snapshot.metrics.saturatedSamples))
                     LabeledContent(localized("Buffered"), value: localizedFrameCount(snapshot.metrics.currentBufferedFrames))
-                    LabeledContent(localized("Peak Buffer"), value: localizedFrameCount(snapshot.metrics.maxBufferedFrames))
+                    LabeledContent(localized("Peak Buffer"), value: localizedFrameCount(snapshot.metrics.maximumPlaybackBufferedFrames))
+                    LabeledContent(localized("Ring Peak"), value: localizedFrameCount(snapshot.metrics.maxBufferedFrames))
+                    LabeledContent(localized("Capture Callback Peak"), value: localizedFrameCount(snapshot.metrics.maximumCaptureCallbackFrames))
+                    LabeledContent(localized("Output Callback Peak"), value: localizedFrameCount(snapshot.metrics.maximumPlaybackCallbackFrames))
                     LabeledContent(localized("Added Latency"), value: averageAddedLatencyLabel)
                     LabeledContent(localized("Latency Range"), value: addedLatencyRangeLabel)
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
-                .glassPanel(padding: 20, usesGlassEffect: false)
+                .cardPanel(padding: 16)
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
@@ -1801,7 +1909,7 @@ private struct OutputTab: View {
             return "No samples"
         }
         let minimum = formatLatency(milliseconds: framesToMilliseconds(Double(snapshot.metrics.minimumPlaybackBufferedFrames)))
-        let maximum = formatLatency(milliseconds: framesToMilliseconds(Double(snapshot.metrics.maxBufferedFrames)))
+        let maximum = formatLatency(milliseconds: framesToMilliseconds(Double(snapshot.metrics.maximumPlaybackBufferedFrames)))
         return "\(minimum)-\(maximum)"
     }
 
