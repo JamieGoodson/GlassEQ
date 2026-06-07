@@ -76,8 +76,6 @@ private extension Notification.Name {
     static let glassEQModelDidChange = Notification.Name("com.glasseq.modelDidChange")
     static let glassEQMetricsDidChange = Notification.Name("com.glasseq.metricsDidChange")
     static let glassEQBringSettingsToFront = Notification.Name("com.glasseq.bringSettingsToFront")
-    static let screenIsLocked = Notification.Name("com.apple.screenIsLocked")
-    static let screenIsUnlocked = Notification.Name("com.apple.screenIsUnlocked")
 }
 
 private enum AppBuildInfo {
@@ -87,8 +85,8 @@ private enum AppBuildInfo {
            !releaseLabel.isEmpty {
             return releaseLabel
         }
-        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.6.0"
-        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "8"
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.7.0"
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "9"
         return "v\(version) (\(build))"
     }
 }
@@ -100,6 +98,11 @@ private enum WakeReconnectPolicy {
 
 private enum SessionActivationReconnectPolicy {
     static let reconnectDelay: Duration = .milliseconds(650)
+}
+
+private enum OutputChangeReconnectPolicy {
+    static let routeSwitchDelay: Duration = .milliseconds(50)
+    static let fallbackDelay: Duration = .milliseconds(350)
 }
 
 private let appResourcesBundle: Bundle = {
@@ -200,7 +203,7 @@ enum GlassEQAppLifecycleState: Equatable {
     case terminating
 }
 
-protocol AudioEngineControlling: AnyObject {
+protocol AudioEngineControlling: AnyObject, Sendable {
     var state: AudioEngineState { get }
 
     func start(output: AudioOutputDevice, profile: EQProfile) throws
@@ -215,7 +218,7 @@ protocol AudioEngineControlling: AnyObject {
 
 extension SystemTapAudioEngine: AudioEngineControlling {}
 
-protocol DefaultOutputLookingUp {
+protocol DefaultOutputLookingUp: Sendable {
     func defaultOutputDevice() throws -> AudioOutputDevice
 }
 
@@ -260,9 +263,12 @@ extension SettingsAudioMetricsDTO {
             saturatedSamples: metrics.saturatedSamples,
             currentBufferedFrames: metrics.currentBufferedFrames,
             maxBufferedFrames: metrics.maxBufferedFrames,
+            maximumPlaybackBufferedFrames: metrics.maximumPlaybackBufferedFrames,
             minimumPlaybackBufferedFrames: metrics.minimumPlaybackBufferedFrames,
             averagePlaybackBufferedFrames: metrics.averagePlaybackBufferedFrames,
-            playbackBufferObservations: metrics.playbackBufferObservations
+            playbackBufferObservations: metrics.playbackBufferObservations,
+            maximumCaptureCallbackFrames: metrics.maximumCaptureCallbackFrames,
+            maximumPlaybackCallbackFrames: metrics.maximumPlaybackCallbackFrames
         )
     }
 }
@@ -296,7 +302,6 @@ final class GlassEQAppModel {
     var currentOutputSampleRate = 0.0
     var currentOutputChannelCount = 0
     var currentOutputBufferFrameSize: UInt32 = 0
-    private var currentOutputIsBluetooth = false
     var statusMessage = localized("Stopped")
     var isRunning = false
     var activeProfile: EQProfile
@@ -320,15 +325,36 @@ final class GlassEQAppModel {
     private var observer: (any DefaultOutputObserving)?
     private var metricsTask: Task<Void, Never>?
     private var outputChangeTask: Task<Void, Never>?
+    private var engineStartTask: Task<Void, Never>?
     private var pendingSaveTask: Task<Void, Never>?
     private var lifecycleObserverTokens: [NSObjectProtocol] = []
     private var wasRunningBeforeSleep = false
-    private var wasRunningBeforeScreenLock = false
     private var wakeReconnectAttempts = 0
     private var observerCallbackGeneration = 0
     private var outputChangeGeneration = 0
+    private var engineStartGeneration = 0
+    private var pendingEngineStartOutput: AudioOutputDevice?
     private let storeWriter: ProfileStoreWriter
     @ObservationIgnored lazy var settingsCoordinator = SettingsCoordinator(model: self)
+
+    private enum EngineWork: Sendable {
+        case start(output: AudioOutputDevice, profile: EQProfile)
+        case restart(profile: EQProfile)
+    }
+
+    private enum EngineWorkResult: Sendable {
+        case success(AudioOutputDevice)
+        case failure(any Error, AudioOutputDevice?)
+        case cancelled
+    }
+
+    private struct EngineWorkFailure: Error, LocalizedError, Sendable {
+        var message: String
+
+        var errorDescription: String? {
+            message
+        }
+    }
 
     init(
         profileStore providedStore: ProfileStore? = nil,
@@ -478,9 +504,9 @@ final class GlassEQAppModel {
             return
         }
         wasRunningBeforeSleep = false
-        wasRunningBeforeScreenLock = false
         stopObserver()
         invalidatePendingOutputChange()
+        invalidatePendingEngineStart()
         metricsTask?.cancel()
         metricsTask = nil
         engine.stop()
@@ -520,6 +546,11 @@ final class GlassEQAppModel {
         selectedProfileID = profile.id
         draftProfile = profile
         saveStore()
+        if lifecycleState == .waking {
+            reschedulePendingEngineStartWithActiveProfile()
+            notifyModelDidChange()
+            return
+        }
         if isRunning {
             if engine.updateDSP(profile: profile) {
                 statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
@@ -562,6 +593,11 @@ final class GlassEQAppModel {
         selectedProfileID = profile.id
         draftProfile = profile
         saveStore()
+        if lifecycleState == .waking {
+            reschedulePendingEngineStartWithActiveProfile()
+            notifyModelDidChange()
+            return
+        }
         if isRunning {
             if engine.updateDSP(profile: profile) {
                 statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
@@ -585,6 +621,11 @@ final class GlassEQAppModel {
             draftProfile = profile
             activeProfile = profile
             saveStore()
+            if lifecycleState == .waking {
+                reschedulePendingEngineStartWithActiveProfile()
+                notifyModelDidChange()
+                return
+            }
             engine.setBypassed(isBypassed)
             statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
             notifyModelDidChange()
@@ -701,7 +742,8 @@ final class GlassEQAppModel {
 
     func preview(profile: EQProfile) {
         guard lifecycleState != .terminating,
-              lifecycleState != .sleeping else {
+              lifecycleState != .sleeping,
+              lifecycleState != .waking else {
             return
         }
         if previewReturnProfile == nil {
@@ -720,7 +762,8 @@ final class GlassEQAppModel {
 
     func stopPreview() {
         guard lifecycleState != .terminating,
-              lifecycleState != .sleeping else {
+              lifecycleState != .sleeping,
+              lifecycleState != .waking else {
             return
         }
         guard let profile = previewReturnProfile else {
@@ -855,63 +898,34 @@ final class GlassEQAppModel {
 
     private func restartEngineWithActiveProfile() {
         guard lifecycleState != .terminating,
-              lifecycleState != .sleeping else {
+              lifecycleState != .sleeping,
+              lifecycleState != .waking else {
             return
         }
 
-        do {
-            var output: AudioOutputDevice
-            switch engine.state {
-            case .running:
-                try engine.update(profile: activeProfile)
-                guard case .running(let activeOutput) = engine.state else {
-                    lifecycleState = .stopped
-                    isRunning = false
-                    statusMessage = localized("Default output unavailable")
-                    notifyModelDidChange()
-                    return
-                }
-                output = activeOutput
-                refreshCurrentOutputMetadata(from: output)
-            case .stopped, .failed:
-                output = try defaultOutputLookup.defaultOutputDevice()
-                refreshCurrentOutputMetadata(from: output)
-                try engine.start(output: output, profile: activeProfile)
-                if case .running(let activeOutput) = engine.state {
-                    output = activeOutput
-                    refreshCurrentOutputMetadata(from: activeOutput)
-                }
-            }
-            statusMessage = processingStatus(outputName: output.name, profileName: activeProfile.name)
-            lifecycleState = .running
-            isRunning = true
-            wasRunningBeforeSleep = false
-            wasRunningBeforeScreenLock = false
-        } catch {
-            lifecycleState = .stopped
-            isRunning = false
-            statusMessage = audioEngineStatusMessage(error)
-        }
+        statusMessage = localized("Reconnecting audio output...")
+        scheduleEngineWork(.restart(profile: activeProfile))
         notifyModelDidChange()
     }
 
     private func scheduleDefaultOutputChange(_ result: Result<AudioOutputDevice, Error>, observerGeneration: Int) {
+        // Observer callbacks can arrive after stop/sleep/restart; the generation gates them to
+        // the observer instance that is currently allowed to drive engine state.
         guard observerGeneration == observerCallbackGeneration,
               lifecycleState != .terminating,
               lifecycleState != .sleeping else {
             return
         }
 
-        if shouldMuteForSettlingOutputChange(result) {
-            engine.muteOutputForTransition()
-            statusMessage = localized("Audio output format changed; rebuilding...")
-            notifyModelDidChange()
-        }
-
         outputChangeGeneration += 1
         let generation = outputChangeGeneration
         let settlingDelay = outputChangeSettlingDelay(for: result)
         outputChangeTask?.cancel()
+        if shouldMuteForSettlingOutputChange(result) {
+            engine.muteOutputForTransition()
+            statusMessage = outputChangeStatusMessage(for: result)
+            notifyModelDidChange()
+        }
         outputChangeTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: settlingDelay)
             guard !Task.isCancelled,
@@ -937,13 +951,23 @@ final class GlassEQAppModel {
     private func shouldMuteForSettlingOutputChange(_ result: Result<AudioOutputDevice, Error>) -> Bool {
         guard isRunning,
               case .success(let output) = result,
-              !currentOutputUID.isEmpty,
-              output.uid == currentOutputUID else {
+              !currentOutputUID.isEmpty else {
             return false
         }
 
-        return output.nominalSampleRate != currentOutputSampleRate
+        return output.uid != currentOutputUID
+            || output.nominalSampleRate != currentOutputSampleRate
             || output.bufferFrameSize != currentOutputBufferFrameSize
+    }
+
+    private func outputChangeStatusMessage(for result: Result<AudioOutputDevice, Error>) -> String {
+        guard case .success(let output) = result else {
+            return localized("Audio output changed; rebuilding...")
+        }
+        if output.uid == currentOutputUID {
+            return localized("Audio output format changed; rebuilding...")
+        }
+        return localized("Audio output changed; rebuilding...")
     }
 
     private func outputChangeSettlingDelay(for result: Result<AudioOutputDevice, Error>) -> Duration {
@@ -951,16 +975,10 @@ final class GlassEQAppModel {
             return outputChangeSettlingDelayOverride
         }
 
-        guard case .success(let output) = result else {
-            return .milliseconds(350)
+        guard case .success = result else {
+            return OutputChangeReconnectPolicy.fallbackDelay
         }
-        if output.nominalSampleRate > 0 && output.nominalSampleRate <= 24_000 {
-            return .milliseconds(900)
-        }
-        if output.isBluetoothTransport {
-            return .milliseconds(650)
-        }
-        return .milliseconds(350)
+        return OutputChangeReconnectPolicy.routeSwitchDelay
     }
 
     private func refreshCurrentOutputMetadata(from output: AudioOutputDevice) {
@@ -969,7 +987,6 @@ final class GlassEQAppModel {
         currentOutputSampleRate = output.nominalSampleRate
         currentOutputChannelCount = output.outputChannelCount
         currentOutputBufferFrameSize = output.bufferFrameSize
-        currentOutputIsBluetooth = output.isBluetoothTransport
     }
 
     private func handleDefaultOutputChange(_ result: Result<AudioOutputDevice, Error>) {
@@ -986,28 +1003,13 @@ final class GlassEQAppModel {
             selectedProfileID = activeProfile.id
             draftProfile = activeProfile
 
-            do {
-                try engine.start(output: output, profile: activeProfile)
-                lifecycleState = .running
-                isRunning = true
-                wakeReconnectAttempts = 0
-                wasRunningBeforeSleep = false
-                wasRunningBeforeScreenLock = false
-                statusMessage = processingStatus(outputName: output.name, profileName: activeProfile.name)
-            } catch {
-                if lifecycleState == .waking {
-                    scheduleWakeReconnectRetry(status: audioEngineStatusMessage(error))
-                    return
-                }
-                lifecycleState = .stopped
-                isRunning = false
-                statusMessage = audioEngineStatusMessage(error)
-            }
+            scheduleEngineWork(.start(output: output, profile: activeProfile))
         case .failure(let error):
             if lifecycleState == .waking {
                 scheduleWakeReconnectRetry(status: localized("Waiting for audio output after wake: \(error.localizedDescription)"))
                 return
             }
+            invalidatePendingEngineStart()
             engine.stop()
             lifecycleState = .stopped
             isRunning = false
@@ -1016,11 +1018,151 @@ final class GlassEQAppModel {
         notifyModelDidChange()
     }
 
+    private func scheduleEngineWork(_ work: EngineWork) {
+        guard lifecycleState != .terminating,
+              lifecycleState != .sleeping else {
+            return
+        }
+
+        engineStartGeneration += 1
+        let generation = engineStartGeneration
+        engineStartTask?.cancel()
+        switch work {
+        case .start(let output, _):
+            pendingEngineStartOutput = output
+        case .restart:
+            pendingEngineStartOutput = nil
+        }
+
+        let engine = engine
+        let defaultOutputLookup = defaultOutputLookup
+        let workTask = Task.detached(priority: .userInitiated) {
+            Self.performEngineWork(work, engine: engine, defaultOutputLookup: defaultOutputLookup)
+        }
+
+        engineStartTask = Task { @MainActor [weak self] in
+            let result = await withTaskCancellationHandler {
+                await workTask.value
+            } onCancel: {
+                workTask.cancel()
+            }
+            guard !Task.isCancelled else {
+                return
+            }
+            self?.completeEngineWork(result, generation: generation)
+        }
+    }
+
+    nonisolated private static func performEngineWork(
+        _ work: EngineWork,
+        engine: any AudioEngineControlling,
+        defaultOutputLookup: any DefaultOutputLookingUp
+    ) -> EngineWorkResult {
+        var attemptedOutput: AudioOutputDevice?
+        do {
+            let output: AudioOutputDevice
+            switch work {
+            case .start(let requestedOutput, let profile):
+                attemptedOutput = requestedOutput
+                try engine.start(output: requestedOutput, profile: profile)
+                if Task.isCancelled {
+                    engine.stop()
+                    return .cancelled
+                }
+                if case .running(let activeOutput) = engine.state {
+                    output = activeOutput
+                } else {
+                    output = requestedOutput
+                }
+            case .restart(let profile):
+                switch engine.state {
+                case .running(let runningOutput):
+                    attemptedOutput = runningOutput
+                    try engine.update(profile: profile)
+                    if Task.isCancelled {
+                        engine.stop()
+                        return .cancelled
+                    }
+                    guard case .running(let activeOutput) = engine.state else {
+                        return .failure(
+                            EngineWorkFailure(message: localized("Default output unavailable")),
+                            attemptedOutput
+                        )
+                    }
+                    output = activeOutput
+                case .stopped, .failed:
+                    let defaultOutput = try defaultOutputLookup.defaultOutputDevice()
+                    attemptedOutput = defaultOutput
+                    if Task.isCancelled {
+                        return .cancelled
+                    }
+                    try engine.start(output: defaultOutput, profile: profile)
+                    if Task.isCancelled {
+                        engine.stop()
+                        return .cancelled
+                    }
+                    if case .running(let activeOutput) = engine.state {
+                        output = activeOutput
+                    } else {
+                        output = defaultOutput
+                    }
+                }
+            }
+            return .success(output)
+        } catch {
+            return .failure(error, attemptedOutput)
+        }
+    }
+
+    private func completeEngineWork(_ result: EngineWorkResult, generation: Int) {
+        guard generation == engineStartGeneration,
+              lifecycleState != .terminating,
+              lifecycleState != .sleeping else {
+            return
+        }
+
+        engineStartTask = nil
+        pendingEngineStartOutput = nil
+
+        switch result {
+        case .success(let output):
+            refreshCurrentOutputMetadata(from: output)
+            lifecycleState = .running
+            isRunning = true
+            wakeReconnectAttempts = 0
+            wasRunningBeforeSleep = false
+            statusMessage = processingStatus(outputName: output.name, profileName: activeProfile.name)
+        case .failure(let error, let attemptedOutput):
+            if let attemptedOutput {
+                refreshCurrentOutputMetadata(from: attemptedOutput)
+            }
+            if lifecycleState == .waking {
+                scheduleWakeReconnectRetry(status: audioEngineStatusMessage(error))
+                return
+            }
+            lifecycleState = .stopped
+            isRunning = false
+            statusMessage = audioEngineStatusMessage(error)
+        case .cancelled:
+            return
+        }
+        notifyModelDidChange()
+    }
+
+    private func reschedulePendingEngineStartWithActiveProfile() {
+        guard lifecycleState == .waking,
+              let output = pendingEngineStartOutput else {
+            return
+        }
+        scheduleEngineWork(.start(output: output, profile: activeProfile))
+    }
+
     private func scheduleWakeReconnectRetry(status: String) {
         guard lifecycleState == .waking else {
             return
         }
         guard wakeReconnectAttempts < WakeReconnectPolicy.maximumAttempts else {
+            invalidatePendingEngineStart()
             engine.stop()
             lifecycleState = .stopped
             isRunning = false
@@ -1100,12 +1242,16 @@ final class GlassEQAppModel {
               lifecycleState != .sleeping else {
             return
         }
+        guard lifecycleState != .waking else {
+            requestWakeReconnectAttempt()
+            return
+        }
         restartEngineWithActiveProfile()
     }
 
     func openPrivacySettings() throws {
         let urls = [
-            URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"),
+            URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"),
             URL(string: "x-apple.systempreferences:com.apple.preference.security")
         ].compactMap { $0 }
         for url in urls where workspaceOpener.open(url) {
@@ -1177,6 +1323,13 @@ final class GlassEQAppModel {
         outputChangeTask = nil
     }
 
+    private func invalidatePendingEngineStart() {
+        engineStartGeneration += 1
+        engineStartTask?.cancel()
+        engineStartTask = nil
+        pendingEngineStartOutput = nil
+    }
+
     private func installLifecycleObservers() {
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         lifecycleObserverTokens.append(
@@ -1208,28 +1361,6 @@ final class GlassEQAppModel {
             }
         )
         lifecycleObserverTokens.append(
-            DistributedNotificationCenter.default().addObserver(
-                forName: .screenIsLocked,
-                object: nil,
-                queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor in
-                    self?.handleScreenDidLock()
-                }
-            }
-        )
-        lifecycleObserverTokens.append(
-            DistributedNotificationCenter.default().addObserver(
-                forName: .screenIsUnlocked,
-                object: nil,
-                queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor in
-                    self?.handleScreenDidUnlock()
-                }
-            }
-        )
-        lifecycleObserverTokens.append(
             NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in
                     self?.cleanupForTermination()
@@ -1245,6 +1376,7 @@ final class GlassEQAppModel {
 
         wasRunningBeforeSleep = isRunning || wasRunningBeforeSleep
         invalidatePendingOutputChange()
+        invalidatePendingEngineStart()
         stopObserver()
         engine.stop()
         previewReturnProfile = nil
@@ -1280,10 +1412,6 @@ final class GlassEQAppModel {
         guard lifecycleState != .terminating else {
             return
         }
-        guard !wasRunningBeforeScreenLock else {
-            handleScreenDidUnlock()
-            return
-        }
         guard lifecycleState != .sleeping else {
             handleDidWake()
             return
@@ -1295,50 +1423,14 @@ final class GlassEQAppModel {
             )
             return
         }
-        guard lifecycleState == .running, isRunning else {
-            return
-        }
-
-        engine.muteOutputForTransition()
-        beginAudioReconnect(
-            status: localized("Reconnecting audio output after unlock..."),
-            initialDelay: wakeReconnectDelayOverride ?? SessionActivationReconnectPolicy.reconnectDelay
-        )
-    }
-
-    func handleScreenDidLock() {
-        guard lifecycleState != .terminating else {
-            return
-        }
-
-        wasRunningBeforeScreenLock = isRunning && currentOutputIsBluetooth
-        guard wasRunningBeforeScreenLock else {
-            return
-        }
-
-        invalidatePendingOutputChange()
-        stopObserver()
-        engine.stop()
-        previewReturnProfile = nil
-        lifecycleState = .stopped
-        isRunning = false
-        statusMessage = localized("Paused while screen is locked")
-        notifyModelDidChange()
-    }
-
-    func handleScreenDidUnlock() {
-        guard lifecycleState != .terminating,
-              wasRunningBeforeScreenLock else {
-            return
-        }
-
-        beginAudioReconnect(
-            status: localized("Reconnecting audio output after unlock..."),
-            initialDelay: wakeReconnectDelayOverride ?? SessionActivationReconnectPolicy.reconnectDelay
-        )
     }
 
     private func beginAudioReconnect(status: String, initialDelay: Duration) {
+        guard lifecycleState != .waking else {
+            statusMessage = status
+            notifyModelDidChange()
+            return
+        }
         invalidatePendingOutputChange()
         let generation = outputChangeGeneration
         wakeReconnectAttempts = 0
@@ -1370,8 +1462,8 @@ final class GlassEQAppModel {
         }
         lifecycleState = .terminating
         wasRunningBeforeSleep = false
-        wasRunningBeforeScreenLock = false
         invalidatePendingOutputChange()
+        invalidatePendingEngineStart()
         metricsTask?.cancel()
         metricsTask = nil
         stopObserver()
@@ -1480,7 +1572,8 @@ private struct MenuBarView: View {
                         .contentShape(.rect)
                 }
                 .controlSize(.large)
-                .modifier(ActivePopoverButtonTint(color: enableButtonTint, isActive: popoverControlsAreActive))
+                .buttonStyle(.glass)
+                .tint(popoverControlsAreActive ? enableButtonTint : nil)
                 .accessibilityLabel(Text(model.draftProfile.isBypassed ? localized("Enable equalizer") : localized("Disable equalizer")))
                 .accessibilityValue(Text(statusBadgeTitle))
                 .accessibilityHint(Text(localized("Toggles audio bypass for the selected profile")))
@@ -1494,6 +1587,7 @@ private struct MenuBarView: View {
                         .contentShape(.rect)
                 }
                 .controlSize(.large)
+                .buttonStyle(.glass)
 
                 Button(role: .destructive) {
                     model.requestQuit()
@@ -1503,7 +1597,8 @@ private struct MenuBarView: View {
                         .contentShape(.rect)
                 }
                 .controlSize(.large)
-                .modifier(ActivePopoverButtonTint(color: .macOSSystemRed, isActive: popoverControlsAreActive))
+                .buttonStyle(.glass)
+                .tint(popoverControlsAreActive ? .macOSSystemRed : nil)
             }
 
             Text(model.statusMessage)
@@ -1514,7 +1609,7 @@ private struct MenuBarView: View {
                 .accessibilityValue(Text(model.statusMessage))
         }
         .padding()
-        .glassEffect(.regular, in: .rect(cornerRadius: 16))
+        .background { PopoverGlassConfigurator() }
     }
 
     private var header: some View {
@@ -1577,53 +1672,39 @@ private struct MenuBarView: View {
 }
 
 
-private struct ActivePopoverButtonTint: ViewModifier {
-    var color: Color
-    var isActive: Bool
+private enum PopoverGlassAppearance {
+    /// Opacity applied to the popover's system Liquid Glass backing (NSGlassView).
+    /// 1.0 keeps the full system frost; lower values thin it so more of the desktop shows
+    /// through. Our content is a sibling of the backing, so it stays fully opaque regardless.
+    static let backingAlpha: CGFloat = 0.2
+}
 
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if isActive {
-            content
-                .buttonStyle(.borderedProminent)
-                .tint(color)
-        } else {
-            content
+private final class PopoverGlassConfiguringView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window else {
+            return
+        }
+        let root = window.contentView?.superview ?? window.contentView
+        root.map(Self.dimGlassBacking)
+    }
+
+    private static func dimGlassBacking(_ view: NSView) {
+        if String(describing: type(of: view)) == "NSGlassView" {
+            view.alphaValue = PopoverGlassAppearance.backingAlpha
+        }
+        for subview in view.subviews {
+            dimGlassBacking(subview)
         }
     }
 }
 
-private struct GlassPanelModifier: ViewModifier {
-    var padding: CGFloat = 16
-    var cornerRadius: CGFloat = 16
-    var usesGlassEffect = false
-
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if usesGlassEffect {
-            content
-                .padding(padding)
-                .background(.regularMaterial, in: .rect(cornerRadius: cornerRadius))
-                .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
-                .overlay(panelBorder)
-        } else {
-            content
-                .padding(padding)
-                .background(Color(nsColor: .controlBackgroundColor), in: .rect(cornerRadius: cornerRadius))
-                .overlay(panelBorder)
-        }
+private struct PopoverGlassConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> PopoverGlassConfiguringView {
+        PopoverGlassConfiguringView()
     }
 
-    private var panelBorder: some View {
-        RoundedRectangle(cornerRadius: cornerRadius)
-            .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-    }
-}
-
-private extension View {
-    func glassPanel(padding: CGFloat = 16, cornerRadius: CGFloat = 16, usesGlassEffect: Bool = false) -> some View {
-        modifier(GlassPanelModifier(padding: padding, cornerRadius: cornerRadius, usesGlassEffect: usesGlassEffect))
-    }
+    func updateNSView(_ nsView: PopoverGlassConfiguringView, context: Context) {}
 }
 
 private extension Color {
