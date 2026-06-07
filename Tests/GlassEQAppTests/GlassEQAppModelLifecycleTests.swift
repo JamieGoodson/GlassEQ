@@ -124,6 +124,31 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func startDoesNotBlockOnAsyncObserverStart() async throws {
+        let observers = BlockingAsyncDefaultOutputObserverFactory()
+        let model = makeModel(observers: observers, outputDelay: .zero)
+
+        let start = Date()
+        model.start()
+        let elapsed = Date().timeIntervalSince(start)
+
+        #expect(elapsed < 0.05)
+        let observer = try #require(observers.observers.first)
+        await waitUntil {
+            observer.startCalls == [true]
+        }
+        #expect(model.lifecycleState == .stopped)
+
+        model.stop()
+        observer.resumeStart()
+        await waitUntil {
+            observer.stopCallCount == 1
+        }
+
+        #expect(observer.stopCallCount == 1)
+    }
+
+    @Test
     func availabilityFailureDuringRouteSwitchStartsSettledDefaultOutput() async {
         let airPods = makeOutput(
             uid: "airpods-output",
@@ -201,6 +226,7 @@ struct GlassEQAppModelLifecycleTests {
 
         #expect(model.currentOutputUID == scarlett.uid)
         #expect(model.lifecycleState == .running)
+        #expect(engine.events == ["start:\(speakers.uid)", "mute", "start:\(scarlett.uid)"])
     }
 
     @Test
@@ -252,6 +278,37 @@ struct GlassEQAppModelLifecycleTests {
 
         #expect(model.currentOutputSampleRate == changedOutput.nominalSampleRate)
         #expect(model.currentOutputBufferFrameSize == changedOutput.bufferFrameSize)
+    }
+
+    @Test
+    func stopThenImmediateRestartEnqueuesStopBeforeNewStart() async {
+        let output = makeOutput(uid: "restart-output", name: "Restart Output")
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(output))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        model.stop()
+        model.start()
+        observers.observers.last?.emit(.success(output))
+
+        await waitUntil {
+            engine.stopCallCount == 1 && engine.startCalls.count == 2
+        }
+
+        #expect(engine.events == ["start:\(output.uid)", "stop", "start:\(output.uid)"])
+        #expect(model.lifecycleState == .running)
     }
 
     @Test
@@ -320,6 +377,7 @@ struct GlassEQAppModelLifecycleTests {
         }
 
         #expect(engine.stopCallCount == 2)
+        #expect(engine.state == .stopped)
         #expect(!model.isRunning)
         #expect(model.lifecycleState == .stopped)
     }
@@ -860,6 +918,62 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func bypassAfterSelectingDifferentDraftOnlyTogglesActiveProfile() async {
+        let active = makeProfile(name: "Active")
+        let draft = makeProfile(name: "Draft")
+        let output = makeOutput(uid: "bypass-output", name: "Bypass Output")
+        let store = ProfileStore(profiles: [active, draft], fallbackProfileID: active.id)
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(store: store, engine: engine, observers: observers, outputDelay: .zero)
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        model.selectProfile(draft.id)
+
+        model.setBypass(true)
+
+        #expect(model.activeProfile.id == active.id)
+        #expect(model.activeProfile.isBypassed)
+        #expect(model.selectedProfileID == draft.id)
+        #expect(model.draftProfile.id == draft.id)
+        #expect(!model.draftProfile.isBypassed)
+        #expect(model.profileStore.profiles.first { $0.id == active.id }?.isBypassed == true)
+        #expect(model.profileStore.profiles.first { $0.id == draft.id }?.isBypassed == false)
+        #expect(engine.updateDSPCalls.isEmpty)
+        #expect(engine.setBypassedCalls == [true])
+    }
+
+    @Test
+    func bypassMirrorsDraftWhenSelectedProfileIsActiveProfile() async {
+        let active = makeProfile(name: "Active")
+        let output = makeOutput(uid: "active-bypass-output", name: "Active Bypass Output")
+        let store = ProfileStore(profiles: [active], fallbackProfileID: active.id)
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(store: store, engine: engine, observers: observers, outputDelay: .zero)
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        model.setBypass(true)
+
+        #expect(model.activeProfile.id == active.id)
+        #expect(model.activeProfile.isBypassed)
+        #expect(model.draftProfile.id == active.id)
+        #expect(model.draftProfile.isBypassed)
+        #expect(model.profileStore.profiles.first { $0.id == active.id }?.isBypassed == true)
+        #expect(engine.updateDSPCalls.isEmpty)
+        #expect(engine.setBypassedCalls == [true])
+    }
+
+    @Test
     func settingsDuplicateUsesExplicitProfileID() async throws {
         let first = makeProfile(name: "First")
         let second = makeProfile(name: "Second")
@@ -1168,7 +1282,7 @@ private func makeModel(
         .appendingPathComponent("GlassEQAppTests-\(UUID().uuidString).json"),
     engine: FakeAudioEngine = FakeAudioEngine(),
     lookup: FakeDefaultOutputLookup = FakeDefaultOutputLookup(.success(makeOutput())),
-    observers: FakeDefaultOutputObserverFactory = FakeDefaultOutputObserverFactory(),
+    observers: any DefaultOutputObservingMaking = FakeDefaultOutputObserverFactory(),
     workspaceOpener: any WorkspaceOpening = FakeWorkspaceOpener(results: []),
     saveDelay: Duration = .zero,
     outputDelay: Duration? = nil,
@@ -1353,16 +1467,36 @@ private final class SleepingSettingsHelperLauncher: SettingsHelperLaunching {
 }
 
 private final class FakeDefaultOutputLookup: DefaultOutputLookingUp, @unchecked Sendable {
-    private(set) var defaultOutputCalls = 0
-    var result: Result<AudioOutputDevice, Error>
+    private let lock = NSLock()
+    private var _defaultOutputCalls = 0
+    private var _result: Result<AudioOutputDevice, Error>
+
+    private(set) var defaultOutputCalls: Int {
+        get { withLock { _defaultOutputCalls } }
+        set { withLock { _defaultOutputCalls = newValue } }
+    }
+
+    var result: Result<AudioOutputDevice, Error> {
+        get { withLock { _result } }
+        set { withLock { _result = newValue } }
+    }
 
     init(_ result: Result<AudioOutputDevice, Error>) {
-        self.result = result
+        self._result = result
     }
 
     func defaultOutputDevice() throws -> AudioOutputDevice {
-        defaultOutputCalls += 1
+        let result = withLock {
+            _defaultOutputCalls += 1
+            return _result
+        }
         return try result.get()
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
     }
 }
 
@@ -1376,25 +1510,130 @@ private final class FakeDefaultOutputObserverFactory: DefaultOutputObservingMaki
     }
 }
 
-private final class FakeDefaultOutputObserver: DefaultOutputObserving {
+private final class FakeDefaultOutputObserver: DefaultOutputObserving, @unchecked Sendable {
     private let onChange: DefaultOutputObserverHandler
-    private(set) var startCalls: [Bool] = []
-    private(set) var stopCallCount = 0
+    private let lock = NSLock()
+    private var _startCalls: [Bool] = []
+    private var _stopCallCount = 0
+
+    var startCalls: [Bool] {
+        withLock {
+            _startCalls
+        }
+    }
+
+    var stopCallCount: Int {
+        withLock {
+            _stopCallCount
+        }
+    }
 
     init(onChange: @escaping DefaultOutputObserverHandler) {
         self.onChange = onChange
     }
 
     func start(sendInitialValue: Bool) throws {
-        startCalls.append(sendInitialValue)
+        withLock {
+            _startCalls.append(sendInitialValue)
+        }
     }
 
     func stop() {
-        stopCallCount += 1
+        withLock {
+            _stopCallCount += 1
+        }
     }
 
     func emit(_ result: Result<AudioOutputDevice, Error>) {
         onChange(result)
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return body()
+    }
+}
+
+private final class BlockingAsyncDefaultOutputObserverFactory: DefaultOutputObservingMaking {
+    private(set) var observers: [BlockingAsyncDefaultOutputObserver] = []
+
+    func makeObserver(onChange: @escaping DefaultOutputObserverHandler) -> any DefaultOutputObserving {
+        let observer = BlockingAsyncDefaultOutputObserver(onChange: onChange)
+        observers.append(observer)
+        return observer
+    }
+}
+
+private final class BlockingAsyncDefaultOutputObserver: DefaultOutputObserving, @unchecked Sendable {
+    private let onChange: DefaultOutputObserverHandler
+    private let lock = NSLock()
+    private var _startCalls: [Bool] = []
+    private var _stopCallCount = 0
+    private var startContinuation: CheckedContinuation<Void, Never>?
+
+    init(onChange: @escaping DefaultOutputObserverHandler) {
+        self.onChange = onChange
+    }
+
+    var startCalls: [Bool] {
+        withLock {
+            _startCalls
+        }
+    }
+
+    var stopCallCount: Int {
+        withLock {
+            _stopCallCount
+        }
+    }
+
+    func start(sendInitialValue: Bool) throws {
+        withLock {
+            _startCalls.append(sendInitialValue)
+        }
+    }
+
+    func startAsync(sendInitialValue: Bool) async throws {
+        try start(sendInitialValue: sendInitialValue)
+        await withCheckedContinuation { continuation in
+            withLock {
+                startContinuation = continuation
+            }
+        }
+    }
+
+    func stop() {
+        withLock {
+            _stopCallCount += 1
+        }
+    }
+
+    func stopAsync() async {
+        stop()
+    }
+
+    func emit(_ result: Result<AudioOutputDevice, Error>) {
+        onChange(result)
+    }
+
+    func resumeStart() {
+        let continuation = withLock {
+            let continuation = startContinuation
+            startContinuation = nil
+            return continuation
+        }
+        continuation?.resume()
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return body()
     }
 }
 
@@ -1404,67 +1643,183 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         var profile: EQProfile
     }
 
-    var state: AudioEngineState = .stopped
-    var startError: Error?
-    var updateError: Error?
-    var updateDSPResult = true
-    var startDelaySeconds: TimeInterval = 0
-    var startDelaySecondsByUID: [String: TimeInterval] = [:]
-    private(set) var startCalls: [StartCall] = []
-    private(set) var updateCalls: [EQProfile] = []
-    private(set) var updateDSPCalls: [EQProfile] = []
-    private(set) var stopCallCount = 0
-    private(set) var muteOutputCallCount = 0
-    private(set) var setBypassedCalls: [Bool] = []
-    var metrics = AudioEngineMetrics()
+    private let lock = NSLock()
+    private var _state: AudioEngineState = .stopped
+    private var _startError: Error?
+    private var _updateError: Error?
+    private var _updateErrorPreservesRunningState = false
+    private var _updateDSPResult = true
+    private var _startDelaySeconds: TimeInterval = 0
+    private var _startDelaySecondsByUID: [String: TimeInterval] = [:]
+    private var _startCalls: [StartCall] = []
+    private var _updateCalls: [EQProfile] = []
+    private var _updateDSPCalls: [EQProfile] = []
+    private var _stopCallCount = 0
+    private var _muteOutputCallCount = 0
+    private var _setBypassedCalls: [Bool] = []
+    private var _metrics = AudioEngineMetrics()
+    private var _events: [String] = []
+
+    var state: AudioEngineState {
+        get { withLock { _state } }
+        set { withLock { _state = newValue } }
+    }
+
+    var startError: Error? {
+        get { withLock { _startError } }
+        set { withLock { _startError = newValue } }
+    }
+
+    var updateError: Error? {
+        get { withLock { _updateError } }
+        set { withLock { _updateError = newValue } }
+    }
+
+    var updateErrorPreservesRunningState: Bool {
+        get { withLock { _updateErrorPreservesRunningState } }
+        set { withLock { _updateErrorPreservesRunningState = newValue } }
+    }
+
+    var updateDSPResult: Bool {
+        get { withLock { _updateDSPResult } }
+        set { withLock { _updateDSPResult = newValue } }
+    }
+
+    var startDelaySeconds: TimeInterval {
+        get { withLock { _startDelaySeconds } }
+        set { withLock { _startDelaySeconds = newValue } }
+    }
+
+    var startDelaySecondsByUID: [String: TimeInterval] {
+        get { withLock { _startDelaySecondsByUID } }
+        set { withLock { _startDelaySecondsByUID = newValue } }
+    }
+
+    private(set) var startCalls: [StartCall] {
+        get { withLock { _startCalls } }
+        set { withLock { _startCalls = newValue } }
+    }
+
+    private(set) var updateCalls: [EQProfile] {
+        get { withLock { _updateCalls } }
+        set { withLock { _updateCalls = newValue } }
+    }
+
+    private(set) var updateDSPCalls: [EQProfile] {
+        get { withLock { _updateDSPCalls } }
+        set { withLock { _updateDSPCalls = newValue } }
+    }
+
+    private(set) var stopCallCount: Int {
+        get { withLock { _stopCallCount } }
+        set { withLock { _stopCallCount = newValue } }
+    }
+
+    private(set) var muteOutputCallCount: Int {
+        get { withLock { _muteOutputCallCount } }
+        set { withLock { _muteOutputCallCount = newValue } }
+    }
+
+    private(set) var setBypassedCalls: [Bool] {
+        get { withLock { _setBypassedCalls } }
+        set { withLock { _setBypassedCalls = newValue } }
+    }
+
+    var metrics: AudioEngineMetrics {
+        get { withLock { _metrics } }
+        set { withLock { _metrics = newValue } }
+    }
+
+    var events: [String] {
+        withLock { _events }
+    }
 
     func start(output: AudioOutputDevice, profile: EQProfile) throws {
-        startCalls.append(StartCall(output: output, profile: profile))
-        let delay = startDelaySecondsByUID[output.uid] ?? startDelaySeconds
+        let delay = withLock {
+            _events.append("start:\(output.uid)")
+            _startCalls.append(StartCall(output: output, profile: profile))
+            return _startDelaySecondsByUID[output.uid] ?? _startDelaySeconds
+        }
         if delay > 0 {
             Thread.sleep(forTimeInterval: delay)
         }
-        if let startError {
-            state = .failed("Start failed")
+        if let startError = withLock({ _startError }) {
+            withLock {
+                _state = .failed("Start failed")
+            }
             throw startError
         }
-        state = .running(output: output)
+        withLock {
+            _state = .running(output: output)
+        }
     }
 
     func update(profile: EQProfile) throws {
-        updateCalls.append(profile)
-        if let updateError {
-            state = .failed("Update failed")
+        let update = withLock {
+            _events.append("update:\(profile.id)")
+            _updateCalls.append(profile)
+            return (error: _updateError, preservesRunningState: _updateErrorPreservesRunningState)
+        }
+        if let updateError = update.error {
+            if !update.preservesRunningState {
+                withLock {
+                    _state = .failed("Update failed")
+                }
+            }
             throw updateError
         }
-        if case .running(let output) = state {
-            state = .running(output: output)
+        withLock {
+            if case .running(let output) = _state {
+                _state = .running(output: output)
+            }
         }
     }
 
     func updateDSP(profile: EQProfile) -> Bool {
-        updateDSPCalls.append(profile)
-        return updateDSPResult
+        withLock {
+            _events.append("updateDSP:\(profile.id)")
+            _updateDSPCalls.append(profile)
+            return _updateDSPResult
+        }
     }
 
     func setBypassed(_ isBypassed: Bool) {
-        setBypassedCalls.append(isBypassed)
+        withLock {
+            _events.append("bypass:\(isBypassed)")
+            _setBypassedCalls.append(isBypassed)
+        }
     }
 
     func muteOutputForTransition() {
-        muteOutputCallCount += 1
+        withLock {
+            _events.append("mute")
+            _muteOutputCallCount += 1
+        }
     }
 
     func stop() {
-        stopCallCount += 1
-        state = .stopped
+        withLock {
+            _events.append("stop")
+            _stopCallCount += 1
+            _state = .stopped
+        }
     }
 
     func snapshotMetrics() -> AudioEngineMetrics {
-        metrics
+        withLock {
+            _metrics
+        }
     }
 
     func resetDiagnostics() {
-        metrics = AudioEngineMetrics()
+        withLock {
+            _metrics = AudioEngineMetrics()
+        }
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
     }
 }

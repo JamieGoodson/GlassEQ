@@ -44,7 +44,7 @@ final class GlassEQAppDelegate: NSObject, NSApplicationDelegate {
             }
             let shouldTerminate = await model.flushStoreBeforeQuit()
             if shouldTerminate {
-                model.cleanupForTermination()
+                await model.cleanupForTerminationAndWait()
             }
             sender.reply(toApplicationShouldTerminate: shouldTerminate)
         }
@@ -230,9 +230,21 @@ struct CoreAudioDefaultOutputLookup: DefaultOutputLookingUp {
 
 typealias DefaultOutputObserverHandler = @Sendable (Result<AudioOutputDevice, Error>) -> Void
 
-protocol DefaultOutputObserving: AnyObject {
+protocol DefaultOutputObserving: AnyObject, Sendable {
     func start(sendInitialValue: Bool) throws
     func stop()
+    func startAsync(sendInitialValue: Bool) async throws
+    func stopAsync() async
+}
+
+extension DefaultOutputObserving {
+    func startAsync(sendInitialValue: Bool) async throws {
+        try start(sendInitialValue: sendInitialValue)
+    }
+
+    func stopAsync() async {
+        stop()
+    }
 }
 
 extension DefaultOutputDeviceObserver: DefaultOutputObserving {}
@@ -294,9 +306,26 @@ private actor ProfileStoreWriter {
     }
 }
 
-private actor EngineWorkExecutor {
-    func run<T: Sendable>(_ operation: @Sendable () -> T) -> T {
-        operation()
+private final class EngineWorkExecutor: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tail: Task<Void, Never> = Task {}
+
+    @discardableResult
+    func enqueue<T: Sendable>(
+        priority: TaskPriority? = nil,
+        _ operation: @Sendable @escaping () -> T
+    ) -> Task<T, Never> {
+        lock.lock()
+        let previous = tail
+        let task = Task(priority: priority) {
+            _ = await previous.value
+            return operation()
+        }
+        tail = Task {
+            _ = await task.value
+        }
+        lock.unlock()
+        return task
     }
 }
 
@@ -472,14 +501,9 @@ final class GlassEQAppModel {
         }
 
         guard observer == nil else {
-            do {
-                try observer?.start(sendInitialValue: sendInitialValue)
-            } catch {
-                statusMessage = localized("Default output observer failed: \(error.localizedDescription)")
-                lifecycleState = .stopped
-                isRunning = false
+            if let observer {
+                startObserverAsync(observer, generation: observerCallbackGeneration, sendInitialValue: sendInitialValue)
             }
-            notifyModelDidChange()
             return
         }
 
@@ -492,18 +516,40 @@ final class GlassEQAppModel {
         }
         self.observer = observer
 
-        do {
-            try observer.start(sendInitialValue: sendInitialValue)
-        } catch {
-            statusMessage = localized("Default output observer failed: \(error.localizedDescription)")
-            if lifecycleState == .waking {
-                scheduleWakeReconnectRetry(status: statusMessage)
-            } else {
-                lifecycleState = .stopped
-                isRunning = false
+        startObserverAsync(observer, generation: generation, sendInitialValue: sendInitialValue)
+    }
+
+    private func startObserverAsync(
+        _ observer: any DefaultOutputObserving,
+        generation: Int,
+        sendInitialValue: Bool
+    ) {
+        Task { @MainActor [weak self, weak observer] in
+            guard let self,
+                  let observer else {
+                return
             }
+            do {
+                try await observer.startAsync(sendInitialValue: sendInitialValue)
+            } catch {
+                guard self.observer === observer,
+                      self.observerCallbackGeneration == generation else {
+                    return
+                }
+                statusMessage = localized("Default output observer failed: \(error.localizedDescription)")
+                if lifecycleState == .waking {
+                    scheduleWakeReconnectRetry(status: statusMessage)
+                } else {
+                    lifecycleState = .stopped
+                    isRunning = false
+                }
+            }
+            guard self.observer === observer,
+                  self.observerCallbackGeneration == generation else {
+                return
+            }
+            notifyModelDidChange()
         }
-        notifyModelDidChange()
     }
 
     func stop() {
@@ -516,8 +562,7 @@ final class GlassEQAppModel {
         invalidatePendingEngineStart()
         metricsTask?.cancel()
         metricsTask = nil
-        engine.stop()
-        engineMetrics = engine.snapshotMetrics()
+        scheduleEngineStop(updateMetrics: true)
         previewReturnProfile = nil
         lifecycleState = .stopped
         isRunning = false
@@ -618,15 +663,17 @@ final class GlassEQAppModel {
     }
 
     func setBypass(_ isBypassed: Bool) {
-        var profile = draftProfile
+        var profile = activeProfile
         profile.isBypassed = isBypassed
         var store = profileStore
         upsertProfile(profile, in: &store)
         do {
             try ProfilePersistence.validate(store)
             profileStore = store
-            draftProfile = profile
             activeProfile = profile
+            if draftProfile.id == profile.id {
+                draftProfile = profile
+            }
             saveStore()
             if lifecycleState == .waking {
                 reschedulePendingEngineStartWithActiveProfile()
@@ -929,7 +976,7 @@ final class GlassEQAppModel {
         let settlingDelay = outputChangeSettlingDelay(for: result)
         outputChangeTask?.cancel()
         if shouldMuteForSettlingOutputChange(result) {
-            engine.muteOutputForTransition()
+            scheduleEngineMuteForTransition()
             statusMessage = outputChangeStatusMessage(for: result)
             notifyModelDidChange()
         }
@@ -1017,7 +1064,7 @@ final class GlassEQAppModel {
                 return
             }
             invalidatePendingEngineStart()
-            engine.stop()
+            scheduleEngineStop(updateMetrics: false)
             lifecycleState = .stopped
             isRunning = false
             statusMessage = localized("Default output unavailable: \(error.localizedDescription)")
@@ -1044,10 +1091,8 @@ final class GlassEQAppModel {
         let engine = engine
         let defaultOutputLookup = defaultOutputLookup
         let engineWorkExecutor = engineWorkExecutor
-        let workTask = Task.detached(priority: .userInitiated) {
-            await engineWorkExecutor.run {
-                Self.performEngineWork(work, engine: engine, defaultOutputLookup: defaultOutputLookup)
-            }
+        let workTask = engineWorkExecutor.enqueue(priority: .userInitiated) {
+            Self.performEngineWork(work, engine: engine, defaultOutputLookup: defaultOutputLookup)
         }
 
         engineStartTask = Task { @MainActor [weak self] in
@@ -1061,6 +1106,41 @@ final class GlassEQAppModel {
                 return
             }
             self?.completeEngineWork(result, generation: generation)
+        }
+    }
+
+    private func scheduleEngineStop(updateMetrics: Bool) {
+        let stopTask = enqueueEngineStop()
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+            let metrics = await stopTask.value
+            if updateMetrics {
+                engineMetrics = metrics
+                notifyModelDidChange()
+            }
+        }
+    }
+
+    private func scheduleEngineMuteForTransition() {
+        let engine = engine
+        let engineWorkExecutor = engineWorkExecutor
+        engineWorkExecutor.enqueue(priority: .userInitiated) {
+            engine.muteOutputForTransition()
+        }
+    }
+
+    private func stopEngineOffMain() async -> AudioEngineMetrics {
+        await enqueueEngineStop().value
+    }
+
+    private func enqueueEngineStop() -> Task<AudioEngineMetrics, Never> {
+        let engine = engine
+        let engineWorkExecutor = engineWorkExecutor
+        return engineWorkExecutor.enqueue(priority: .userInitiated) {
+            engine.stop()
+            return engine.snapshotMetrics()
         }
     }
 
@@ -1136,10 +1216,7 @@ final class GlassEQAppModel {
                 || lifecycleState == .terminating else {
             return
         }
-        engine.stop()
-        if lifecycleState == .stopped {
-            engineMetrics = engine.snapshotMetrics()
-        }
+        scheduleEngineStop(updateMetrics: lifecycleState == .stopped)
     }
 
     private func completeEngineWork(_ result: EngineWorkResult, generation: Int) {
@@ -1191,7 +1268,7 @@ final class GlassEQAppModel {
         }
         guard wakeReconnectAttempts < WakeReconnectPolicy.maximumAttempts else {
             invalidatePendingEngineStart()
-            engine.stop()
+            scheduleEngineStop(updateMetrics: false)
             lifecycleState = .stopped
             isRunning = false
             statusMessage = status
@@ -1259,7 +1336,7 @@ final class GlassEQAppModel {
             guard await self.flushStoreBeforeQuit() else {
                 return
             }
-            self.cleanupForTermination()
+            await self.cleanupForTerminationAndWait()
             GlassEQAppDelegate.allowNextTerminationImmediately()
             NSApplication.shared.terminate(nil)
         }
@@ -1341,8 +1418,11 @@ final class GlassEQAppModel {
 
     private func stopObserver() {
         observerCallbackGeneration += 1
-        observer?.stop()
+        let observerToStop = observer
         observer = nil
+        Task {
+            await observerToStop?.stopAsync()
+        }
     }
 
     private func invalidatePendingOutputChange() {
@@ -1391,7 +1471,7 @@ final class GlassEQAppModel {
         lifecycleObserverTokens.append(
             NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in
-                    self?.cleanupForTermination()
+                    await self?.cleanupForTerminationAndWait()
                 }
             }
         )
@@ -1406,7 +1486,7 @@ final class GlassEQAppModel {
         invalidatePendingOutputChange()
         invalidatePendingEngineStart()
         stopObserver()
-        engine.stop()
+        scheduleEngineStop(updateMetrics: false)
         previewReturnProfile = nil
         lifecycleState = .sleeping
         isRunning = false
@@ -1485,8 +1565,23 @@ final class GlassEQAppModel {
     }
 
     func cleanupForTermination() {
-        guard lifecycleState != .terminating else {
+        guard prepareForTermination(shutdownSettings: true) else {
             return
+        }
+        scheduleEngineStop(updateMetrics: false)
+    }
+
+    func cleanupForTerminationAndWait() async {
+        guard prepareForTermination(shutdownSettings: false) else {
+            return
+        }
+        await settingsCoordinator.shutdownAndWait()
+        _ = await stopEngineOffMain()
+    }
+
+    private func prepareForTermination(shutdownSettings: Bool) -> Bool {
+        guard lifecycleState != .terminating else {
+            return false
         }
         lifecycleState = .terminating
         wasRunningBeforeSleep = false
@@ -1495,11 +1590,13 @@ final class GlassEQAppModel {
         metricsTask?.cancel()
         metricsTask = nil
         stopObserver()
-        engine.stop()
         previewReturnProfile = nil
         isRunning = false
-        settingsCoordinator.shutdown()
+        if shutdownSettings {
+            settingsCoordinator.shutdown()
+        }
         notifyModelDidChange()
+        return true
     }
 
     private func audioEngineStatusMessage(_ error: Error) -> String {
@@ -1592,16 +1689,16 @@ private struct MenuBarView: View {
                 .labelsHidden()
                 .accessibilityLabel(Text(localized("Profile")))
                 .accessibilityValue(Text(model.selectedProfile.name))
-                .accessibilityHint(Text(localized("Chooses the active profile")))
+                .accessibilityHint(Text(localized("Chooses a profile for editing")))
             }
 
             HStack(spacing: 10) {
                 Button {
-                    model.setBypass(!model.draftProfile.isBypassed)
+                    model.setBypass(!model.activeProfile.isBypassed)
                 } label: {
                     Label(
-                        model.draftProfile.isBypassed ? localized("Enable") : localized("Disable"),
-                        systemImage: model.draftProfile.isBypassed ? "speaker.wave.2" : "speaker.slash"
+                        model.activeProfile.isBypassed ? localized("Enable") : localized("Disable"),
+                        systemImage: model.activeProfile.isBypassed ? "speaker.wave.2" : "speaker.slash"
                     )
                         .frame(minWidth: 82, minHeight: 28)
                         .contentShape(.rect)
@@ -1609,9 +1706,9 @@ private struct MenuBarView: View {
                 .controlSize(.large)
                 .buttonStyle(.glass)
                 .tint(popoverControlsAreActive ? enableButtonTint : nil)
-                .accessibilityLabel(Text(model.draftProfile.isBypassed ? localized("Enable equalizer") : localized("Disable equalizer")))
+                .accessibilityLabel(Text(model.activeProfile.isBypassed ? localized("Enable equalizer") : localized("Disable equalizer")))
                 .accessibilityValue(Text(statusBadgeTitle))
-                .accessibilityHint(Text(localized("Toggles audio bypass for the selected profile")))
+                .accessibilityHint(Text(localized("Toggles audio bypass for the active profile")))
 
                 Button {
                     dismiss()
@@ -1675,15 +1772,15 @@ private struct MenuBarView: View {
         guard model.isRunning else {
             return localized("Stopped")
         }
-        return model.draftProfile.isBypassed ? localized("Disabled") : localized("Active")
+        return model.activeProfile.isBypassed ? localized("Disabled") : localized("Active")
     }
 
     private var statusBadgeColor: Color {
-        model.isRunning && !model.draftProfile.isBypassed ? .macOSSystemGreen : .macOSSystemRed
+        model.isRunning && !model.activeProfile.isBypassed ? .macOSSystemGreen : .macOSSystemRed
     }
 
     private var enableButtonTint: Color {
-        model.draftProfile.isBypassed ? .macOSSystemGreen : .macOSSystemYellow
+        model.activeProfile.isBypassed ? .macOSSystemGreen : .macOSSystemYellow
     }
 
     private var popoverControlsAreActive: Bool {

@@ -1,3 +1,4 @@
+import Darwin
 import GlassEQCore
 import Foundation
 import Testing
@@ -271,6 +272,9 @@ struct EQCoreTests {
 
     @Test
     func dspCallbackPathStaysWithinGenerousDebugBudget() {
+        guard !isThreadSanitizerRuntimeLoaded else {
+            return
+        }
         let profile = EQProfile.flatGraphic31
         var processor = EQProcessor(configuration: EQConfiguration(profile: profile, sampleRate: 48_000, channelCount: 2))
         var samples = makeStereoTestBlock(frameCount: 256, sampleRate: 48_000)
@@ -613,4 +617,16 @@ struct EQCoreTests {
         }
         return value
     }
+}
+
+private var isThreadSanitizerRuntimeLoaded: Bool {
+    for index in 0..<_dyld_image_count() {
+        guard let imageName = _dyld_get_image_name(index) else {
+            continue
+        }
+        if String(cString: imageName).contains("libclang_rt.tsan") {
+            return true
+        }
+    }
+    return false
 }
