@@ -136,7 +136,8 @@ public struct SettingsView: View {
                 onCreateParametric: createParametricProfile,
                 onDuplicate: duplicateSelectedProfile,
                 onDelete: deleteSelectedProfile,
-                canDeleteSelectedProfile: canDeleteSelectedProfile
+                canDeleteSelectedProfile: canDeleteSelectedProfile,
+                isReadOnly: isProfileStoreProtected
             )
                 .frame(width: 260)
 
@@ -154,7 +155,8 @@ public struct SettingsView: View {
                                 onStopPreview: stopPreview,
                                 onResetDiagnostics: resetDiagnostics,
                                 onRetryAudioEngine: retryAudioEngine,
-                                onOpenPrivacySettings: openPrivacySettings
+                                onOpenPrivacySettings: openPrivacySettings,
+                                onResetUnsupportedProfileStore: resetUnsupportedProfileStore
                             )
                 .frame(minWidth: 640, maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -202,7 +204,11 @@ public struct SettingsView: View {
     }
 
     private var canDeleteSelectedProfile: Bool {
-        snapshot.profiles.count > 1 && snapshot.selectedProfileID != snapshot.activeProfileID
+        !isProfileStoreProtected && snapshot.profiles.count > 1 && snapshot.selectedProfileID != snapshot.activeProfileID
+    }
+
+    private var isProfileStoreProtected: Bool {
+        snapshot.profileStoreProtection.isProtected
     }
 
     private func selectProfile(_ id: UUID) {
@@ -253,6 +259,10 @@ public struct SettingsView: View {
 
     private func openPrivacySettings() {
         perform(.openPrivacySettings)
+    }
+
+    private func resetUnsupportedProfileStore() {
+        perform(.resetUnsupportedProfileStore)
     }
 
     private func createGraphic31Profile() {
@@ -629,6 +639,7 @@ private struct ProfileSidebar: View {
     var onDuplicate: () -> Void
     var onDelete: () -> Void
     var canDeleteSelectedProfile: Bool
+    var isReadOnly: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -688,6 +699,7 @@ private struct ProfileSidebar: View {
                             .contentShape(.rect)
                     }
                     .help(localized("New 31-band profile"))
+                    .disabled(isReadOnly)
                     .accessibilityLabel(Text(localized("New 31-band profile")))
                     .accessibilityHint(Text(localized("Creates a 31-band graphic equalizer profile")))
 
@@ -699,6 +711,7 @@ private struct ProfileSidebar: View {
                             .contentShape(.rect)
                     }
                     .help(localized("New 10-band profile"))
+                    .disabled(isReadOnly)
                     .accessibilityLabel(Text(localized("New 10-band profile")))
                     .accessibilityHint(Text(localized("Creates a 10-band graphic equalizer profile")))
 
@@ -710,6 +723,7 @@ private struct ProfileSidebar: View {
                             .contentShape(.rect)
                     }
                     .help(localized("New parametric profile"))
+                    .disabled(isReadOnly)
                     .accessibilityLabel(Text(localized("New parametric profile")))
                     .accessibilityHint(Text(localized("Creates a parametric equalizer profile")))
 
@@ -723,6 +737,7 @@ private struct ProfileSidebar: View {
                             .contentShape(.rect)
                     }
                     .help(localized("Duplicate profile"))
+                    .disabled(isReadOnly)
                     .accessibilityLabel(Text(localized("Duplicate profile")))
                     .accessibilityHint(Text(localized("Copies the selected profile")))
 
@@ -784,6 +799,7 @@ private struct ProfileDetail: View {
     var onResetDiagnostics: () -> Void
     var onRetryAudioEngine: () -> Void
     var onOpenPrivacySettings: () -> Void
+    var onResetUnsupportedProfileStore: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -791,8 +807,19 @@ private struct ProfileDetail: View {
                 ProfileHeader(
                     snapshot: snapshot,
                     draftProfile: $draftProfile,
-                    tab: $tab
+                    tab: $tab,
+                    isReadOnly: isProfileStoreProtected
                 )
+            }
+
+            if isProfileStoreProtected {
+                constrainedContent {
+                    ProfileStoreProtectionBanner(
+                        protection: snapshot.profileStoreProtection,
+                        onReset: onResetUnsupportedProfileStore
+                    )
+                }
+                .fixedSize(horizontal: false, vertical: true)
             }
 
             ScrollView {
@@ -804,11 +831,17 @@ private struct ProfileDetail: View {
                                 draftProfile: $draftProfile,
                                 sampleRate: snapshot.currentOutputSampleRate
                             )
+                            .disabled(isProfileStoreProtected)
                         case .importer:
-                            ImportTab(profile: draftProfile, onImport: onImport)
+                            ImportTab(
+                                profile: draftProfile,
+                                isReadOnly: isProfileStoreProtected,
+                                onImport: onImport
+                            )
                         case .output:
                             OutputTab(
                                 snapshot: snapshot,
+                                isProfileStoreProtected: isProfileStoreProtected,
                                 onUseForCurrentOutput: onUseForCurrentOutput,
                                 onSetFallback: onSetFallback,
                                 onResetDiagnostics: onResetDiagnostics,
@@ -834,6 +867,7 @@ private struct ProfileDetail: View {
                         hasUnsavedDraft: hasUnsavedDraft,
                         currentOutputUID: snapshot.currentOutputUID,
                         isPreviewing: snapshot.isPreviewing,
+                        isReadOnly: isProfileStoreProtected,
                         onApply: onApply,
                         onRevert: onRevert,
                         onPreview: onPreview,
@@ -859,12 +893,17 @@ private struct ProfileDetail: View {
             .frame(maxWidth: 860, alignment: .topLeading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
     }
+
+    private var isProfileStoreProtected: Bool {
+        snapshot.profileStoreProtection.isProtected
+    }
 }
 
 private struct ProfileHeader: View {
     var snapshot: SettingsSnapshot
     @Binding var draftProfile: EQProfile
     @Binding var tab: EditorSection
+    var isReadOnly: Bool
     @State private var isRenaming = false
 
     var body: some View {
@@ -875,6 +914,7 @@ private struct ProfileHeader: View {
                         TextField(localized("Profile name"), text: $draftProfile.name)
                             .textFieldStyle(.roundedBorder)
                             .frame(maxWidth: 280)
+                            .disabled(isReadOnly)
                             .accessibilityLabel(Text(localized("Profile name")))
                         Button(localized("Done")) {
                             isRenaming = false
@@ -894,6 +934,7 @@ private struct ProfileHeader: View {
                                 .contentShape(.rect)
                         }
                         .buttonStyle(.borderless)
+                        .disabled(isReadOnly)
                         .help(localized("Rename profile"))
                         .accessibilityLabel(Text(localized("Rename profile")))
                         .accessibilityHint(Text(localized("Edits the selected profile name")))
@@ -922,6 +963,34 @@ private struct ProfileHeader: View {
             .accessibilityHint(Text(localized("Switches between editor, import, and output details")))
         }
         .cardPanel(padding: 16)
+    }
+}
+
+private struct ProfileStoreProtectionBanner: View {
+    var protection: SettingsProfileStoreProtectionDTO
+    var onReset: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: "lock.fill")
+                .foregroundStyle(Color.orange)
+                .accessibilityHidden(true)
+            Text(protection.message)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            Button(role: .destructive) {
+                onReset()
+            } label: {
+                Label(protection.resetButtonTitle, systemImage: "arrow.counterclockwise")
+                    .frame(minHeight: 28)
+                    .contentShape(.rect)
+            }
+            .controlSize(.large)
+            .accessibilityLabel(Text(protection.resetButtonTitle))
+        }
+        .cardPanel(padding: 14)
     }
 }
 
@@ -1243,6 +1312,7 @@ private struct ApplyBar: View {
     var hasUnsavedDraft: Bool
     var currentOutputUID: String
     var isPreviewing: Bool
+    var isReadOnly: Bool
     var onApply: () -> Void
     var onRevert: () -> Void
     var onPreview: () -> Void
@@ -1267,19 +1337,20 @@ private struct ApplyBar: View {
                 onApply()
             }
             .keyboardShortcut(.return, modifiers: .command)
-            .disabled(!hasUnsavedDraft)
+            .disabled(isReadOnly || !hasUnsavedDraft)
             .buttonStyle(ToolbarButtonStyle(prominent: true))
 
             Button(isPreviewing ? localized("Stop Preview") : localized("Preview")) {
                 isPreviewing ? onStopPreview() : onPreview()
             }
+            .disabled(isReadOnly && !isPreviewing)
             .buttonStyle(ToolbarButtonStyle())
             .accessibilityValue(Text(isPreviewing ? localized("Previewing") : localized("Not previewing")))
 
             Button(localized("Assign to current output")) {
                 onUseForCurrentOutput()
             }
-            .disabled(currentOutputUID.isEmpty)
+            .disabled(isReadOnly || currentOutputUID.isEmpty)
             .buttonStyle(ToolbarButtonStyle())
             .accessibilityHint(Text(currentOutputUID.isEmpty ? localized("No current output is available") : localized("Maps the selected profile to the current output device")))
         }
@@ -1710,6 +1781,7 @@ private struct SliderRow: View {
 
 private struct ImportTab: View {
     var profile: EQProfile
+    var isReadOnly: Bool
     var onImport: (ImportFormat, String, String) async -> Bool
     @State private var importFormat: ImportFormat
     @State private var importName: String
@@ -1717,8 +1789,9 @@ private struct ImportTab: View {
     @State private var isEditorVisible = false
     @State private var isImporting = false
 
-    init(profile: EQProfile, onImport: @escaping (ImportFormat, String, String) async -> Bool) {
+    init(profile: EQProfile, isReadOnly: Bool, onImport: @escaping (ImportFormat, String, String) async -> Bool) {
         self.profile = profile
+        self.isReadOnly = isReadOnly
         self.onImport = onImport
         _importFormat = State(initialValue: .autoEQ)
         _importName = State(initialValue: localized("Imported Profile"))
@@ -1809,7 +1882,7 @@ private struct ImportTab: View {
                         .frame(minHeight: 28)
                         .contentShape(.rect)
                 }
-                .disabled(!isEditorVisible || importText.isEmpty || isImporting)
+                .disabled(isReadOnly || !isEditorVisible || importText.isEmpty || isImporting)
                 .controlSize(.large)
             }
             .cardPanel(padding: 12)
@@ -1819,6 +1892,7 @@ private struct ImportTab: View {
 
 private struct OutputTab: View {
     var snapshot: SettingsSnapshot
+    var isProfileStoreProtected: Bool
     var onUseForCurrentOutput: () -> Void
     var onSetFallback: () -> Void
     var onResetDiagnostics: () -> Void
@@ -1850,12 +1924,13 @@ private struct OutputTab: View {
                         Button(localized("Use for this output")) {
                             onUseForCurrentOutput()
                         }
-                        .disabled(snapshot.currentOutputUID.isEmpty)
+                        .disabled(isProfileStoreProtected || snapshot.currentOutputUID.isEmpty)
                         .controlSize(.large)
 
                         Button(localized("Set as fallback profile")) {
                             onSetFallback()
                         }
+                        .disabled(isProfileStoreProtected)
                         .controlSize(.large)
                     }
                 }

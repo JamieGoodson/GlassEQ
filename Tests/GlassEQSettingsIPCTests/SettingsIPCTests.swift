@@ -399,7 +399,12 @@ struct SettingsIPCTests {
                 channelCount: 2,
                 bufferFrameSize: 256
             ),
-            currentOutputMappedProfileID: .set(profileID)
+            currentOutputMappedProfileID: .set(profileID),
+            profileStoreProtection: SettingsProfileStoreProtectionDTO(
+                isProtected: true,
+                message: "Newer store",
+                resetButtonTitle: "Reset profiles for this version"
+            )
         )
         let message = SettingsPipeMessage.event(sessionToken: "token", event: .snapshotPatched(patch))
 

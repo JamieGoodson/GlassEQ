@@ -136,6 +136,26 @@ public enum SettingsOptionalUUIDPatchDTO: Codable, Equatable, Sendable {
     case clear
 }
 
+public struct SettingsProfileStoreProtectionDTO: Codable, Equatable, Sendable {
+    public var isProtected: Bool
+    public var message: String
+    public var resetButtonTitle: String
+
+    public init(
+        isProtected: Bool = false,
+        message: String = "",
+        resetButtonTitle: String = ""
+    ) {
+        self.isProtected = isProtected
+        self.message = message
+        self.resetButtonTitle = resetButtonTitle
+    }
+
+    public static var unprotected: SettingsProfileStoreProtectionDTO {
+        SettingsProfileStoreProtectionDTO()
+    }
+}
+
 public struct SettingsSnapshotPatchDTO: Codable, Equatable, Sendable {
     public var statusMessage: String?
     public var isPreviewing: Bool?
@@ -146,6 +166,7 @@ public struct SettingsSnapshotPatchDTO: Codable, Equatable, Sendable {
     public var fallbackProfileID: UUID?
     public var currentOutput: SettingsOutputDTO?
     public var currentOutputMappedProfileID: SettingsOptionalUUIDPatchDTO?
+    public var profileStoreProtection: SettingsProfileStoreProtectionDTO?
 
     public init(
         statusMessage: String? = nil,
@@ -156,7 +177,8 @@ public struct SettingsSnapshotPatchDTO: Codable, Equatable, Sendable {
         activeProfileName: String? = nil,
         fallbackProfileID: UUID? = nil,
         currentOutput: SettingsOutputDTO? = nil,
-        currentOutputMappedProfileID: SettingsOptionalUUIDPatchDTO? = nil
+        currentOutputMappedProfileID: SettingsOptionalUUIDPatchDTO? = nil,
+        profileStoreProtection: SettingsProfileStoreProtectionDTO? = nil
     ) {
         self.statusMessage = statusMessage
         self.isPreviewing = isPreviewing
@@ -167,6 +189,7 @@ public struct SettingsSnapshotPatchDTO: Codable, Equatable, Sendable {
         self.fallbackProfileID = fallbackProfileID
         self.currentOutput = currentOutput
         self.currentOutputMappedProfileID = currentOutputMappedProfileID
+        self.profileStoreProtection = profileStoreProtection
     }
 }
 
@@ -186,6 +209,7 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
     public var statusMessage: String
     public var metrics: SettingsAudioMetricsDTO
     public var isPreviewing: Bool
+    public var profileStoreProtection: SettingsProfileStoreProtectionDTO
 
     public init(
         profiles: [EQProfile],
@@ -202,7 +226,8 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
         fallbackProfileID: UUID,
         statusMessage: String,
         metrics: SettingsAudioMetricsDTO,
-        isPreviewing: Bool
+        isPreviewing: Bool,
+        profileStoreProtection: SettingsProfileStoreProtectionDTO = .unprotected
     ) {
         self.profiles = profiles
         self.selectedProfileID = selectedProfileID
@@ -219,6 +244,7 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
         self.statusMessage = statusMessage
         self.metrics = metrics
         self.isPreviewing = isPreviewing
+        self.profileStoreProtection = profileStoreProtection
     }
 
     public static var disconnected: SettingsSnapshotDTO {
@@ -238,7 +264,8 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
             fallbackProfileID: profile.id,
             statusMessage: "Connecting to GlassEQ...",
             metrics: SettingsAudioMetricsDTO(),
-            isPreviewing: false
+            isPreviewing: false,
+            profileStoreProtection: .unprotected
         )
     }
 }
@@ -258,6 +285,7 @@ public enum SettingsCommand: Codable, Equatable, Sendable {
     case openPrivacySettings
     case startMetricsPolling
     case stopMetricsPolling
+    case resetUnsupportedProfileStore
 }
 
 public struct SettingsCommandResponse: Codable, Equatable, Sendable {

@@ -304,6 +304,10 @@ private actor ProfileStoreWriter {
         }
         try handle.synchronize()
     }
+
+    func resetUnsupportedStore(timestamp: Date = Date()) throws -> (store: ProfileStore, backupURL: URL) {
+        try ProfilePersistence.resetUnsupportedStore(at: url, timestamp: timestamp)
+    }
 }
 
 private final class EngineWorkExecutor: @unchecked Sendable {
@@ -370,16 +374,38 @@ final class GlassEQAppModel {
     private var engineStartGeneration = 0
     private var pendingEngineStartOutput: AudioOutputDevice?
     private let storeWriter: ProfileStoreWriter
+    private var profilePersistenceMode: ProfilePersistenceMode = .normal
     @ObservationIgnored private let engineWorkExecutor = EngineWorkExecutor()
     @ObservationIgnored lazy var settingsCoordinator = SettingsCoordinator(model: self)
 
+    private enum ProfilePersistenceMode: Equatable, Sendable {
+        case normal
+        case unsupportedSchema(version: Int, maximumSupported: Int)
+
+        var isProtected: Bool {
+            if case .unsupportedSchema = self {
+                return true
+            }
+            return false
+        }
+    }
+
+    private struct ProfileRollback: Sendable {
+        var profileStore: ProfileStore
+        var activeProfile: EQProfile
+        var selectedProfileID: UUID
+        var draftProfile: EQProfile
+        var previewReturnProfile: EQProfile?
+    }
+
     private enum EngineWork: Sendable {
         case start(output: AudioOutputDevice, profile: EQProfile)
-        case restart(profile: EQProfile)
+        case restart(profile: EQProfile, rollback: ProfileRollback?)
     }
 
     private enum EngineWorkResult: Sendable {
         case success(AudioOutputDevice)
+        case profileChangeNotApplied(any Error, AudioOutputDevice, ProfileRollback?)
         case failure(any Error, AudioOutputDevice?)
         case cancelled
     }
@@ -416,6 +442,12 @@ final class GlassEQAppModel {
             loadResult = result
             loadedStore = result.store
         }
+        let persistenceMode: ProfilePersistenceMode
+        if case let .unsupportedSchemaVersion(version, maximumSupported) = loadResult?.status {
+            persistenceMode = .unsupportedSchema(version: version, maximumSupported: maximumSupported)
+        } else {
+            persistenceMode = .normal
+        }
         let initialProfile = loadedStore.profile(forOutputUID: nil)
         self.profileStore = loadedStore
         self.activeProfile = initialProfile
@@ -429,6 +461,7 @@ final class GlassEQAppModel {
         self.outputChangeSettlingDelayOverride = outputChangeSettlingDelayOverride
         self.wakeReconnectDelayOverride = wakeReconnectDelayOverride
         self.storeWriter = ProfileStoreWriter(url: storeURL)
+        self.profilePersistenceMode = persistenceMode
         if registerAppDelegate {
             GlassEQAppDelegate.model = self
         }
@@ -482,8 +515,37 @@ final class GlassEQAppModel {
             fallbackProfileID: profileStore.fallbackProfileID,
             statusMessage: statusMessage,
             metrics: SettingsAudioMetricsDTO(engineMetrics),
-            isPreviewing: previewReturnProfile != nil
+            isPreviewing: previewReturnProfile != nil,
+            profileStoreProtection: profileStoreProtectionSnapshot()
         )
+    }
+
+    private func profileStoreProtectionSnapshot() -> SettingsProfileStoreProtectionDTO {
+        switch profilePersistenceMode {
+        case .normal:
+            return .unprotected
+        case let .unsupportedSchema(version, maximumSupported):
+            return SettingsProfileStoreProtectionDTO(
+                isProtected: true,
+                message: localized("Profiles are read-only because this store was written by a newer GlassEQ schema \(version). This build supports schema \(maximumSupported)."),
+                resetButtonTitle: localized("Reset profiles for this version")
+            )
+        }
+    }
+
+    func ensureProfileStoreWritable() throws {
+        guard !profilePersistenceMode.isProtected else {
+            throw SettingsCommandFailure(message: unsupportedProfileStoreEditMessage())
+        }
+    }
+
+    private func unsupportedProfileStoreEditMessage() -> String {
+        switch profilePersistenceMode {
+        case .normal:
+            return ""
+        case .unsupportedSchema:
+            return localized("Profile store was written by a newer GlassEQ; reset profiles or use a newer build.")
+        }
     }
 
     func start() {
@@ -589,9 +651,11 @@ final class GlassEQAppModel {
     }
 
     func apply(profile: EQProfile) throws {
+        try ensureProfileStoreWritable()
+        let rollback = profileRollback()
         var store = profileStore
         upsertProfile(profile, in: &store)
-        try ProfilePersistence.validate(store)
+        try ProfilePersistence.validateForCommit(store)
 
         profileStore = store
         activeProfile = profile
@@ -607,10 +671,10 @@ final class GlassEQAppModel {
             if engine.updateDSP(profile: profile) {
                 statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
             } else {
-                restartEngineWithActiveProfile()
+                restartEngineWithActiveProfile(rollback: rollback)
             }
         } else {
-            restartEngineWithActiveProfile()
+            restartEngineWithActiveProfile(rollback: rollback)
         }
         notifyModelDidChange()
     }
@@ -628,6 +692,8 @@ final class GlassEQAppModel {
     }
 
     func useForCurrentOutput(profile: EQProfile) throws {
+        try ensureProfileStoreWritable()
+        let rollback = profileRollback()
         guard !currentOutputUID.isEmpty else {
             return
         }
@@ -638,7 +704,7 @@ final class GlassEQAppModel {
         store.outputMappings.append(
             OutputDeviceProfileMapping(outputDeviceUID: currentOutputUID, profileID: profile.id)
         )
-        try ProfilePersistence.validate(store)
+        try ProfilePersistence.validateForCommit(store)
 
         profileStore = store
         activeProfile = profile
@@ -654,21 +720,27 @@ final class GlassEQAppModel {
             if engine.updateDSP(profile: profile) {
                 statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
             } else {
-                restartEngineWithActiveProfile()
+                restartEngineWithActiveProfile(rollback: rollback)
             }
         } else {
-            restartEngineWithActiveProfile()
+            restartEngineWithActiveProfile(rollback: rollback)
         }
         notifyModelDidChange()
     }
 
     func setBypass(_ isBypassed: Bool) {
+        do {
+            try ensureProfileStoreWritable()
+        } catch {
+            reportProfileActionFailure(error)
+            return
+        }
         var profile = activeProfile
         profile.isBypassed = isBypassed
         var store = profileStore
         upsertProfile(profile, in: &store)
         do {
-            try ProfilePersistence.validate(store)
+            try ProfilePersistence.validateForCommit(store)
             profileStore = store
             activeProfile = profile
             if draftProfile.id == profile.id {
@@ -737,6 +809,7 @@ final class GlassEQAppModel {
     }
 
     func importProfile(format: ImportFormat, name: String, text: String) async throws -> Bool {
+        try ensureProfileStoreWritable()
         statusMessage = localized("Importing \(format.title)...")
         notifyModelDidChange()
 
@@ -781,10 +854,11 @@ final class GlassEQAppModel {
     }
 
     func setFallback(profile: EQProfile) throws {
+        try ensureProfileStoreWritable()
         var store = profileStore
         upsertProfile(profile, in: &store)
         store.fallbackProfileID = profile.id
-        try ProfilePersistence.validate(store)
+        try ProfilePersistence.validateForCommit(store)
 
         profileStore = store
         selectedProfileID = profile.id
@@ -795,6 +869,13 @@ final class GlassEQAppModel {
     }
 
     func preview(profile: EQProfile) {
+        do {
+            try ensureProfileStoreWritable()
+        } catch {
+            reportProfileActionFailure(error)
+            return
+        }
+        let rollback = profileRollback()
         guard lifecycleState != .terminating,
               lifecycleState != .sleeping,
               lifecycleState != .waking else {
@@ -809,7 +890,7 @@ final class GlassEQAppModel {
         if engine.updateDSP(profile: profile) {
             statusMessage = localized("Previewing settings for \(profile.name)")
         } else {
-            restartEngineWithActiveProfile()
+            restartEngineWithActiveProfile(rollback: rollback)
         }
         notifyModelDidChange()
     }
@@ -823,6 +904,7 @@ final class GlassEQAppModel {
         guard let profile = previewReturnProfile else {
             return
         }
+        let rollback = profileRollback()
         previewReturnProfile = nil
         activeProfile = profile
         selectedProfileID = profile.id
@@ -830,7 +912,7 @@ final class GlassEQAppModel {
         if engine.updateDSP(profile: profile) {
             statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
         } else {
-            restartEngineWithActiveProfile()
+            restartEngineWithActiveProfile(rollback: rollback)
         }
         notifyModelDidChange()
     }
@@ -843,12 +925,13 @@ final class GlassEQAppModel {
 
     @discardableResult
     private func addProfile(_ profile: EQProfile, name: String, status: String? = nil) throws -> EQProfile {
+        try ensureProfileStoreWritable()
         var profile = profile
         profile.id = UUID()
         profile.name = uniqueProfileName(name)
         var store = profileStore
         store.profiles.append(profile)
-        try ProfilePersistence.validate(store)
+        try ProfilePersistence.validateForCommit(store)
 
         profileStore = store
         selectedProfileID = profile.id
@@ -877,6 +960,7 @@ final class GlassEQAppModel {
     }
 
     func duplicateProfile(id: UUID) throws {
+        try ensureProfileStoreWritable()
         guard let source = profileStore.profiles.first(where: { $0.id == id }) else {
             throw SettingsCommandFailure(message: localized("The selected profile no longer exists. Refresh settings and try again."))
         }
@@ -886,6 +970,7 @@ final class GlassEQAppModel {
     }
 
     func deleteProfile(id: UUID) throws {
+        try ensureProfileStoreWritable()
         guard let deletedIndex = profileStore.profiles.firstIndex(where: { $0.id == id }) else {
             throw SettingsCommandFailure(message: localized("The selected profile no longer exists. Refresh settings and try again."))
         }
@@ -915,7 +1000,7 @@ final class GlassEQAppModel {
             nextDraft = draftProfile
         }
 
-        try ProfilePersistence.validate(store)
+        try ProfilePersistence.validateForCommit(store)
         profileStore = store
         selectedProfileID = nextSelectionID
         draftProfile = nextDraft
@@ -950,7 +1035,17 @@ final class GlassEQAppModel {
         notifyModelDidChange()
     }
 
-    private func restartEngineWithActiveProfile() {
+    private func profileRollback() -> ProfileRollback {
+        ProfileRollback(
+            profileStore: profileStore,
+            activeProfile: activeProfile,
+            selectedProfileID: selectedProfileID,
+            draftProfile: draftProfile,
+            previewReturnProfile: previewReturnProfile
+        )
+    }
+
+    private func restartEngineWithActiveProfile(rollback: ProfileRollback? = nil) {
         guard lifecycleState != .terminating,
               lifecycleState != .sleeping,
               lifecycleState != .waking else {
@@ -958,7 +1053,7 @@ final class GlassEQAppModel {
         }
 
         statusMessage = localized("Reconnecting audio output...")
-        scheduleEngineWork(.restart(profile: activeProfile))
+        scheduleEngineWork(.restart(profile: activeProfile, rollback: rollback))
         notifyModelDidChange()
     }
 
@@ -1164,14 +1259,21 @@ final class GlassEQAppModel {
                 } else {
                     output = requestedOutput
                 }
-            case .restart(let profile):
+            case .restart(let profile, let rollback):
                 switch engine.state {
                 case .running(let runningOutput):
                     guard !Task.isCancelled else {
                         return .cancelled
                     }
                     attemptedOutput = runningOutput
-                    try engine.update(profile: profile)
+                    do {
+                        try engine.update(profile: profile)
+                    } catch {
+                        if case .running(let activeOutput) = engine.state {
+                            return .profileChangeNotApplied(error, activeOutput, rollback)
+                        }
+                        throw error
+                    }
                     guard case .running(let activeOutput) = engine.state else {
                         return .failure(
                             EngineWorkFailure(message: localized("Default output unavailable")),
@@ -1237,6 +1339,18 @@ final class GlassEQAppModel {
             wakeReconnectAttempts = 0
             wasRunningBeforeSleep = false
             statusMessage = processingStatus(outputName: output.name, profileName: activeProfile.name)
+        case .profileChangeNotApplied(_, let output, let rollback):
+            refreshCurrentOutputMetadata(from: output)
+            if let rollback {
+                restoreProfileRollback(rollback, persist: true)
+                statusMessage = localized("Profile change was not applied; audio is still running with \(rollback.activeProfile.name).")
+            } else {
+                statusMessage = localized("Profile change was not applied; audio is still running with \(activeProfile.name).")
+            }
+            lifecycleState = .running
+            isRunning = true
+            wakeReconnectAttempts = 0
+            wasRunningBeforeSleep = false
         case .failure(let error, let attemptedOutput):
             if let attemptedOutput {
                 refreshCurrentOutputMetadata(from: attemptedOutput)
@@ -1252,6 +1366,17 @@ final class GlassEQAppModel {
             return
         }
         notifyModelDidChange()
+    }
+
+    private func restoreProfileRollback(_ rollback: ProfileRollback, persist: Bool) {
+        profileStore = rollback.profileStore
+        activeProfile = rollback.activeProfile
+        selectedProfileID = rollback.selectedProfileID
+        draftProfile = rollback.draftProfile
+        previewReturnProfile = rollback.previewReturnProfile
+        if persist {
+            saveStore()
+        }
     }
 
     private func reschedulePendingEngineStartWithActiveProfile() {
@@ -1293,6 +1418,11 @@ final class GlassEQAppModel {
     }
 
     private func saveStore() {
+        guard !profilePersistenceMode.isProtected else {
+            pendingSaveTask?.cancel()
+            pendingSaveTask = nil
+            return
+        }
         let store = profileStore
         let storeWriter = storeWriter
         let saveDebounceDelay = saveDebounceDelay
@@ -1317,6 +1447,9 @@ final class GlassEQAppModel {
         pendingSaveTask?.cancel()
         await pendingSaveTask?.value
         pendingSaveTask = nil
+        guard !profilePersistenceMode.isProtected else {
+            return true
+        }
         do {
             try await storeWriter.saveAndSynchronize(profileStore)
             return true
@@ -1325,6 +1458,25 @@ final class GlassEQAppModel {
             notifyModelDidChange()
             return false
         }
+    }
+
+    func resetUnsupportedProfileStore() async throws {
+        guard profilePersistenceMode.isProtected else {
+            throw SettingsCommandFailure(message: localized("Profile store reset is only available for stores written by a newer GlassEQ."))
+        }
+        pendingSaveTask?.cancel()
+        await pendingSaveTask?.value
+        pendingSaveTask = nil
+
+        let result = try await storeWriter.resetUnsupportedStore()
+        profilePersistenceMode = .normal
+        profileStore = result.store
+        activeProfile = result.store.profile(forOutputUID: currentOutputUID.isEmpty ? nil : currentOutputUID)
+        selectedProfileID = activeProfile.id
+        draftProfile = activeProfile
+        previewReturnProfile = nil
+        statusMessage = localized("Profiles reset for this GlassEQ version; previous store backed up to \(result.backupURL.lastPathComponent).")
+        notifyModelDidChange()
     }
 
     func requestQuit() {

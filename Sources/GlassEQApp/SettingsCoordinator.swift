@@ -442,6 +442,10 @@ final class SettingsCoordinator: NSObject {
             }
             didPatch = true
         }
+        if previous.profileStoreProtection != snapshot.profileStoreProtection {
+            patch.profileStoreProtection = snapshot.profileStoreProtection
+            didPatch = true
+        }
 
         guard didPatch else {
             lastSentSnapshot = snapshot
@@ -875,16 +879,21 @@ extension GlassEQAppModel {
         case .stopMetricsPolling:
             stopMetricsPolling()
             return SettingsCommandResponse()
+
+        case .resetUnsupportedProfileStore:
+            try await resetUnsupportedProfileStore()
+            return SettingsCommandResponse(snapshot: settingsSnapshot())
         }
     }
 
     private func validateIncomingProfile(_ profile: EQProfile) throws {
+        try ensureProfileStoreWritable()
         var store = profileStore
         if let index = store.profiles.firstIndex(where: { $0.id == profile.id }) {
             store.profiles[index] = profile
         } else {
             store.profiles.append(profile)
         }
-        try ProfilePersistence.validate(store)
+        try ProfilePersistence.validateForCommit(store)
     }
 }

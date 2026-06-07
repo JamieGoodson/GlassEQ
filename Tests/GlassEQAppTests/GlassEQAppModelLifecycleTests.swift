@@ -901,6 +901,29 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsApplyProfileRejectsDisabledFilterOverloadWithoutMutation() async throws {
+        let model = makeModel()
+        let initialStore = model.profileStore
+        let initialActiveProfile = model.activeProfile
+        var overloaded = model.activeProfile
+        overloaded.filters = (0...ProfilePersistence.maxFiltersPerChannel).map {
+            EQFilter(kind: .peak, frequency: Double($0 + 1), gainDB: 0, q: 1, isEnabled: false)
+        }
+
+        await #expect(throws: ProfileStoreValidationError.tooManyFilters(
+            profileID: overloaded.id,
+            channel: "linked",
+            count: ProfilePersistence.maxFiltersPerChannel + 1,
+            maximum: ProfilePersistence.maxFiltersPerChannel
+        )) {
+            _ = try await model.performSettingsCommand(.applyProfile(overloaded))
+        }
+
+        #expect(model.profileStore == initialStore)
+        #expect(model.activeProfile == initialActiveProfile)
+    }
+
+    @Test
     func settingsCreateProfileAtLimitThrowsWithoutMutation() async throws {
         let store = makeStore(profileCount: ProfilePersistence.profileCountRange.upperBound)
         let model = makeModel(store: store)
@@ -915,6 +938,35 @@ struct GlassEQAppModelLifecycleTests {
 
         #expect(model.profileStore == store)
         #expect(model.selectedProfileID == initialSelection)
+    }
+
+    @Test
+    func settingsDuplicateUsesExplicitProfileID() async throws {
+        let first = makeProfile(name: "First")
+        let second = makeProfile(name: "Second")
+        let store = ProfileStore(profiles: [first, second], fallbackProfileID: first.id)
+        let model = makeModel(store: store)
+        model.selectProfile(first.id)
+
+        let response = try await model.performSettingsCommand(.duplicateProfile(second.id))
+
+        let snapshot = try #require(response.snapshot)
+        #expect(snapshot.profiles.count == 3)
+        #expect(snapshot.draftProfile.name == "Second Copy")
+        #expect(snapshot.draftProfile.id != second.id)
+        #expect(snapshot.selectedProfileID == snapshot.draftProfile.id)
+    }
+
+    @Test
+    func settingsDuplicateStaleIDThrowsWithoutDuplicatingSelectedProfile() async throws {
+        let model = makeModel()
+        let initialStore = model.profileStore
+
+        await #expect(throws: SettingsCommandFailure.self) {
+            _ = try await model.performSettingsCommand(.duplicateProfile(UUID()))
+        }
+
+        #expect(model.profileStore == initialStore)
     }
 
     @Test
@@ -974,32 +1026,104 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
-    func settingsDuplicateUsesExplicitProfileID() async throws {
-        let first = makeProfile(name: "First")
-        let second = makeProfile(name: "Second")
-        let store = ProfileStore(profiles: [first, second], fallbackProfileID: first.id)
-        let model = makeModel(store: store)
-        model.selectProfile(first.id)
+    func unsupportedSchemaStoreIsProtectedUntilExplicitReset() async throws {
+        let storeURL = temporaryAppStoreURL()
+        defer { removeTemporaryStoreDirectory(for: storeURL) }
+        let futureProfile = makeProfile(name: "Future Profile")
+        let futureStore = ProfileStore(
+            schemaVersion: ProfileStore.currentSchemaVersion + 1,
+            profiles: [futureProfile],
+            fallbackProfileID: futureProfile.id
+        )
+        let futureData = try ProfilePersistence.encoder.encode(futureStore)
+        try FileManager.default.createDirectory(
+            at: storeURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try futureData.write(to: storeURL)
 
-        let response = try await model.performSettingsCommand(.duplicateProfile(second.id))
+        let model = GlassEQAppModel(
+            storeURL: storeURL,
+            engine: FakeAudioEngine(),
+            defaultOutputLookup: FakeDefaultOutputLookup(.success(makeOutput())),
+            observerFactory: FakeDefaultOutputObserverFactory(),
+            autoStart: false,
+            installLifecycleObservers: false,
+            registerAppDelegate: false
+        )
 
+        #expect(model.settingsSnapshot().profileStoreProtection.isProtected)
+        #expect(model.profileStore.profiles == ProfileStore.defaultProfiles)
+        #expect(await model.flushStoreBeforeQuit())
+        #expect(try Data(contentsOf: storeURL) == futureData)
+
+        await #expect(throws: SettingsCommandFailure.self) {
+            _ = try await model.performSettingsCommand(.createProfile(.parametric))
+        }
+        await #expect(throws: SettingsCommandFailure.self) {
+            _ = try await model.performSettingsCommand(.applyProfile(model.activeProfile))
+        }
+        #expect(try Data(contentsOf: storeURL) == futureData)
+
+        let response = try await model.performSettingsCommand(.resetUnsupportedProfileStore)
         let snapshot = try #require(response.snapshot)
-        #expect(snapshot.profiles.count == 3)
-        #expect(snapshot.draftProfile.name == "Second Copy")
-        #expect(snapshot.draftProfile.id != second.id)
-        #expect(snapshot.selectedProfileID == snapshot.draftProfile.id)
+        #expect(!snapshot.profileStoreProtection.isProtected)
+        #expect(try ProfilePersistence.decode(Data(contentsOf: storeURL)).profiles == ProfileStore.defaultProfiles)
+
+        let backups = try FileManager.default.contentsOfDirectory(
+            at: storeURL.deletingLastPathComponent(),
+            includingPropertiesForKeys: nil
+        )
+            .filter { $0.lastPathComponent.hasPrefix("Profiles.invalid-") }
+        #expect(backups.count == 1)
+        if let backup = backups.first {
+            #expect(try Data(contentsOf: backup) == futureData)
+        }
+
+        _ = try await model.performSettingsCommand(.createProfile(.parametric))
+        #expect(model.profileStore.profiles.count == ProfileStore.defaultProfiles.count + 1)
     }
 
     @Test
-    func settingsDuplicateStaleIDThrowsWithoutDuplicatingSelectedProfile() async throws {
-        let model = makeModel()
-        let initialStore = model.profileStore
+    func preservedRunningProfileUpdateFailureRevertsModelToRunningProfile() async throws {
+        let running = makeProfile(name: "Running")
+        let requested = makeProfile(name: "Requested")
+        let output = makeOutput(uid: "preserved-output", name: "Preserved Output")
+        let store = ProfileStore(profiles: [running, requested], fallbackProfileID: running.id)
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let lookup = FakeDefaultOutputLookup(.success(output))
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
 
-        await #expect(throws: SettingsCommandFailure.self) {
-            _ = try await model.performSettingsCommand(.duplicateProfile(UUID()))
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        engine.updateDSPResult = false
+        engine.updateError = TestAudioError.updateFailed
+        engine.updateErrorPreservesRunningState = true
+
+        try model.apply(profile: requested)
+
+        await waitUntil {
+            engine.updateCalls.count == 1 && model.statusMessage.contains("not applied")
         }
 
-        #expect(model.profileStore == initialStore)
+        #expect(model.lifecycleState == .running)
+        #expect(model.isRunning)
+        #expect(model.currentOutputUID == output.uid)
+        #expect(model.activeProfile == running)
+        #expect(model.selectedProfileID == running.id)
+        #expect(model.draftProfile == running)
+        #expect(model.profileStore == store)
+        #expect(engine.state == .running(output: output))
     }
 
     @Test
@@ -1342,6 +1466,16 @@ private func makeOutput(
     )
 }
 
+private func temporaryAppStoreURL() -> URL {
+    FileManager.default.temporaryDirectory
+        .appendingPathComponent("GlassEQAppTests-\(UUID().uuidString)", isDirectory: true)
+        .appendingPathComponent("Profiles.json")
+}
+
+private func removeTemporaryStoreDirectory(for url: URL) {
+    try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+}
+
 private func makeFakeAppBundle(
     at appURL: URL,
     bundleIdentifier: String,
@@ -1388,6 +1522,7 @@ private func waitUntil(_ predicate: @MainActor () -> Bool) async {
 
 private enum TestAudioError: Error {
     case startFailed
+    case updateFailed
     case defaultOutputUnavailable
 }
 
