@@ -146,6 +146,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     private final class PreparedDSPConfigBox: @unchecked Sendable {
         let config: EQRenderConfiguration
+        var retiredStorage: EQProcessorRetiredRenderStorage?
         var nextRetiredPointer: UInt = 0
 
         init(config: EQRenderConfiguration) {
@@ -527,7 +528,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
             let pointer = UnsafeRawPointer(bitPattern: rawPointer)!
             let box = Unmanaged<PreparedDSPConfigBox>.fromOpaque(pointer).takeUnretainedValue()
-            processor.applyPreparedConfiguration(box.config)
+            box.retiredStorage = processor.applyRealtimeCompatiblePreparedConfiguration(box.config)
             pushRetiredDSPConfigBox(rawPointer)
         }
 

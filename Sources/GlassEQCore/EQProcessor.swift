@@ -100,6 +100,28 @@ public struct EQRenderConfiguration: Equatable, Sendable {
     }
 }
 
+public struct EQProcessorRetiredRenderStorage: Sendable {
+    private let configuration: EQConfiguration
+    private let coefficients: [RenderBiquadCoefficients]
+    private let channelStarts: [Int]
+    private let channelFilterCounts: [Int]
+    private let preampLinearGains: [Float]
+
+    fileprivate init(
+        configuration: EQConfiguration,
+        coefficients: [RenderBiquadCoefficients],
+        channelStarts: [Int],
+        channelFilterCounts: [Int],
+        preampLinearGains: [Float]
+    ) {
+        self.configuration = configuration
+        self.coefficients = coefficients
+        self.channelStarts = channelStarts
+        self.channelFilterCounts = channelFilterCounts
+        self.preampLinearGains = preampLinearGains
+    }
+}
+
 public struct EQProcessor: Sendable {
     public private(set) var configuration: EQConfiguration
     private var coefficients: [RenderBiquadCoefficients]
@@ -143,6 +165,43 @@ public struct EQProcessor: Sendable {
         } else {
             resetChangedFilterStates(previousCoefficients: previousCoefficients, nextCoefficients: renderConfiguration.coefficients)
         }
+    }
+
+    public mutating func applyRealtimeCompatiblePreparedConfiguration(
+        _ renderConfiguration: EQRenderConfiguration
+    ) -> EQProcessorRetiredRenderStorage? {
+        guard renderConfiguration.configuration.sampleRate == configuration.sampleRate,
+              renderConfiguration.configuration.channelCount == configuration.channelCount,
+              renderConfiguration.channelFilterCounts == channelFilterCounts,
+              renderConfiguration.coefficients.count == coefficients.count,
+              renderConfiguration.channelStarts.count == channelStarts.count,
+              renderConfiguration.preampLinearGains.count == preampLinearGains.count,
+              states.count == coefficients.count else {
+            return nil
+        }
+
+        let retiredStorage = EQProcessorRetiredRenderStorage(
+            configuration: configuration,
+            coefficients: coefficients,
+            channelStarts: channelStarts,
+            channelFilterCounts: channelFilterCounts,
+            preampLinearGains: preampLinearGains
+        )
+        let previousCoefficients = coefficients
+
+        configuration = renderConfiguration.configuration
+        coefficients = renderConfiguration.coefficients
+        channelStarts = renderConfiguration.channelStarts
+        channelFilterCounts = renderConfiguration.channelFilterCounts
+        preampLinearGains = renderConfiguration.preampLinearGains
+
+        for index in coefficients.indices {
+            if previousCoefficients[index] != coefficients[index] {
+                states[index] = BiquadState()
+            }
+        }
+
+        return retiredStorage
     }
 
     private mutating func resetChangedFilterStates(
