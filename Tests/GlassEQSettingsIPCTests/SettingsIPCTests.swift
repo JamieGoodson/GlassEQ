@@ -1,9 +1,9 @@
 import Foundation
 import GlassEQCore
 import GlassEQSettingsIPC
-import GlassEQSettingsUI
 import Testing
 @testable import GlassEQSettings
+@testable import GlassEQSettingsUI
 
 @Suite
 struct SettingsIPCTests {
@@ -65,6 +65,33 @@ struct SettingsIPCTests {
         #expect(metrics.playbackBufferObservations == 0)
         #expect(metrics.maximumCaptureCallbackFrames == 0)
         #expect(metrics.maximumPlaybackCallbackFrames == 0)
+    }
+
+    @Test
+    func settingsAnalysisUsesCurrentOutputSampleRateWithFallback() {
+        let profile = EQProfile(
+            name: "Analysis",
+            mode: .parametric,
+            filters: [
+                EQFilter(kind: .peak, frequency: 20_000, gainDB: 8, q: 8)
+            ]
+        )
+
+        let routeAnalysis = EQAnalysisSnapshot(profile: profile, sampleRate: 44_100)
+        let fallbackAnalysis = EQAnalysisSnapshot(profile: profile, sampleRate: 0)
+
+        #expect(routeAnalysis.signature.sampleRate == 44_100)
+        #expect(fallbackAnalysis.signature.sampleRate == EQAnalysisSignature.defaultSampleRate)
+        #expect(routeAnalysis.signature != fallbackAnalysis.signature)
+        #expect(routeAnalysis.linkedPoints == FrequencyResponse.points(
+            for: profile.filters,
+            preampDB: profile.preampDB,
+            sampleRate: 44_100
+        ))
+        #expect(routeAnalysis.recommendedPreampDB == EQProfileAnalysis.recommendedPreampDB(
+            profile: profile,
+            sampleRate: 44_100
+        ))
     }
 
     @Test

@@ -75,6 +75,25 @@ struct EQCoreTests {
     }
 
     @Test
+    func recommendedPreampFallbackUsesQuieterStereoPreamp() {
+        let profile = EQProfile(
+            name: "Stereo Cut",
+            mode: .parametric,
+            channelMode: .stereo,
+            preampDB: 0,
+            filters: [],
+            leftPreampDB: -3,
+            leftFilters: [EQFilter(kind: .peak, frequency: 1_000, gainDB: -6, q: 1)],
+            rightPreampDB: -9,
+            rightFilters: [EQFilter(kind: .peak, frequency: 1_000, gainDB: -3, q: 1)]
+        )
+
+        let recommended = EQProfileAnalysis.recommendedPreampDB(profile: profile, sampleRate: 48_000)
+
+        #expect(recommended == -9)
+    }
+
+    @Test
     func bypassLeavesSamplesUntouched() {
         var profile = EQProfile(
             name: "Bypass",

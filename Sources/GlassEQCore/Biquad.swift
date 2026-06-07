@@ -269,6 +269,14 @@ public enum EQProfileAnalysis {
             ]
         }
         let peak = peaks.max() ?? 0
-        return peak > -0.5 ? -peak - 0.5 : profile.preampDB
+        if peak > -0.5 {
+            return -peak - 0.5
+        }
+        switch profile.channelMode {
+        case .linked:
+            return profile.preampDB
+        case .stereo:
+            return min(profile.leftPreampDB, profile.rightPreampDB)
+        }
     }
 }

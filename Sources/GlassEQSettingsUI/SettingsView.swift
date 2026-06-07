@@ -525,7 +525,10 @@ private struct GraphLegendItem: View {
     }
 }
 
-private struct EQAnalysisSignature: Equatable, Sendable {
+struct EQAnalysisSignature: Equatable, Sendable {
+    static let defaultSampleRate = 48_000.0
+
+    var sampleRate: Double
     var mode: EQMode
     var channelMode: EQChannelMode
     var preampDB: Double
@@ -535,7 +538,8 @@ private struct EQAnalysisSignature: Equatable, Sendable {
     var rightPreampDB: Double
     var rightFilters: [EQFilter]
 
-    init(profile: EQProfile) {
+    init(profile: EQProfile, sampleRate: Double) {
+        self.sampleRate = Self.effectiveSampleRate(sampleRate)
         self.mode = profile.mode
         self.channelMode = profile.channelMode
         self.preampDB = profile.preampDB
@@ -545,9 +549,16 @@ private struct EQAnalysisSignature: Equatable, Sendable {
         self.rightPreampDB = profile.rightPreampDB
         self.rightFilters = profile.rightFilters
     }
+
+    static func effectiveSampleRate(_ sampleRate: Double) -> Double {
+        guard sampleRate.isFinite, sampleRate > 0 else {
+            return defaultSampleRate
+        }
+        return sampleRate
+    }
 }
 
-private struct EQAnalysisSnapshot: Equatable, Sendable {
+struct EQAnalysisSnapshot: Equatable, Sendable {
     var signature: EQAnalysisSignature
     var channelMode: EQChannelMode
     var recommendedPreampDB: Double
@@ -555,20 +566,33 @@ private struct EQAnalysisSnapshot: Equatable, Sendable {
     var leftPoints: [FrequencyResponsePoint]
     var rightPoints: [FrequencyResponsePoint]
 
-    init(profile: EQProfile) {
-        self.signature = EQAnalysisSignature(profile: profile)
+    init(profile: EQProfile, sampleRate: Double) {
+        let sampleRate = EQAnalysisSignature.effectiveSampleRate(sampleRate)
+        self.signature = EQAnalysisSignature(profile: profile, sampleRate: sampleRate)
         self.channelMode = profile.channelMode
-        self.recommendedPreampDB = EQProfileAnalysis.recommendedPreampDB(profile: profile)
+        self.recommendedPreampDB = EQProfileAnalysis.recommendedPreampDB(profile: profile, sampleRate: sampleRate)
 
         switch profile.channelMode {
         case .linked:
-            self.linkedPoints = FrequencyResponse.points(for: profile.filters, preampDB: profile.preampDB)
+            self.linkedPoints = FrequencyResponse.points(
+                for: profile.filters,
+                preampDB: profile.preampDB,
+                sampleRate: sampleRate
+            )
             self.leftPoints = []
             self.rightPoints = []
         case .stereo:
             self.linkedPoints = []
-            self.leftPoints = FrequencyResponse.points(for: profile.leftFilters, preampDB: profile.leftPreampDB)
-            self.rightPoints = FrequencyResponse.points(for: profile.rightFilters, preampDB: profile.rightPreampDB)
+            self.leftPoints = FrequencyResponse.points(
+                for: profile.leftFilters,
+                preampDB: profile.leftPreampDB,
+                sampleRate: sampleRate
+            )
+            self.rightPoints = FrequencyResponse.points(
+                for: profile.rightFilters,
+                preampDB: profile.rightPreampDB,
+                sampleRate: sampleRate
+            )
         }
     }
 
@@ -777,7 +801,8 @@ private struct ProfileDetail: View {
                         switch tab {
                         case .editor:
                             EditorTab(
-                                draftProfile: $draftProfile
+                                draftProfile: $draftProfile,
+                                sampleRate: snapshot.currentOutputSampleRate
                             )
                         case .importer:
                             ImportTab(profile: draftProfile, onImport: onImport)
@@ -948,13 +973,20 @@ private extension EQChannelMode {
 
 private struct EditorTab: View {
     @Binding var draftProfile: EQProfile
+    var sampleRate: Double
     @State private var editChannel = EQEditChannel.left
     @State private var analysis: EQAnalysisSnapshot
     @State private var analysisTask: Task<Void, Never>?
 
-    init(draftProfile: Binding<EQProfile>) {
+    init(draftProfile: Binding<EQProfile>, sampleRate: Double) {
         self._draftProfile = draftProfile
-        self._analysis = State(initialValue: EQAnalysisSnapshot(profile: draftProfile.wrappedValue))
+        self.sampleRate = sampleRate
+        self._analysis = State(
+            initialValue: EQAnalysisSnapshot(
+                profile: draftProfile.wrappedValue,
+                sampleRate: sampleRate
+            )
+        )
     }
 
     var body: some View {
@@ -1070,12 +1102,13 @@ private struct EditorTab: View {
     }
 
     private var analysisSignature: EQAnalysisSignature {
-        EQAnalysisSignature(profile: draftProfile)
+        EQAnalysisSignature(profile: draftProfile, sampleRate: sampleRate)
     }
 
     private func refreshAnalysisIfNeeded(debounced: Bool) {
         let profile = draftProfile
-        let signature = EQAnalysisSignature(profile: profile)
+        let sampleRate = sampleRate
+        let signature = EQAnalysisSignature(profile: profile, sampleRate: sampleRate)
         guard analysis.signature != signature else {
             return
         }
@@ -1093,11 +1126,11 @@ private struct EditorTab: View {
             }
 
             let nextAnalysis = await Task.detached(priority: .userInitiated) {
-                EQAnalysisSnapshot(profile: profile)
+                EQAnalysisSnapshot(profile: profile, sampleRate: sampleRate)
             }.value
 
             guard !Task.isCancelled,
-                  EQAnalysisSignature(profile: draftProfile) == nextAnalysis.signature else {
+                  EQAnalysisSignature(profile: draftProfile, sampleRate: sampleRate) == nextAnalysis.signature else {
                 return
             }
             analysis = nextAnalysis
