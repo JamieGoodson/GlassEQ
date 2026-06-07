@@ -73,6 +73,7 @@ cp "$ROOT_DIR/Sources/GlassEQSettings/Info.plist" "$SETTINGS_INFO_PLIST"
 cp "$MIGRATION_PLIST" "$RESOURCES_DIR/container-migration.plist"
 if [[ -f "$ICON_FILE" ]]; then
     cp "$ICON_FILE" "$RESOURCES_DIR/GlassEQ.icns"
+    cp "$ICON_FILE" "$SETTINGS_RESOURCES_DIR/GlassEQ.icns"
 fi
 copy_spm_resources "$BUILD_BIN_DIR" "$APP_NAME" "$APP_TARGET" "$RESOURCES_DIR"
 copy_spm_resources "$BUILD_BIN_DIR" "$SETTINGS_APP_NAME" "$SETTINGS_APP_TARGET" "$SETTINGS_RESOURCES_DIR" 0

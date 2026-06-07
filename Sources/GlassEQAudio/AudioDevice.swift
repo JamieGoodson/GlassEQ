@@ -147,6 +147,34 @@ public enum CoreAudioDeviceQuery {
         )
     }
 
+    static func outputDevice(uid targetUID: String) throws -> AudioOutputDevice? {
+        guard !targetUID.isEmpty else {
+            return nil
+        }
+
+        for deviceID in try audioDeviceIDs() {
+            guard (try? getStringProperty(
+                objectID: deviceID,
+                selector: kAudioDevicePropertyDeviceUID,
+                scope: kAudioObjectPropertyScopeGlobal
+            )) == targetUID else {
+                continue
+            }
+            guard (try? isDeviceAlive(id: deviceID)) == true else {
+                return nil
+            }
+            do {
+                return try outputDevice(id: deviceID)
+            } catch AudioDeviceAvailabilityError.outputDeviceHasNoOutputChannels {
+                return nil
+            } catch AudioDeviceAvailabilityError.unsupportedOutputChannelCount {
+                return nil
+            }
+        }
+
+        return nil
+    }
+
     public static func bufferFrameSizeRangeValue(objectID: AudioObjectID) throws -> AudioBufferFrameSizeRange {
         let range = try bufferFrameSizeRange(objectID: objectID)
         return try validatedBufferFrameSizeRange(range, objectID: objectID)
@@ -190,9 +218,30 @@ public enum CoreAudioDeviceQuery {
         )
         var value = frameSize
         let size = UInt32(MemoryLayout<UInt32>.size)
+        // Mark this as our own change so the default-output observer ignores the resulting
+        // property-change notification instead of rebuilding.
+        CoreAudioSelfChangeGuard.shared.beginSelfChange(deviceID: objectID)
         try checkOSStatus(
             AudioObjectSetPropertyData(objectID, &address, 0, nil, size, &value),
             operation: "AudioObjectSetPropertyData(buffer frame size)"
+        )
+    }
+
+    public static func setNominalSampleRate(_ sampleRate: Double, objectID: AudioObjectID) throws {
+        _ = try validatedSampleRate(sampleRate, objectID: objectID)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value = sampleRate
+        let size = UInt32(MemoryLayout<Float64>.size)
+        // Mark this as our own change so the default-output observer ignores the resulting
+        // property-change notification instead of rebuilding.
+        CoreAudioSelfChangeGuard.shared.beginSelfChange(deviceID: objectID)
+        try checkOSStatus(
+            AudioObjectSetPropertyData(objectID, &address, 0, nil, size, &value),
+            operation: "AudioObjectSetPropertyData(nominal sample rate)"
         )
     }
 
@@ -220,6 +269,52 @@ public enum CoreAudioDeviceQuery {
             objectID: objectID
         )
         return value
+    }
+
+    static func audioDeviceIDs() throws -> [AudioObjectID] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size = UInt32(0)
+        try checkOSStatus(
+            AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size),
+            operation: "AudioObjectGetPropertyDataSize(devices)"
+        )
+        guard size % UInt32(MemoryLayout<AudioObjectID>.size) == 0 else {
+            throw AudioDeviceAvailabilityError.invalidDeviceMetadata(
+                AudioObjectID(kAudioObjectSystemObject),
+                "device list returned \(size) bytes; expected a multiple of \(MemoryLayout<AudioObjectID>.size)"
+            )
+        }
+        guard size <= maxStreamConfigurationBytes else {
+            throw AudioDeviceAvailabilityError.invalidDeviceMetadata(
+                AudioObjectID(kAudioObjectSystemObject),
+                "device list is too large (\(size) bytes)"
+            )
+        }
+
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
+        guard count > 0 else {
+            return []
+        }
+
+        var deviceIDs = Array(repeating: AudioObjectID(kAudioObjectUnknown), count: count)
+        try deviceIDs.withUnsafeMutableBufferPointer { buffer in
+            try checkOSStatus(
+                AudioObjectGetPropertyData(
+                    AudioObjectID(kAudioObjectSystemObject),
+                    &address,
+                    0,
+                    nil,
+                    &size,
+                    buffer.baseAddress!
+                ),
+                operation: "AudioObjectGetPropertyData(devices)"
+            )
+        }
+        return deviceIDs.filter { $0 != kAudioObjectUnknown }
     }
 
     static func getFloat64Property(

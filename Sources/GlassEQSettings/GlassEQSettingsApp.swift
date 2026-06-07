@@ -20,20 +20,27 @@ struct GlassEQSettingsApp: App {
         }
         .defaultSize(width: 1180, height: 720)
         .windowResizability(.contentMinSize)
+        .windowStyle(.hiddenTitleBar)
     }
 }
 
 @MainActor
 final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
-    private weak var model: GlassEQSettingsViewModel?
-    private var client: SettingsPipeClient?
-    private var pendingLaunchInfo: SettingsLaunchInfo?
-    private var connectedToken: String?
+    private let launchCoordinator = SettingsLaunchCoordinator()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApplication.shared.setActivationPolicy(.accessory)
+        // Promote from the LSUIElement/agent launch state to a regular app so the Settings window
+        // appears in the Cmd-Tab task switcher (and the Dock) while it's open. The helper
+        // terminates when the window closes, so both go away with it.
+        NSApplication.shared.setActivationPolicy(.regular)
+        // The helper is launched as a piped subprocess, so set the Dock/Cmd-Tab icon explicitly
+        // from the bundled icns (CFBundleIconFile covers the static bundle icon as well).
+        if let iconURL = Bundle.main.url(forResource: "GlassEQ", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL) {
+            NSApplication.shared.applicationIconImage = icon
+        }
         NSApplication.shared.activate(ignoringOtherApps: true)
-        pendingLaunchInfo = SettingsLaunchInfo(commandLineArguments: CommandLine.arguments)
+        launchCoordinator.finishLaunching(arguments: CommandLine.arguments)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -41,19 +48,103 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        client?.disconnect()
+        launchCoordinator.disconnect()
+    }
+
+    func attach(model: GlassEQSettingsViewModel) {
+        launchCoordinator.attach(model: model)
+    }
+}
+
+@MainActor
+protocol SettingsPipeClientConnection: SettingsCommanding {
+    var token: String { get }
+
+    func connect() async throws -> SettingsSnapshotDTO
+    func disconnect()
+}
+
+@MainActor
+protocol SettingsPipeClientMaking {
+    func makeClient(
+        launchInfo: SettingsLaunchInfo,
+        model: GlassEQSettingsViewModel
+    ) throws -> any SettingsPipeClientConnection
+}
+
+@MainActor
+struct LiveSettingsPipeClientFactory: SettingsPipeClientMaking {
+    func makeClient(
+        launchInfo: SettingsLaunchInfo,
+        model: GlassEQSettingsViewModel
+    ) throws -> any SettingsPipeClientConnection {
+        try SettingsPipeClient(launchInfo: launchInfo, model: model)
+    }
+}
+
+@MainActor
+final class SettingsLaunchCoordinator {
+    private weak var model: GlassEQSettingsViewModel?
+    private var client: (any SettingsPipeClientConnection)?
+    private var pendingLaunchInfo: SettingsLaunchInfo?
+    private var connectedToken: String?
+    private var didFinishLaunching = false
+    private var connectionTask: Task<Void, Never>?
+    private let clientFactory: any SettingsPipeClientMaking
+
+    init(clientFactory: any SettingsPipeClientMaking = LiveSettingsPipeClientFactory()) {
+        self.clientFactory = clientFactory
+    }
+
+    func finishLaunching(arguments: [String]) {
+        didFinishLaunching = true
+        pendingLaunchInfo = SettingsLaunchInfo(commandLineArguments: arguments)
+        connectIfReady()
     }
 
     func attach(model: GlassEQSettingsViewModel) {
         self.model = model
-        if let pendingLaunchInfo {
-            self.pendingLaunchInfo = nil
-            Task { @MainActor in
-                await connect(launchInfo: pendingLaunchInfo, model: model)
-            }
+        connectIfReady()
+    }
+
+    func disconnect() {
+        connectionTask?.cancel()
+        connectionTask = nil
+        client?.disconnect()
+        client = nil
+    }
+
+    func waitForConnectionTask() async {
+        await connectionTask?.value
+    }
+
+    private func connectIfReady() {
+        guard let model else {
             return
         }
-        model.commandErrorMessage = "Settings was not launched by GlassEQ."
+        guard didFinishLaunching else {
+            return
+        }
+        guard let pendingLaunchInfo else {
+            guard !model.isConnected else {
+                return
+            }
+            model.commandErrorMessage = "Settings was not launched by GlassEQ."
+            return
+        }
+        guard pendingLaunchInfo.token != connectedToken else {
+            return
+        }
+
+        self.pendingLaunchInfo = nil
+        connectionTask?.cancel()
+        connectionTask = Task { @MainActor [weak self, weak model] in
+            guard let self,
+                  let model else {
+                return
+            }
+            await self.connect(launchInfo: pendingLaunchInfo, model: model)
+        }
     }
 
     private func connect(launchInfo: SettingsLaunchInfo, model: GlassEQSettingsViewModel) async {
@@ -61,19 +152,26 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
             guard launchInfo.token != connectedToken else {
                 return
             }
-            let client = try SettingsPipeClient(launchInfo: launchInfo, model: model)
+            let client = try clientFactory.makeClient(launchInfo: launchInfo, model: model)
             let snapshot = try await client.connect()
+            guard !Task.isCancelled else {
+                client.disconnect()
+                return
+            }
             self.client = client
             connectedToken = client.token
             model.attach(client: client, snapshot: snapshot)
         } catch {
+            guard !Task.isCancelled else {
+                return
+            }
             model.commandErrorMessage = error.localizedDescription
         }
     }
 }
 
 @MainActor
-final class SettingsPipeClient: NSObject, SettingsCommanding, @unchecked Sendable {
+final class SettingsPipeClient: NSObject, SettingsPipeClientConnection, @unchecked Sendable {
     let token: String
     private let mainProcessIdentifier: pid_t
     private weak var model: GlassEQSettingsViewModel?

@@ -38,10 +38,10 @@ The command prints output device metadata and post-run callback metrics:
 
 The diagnostic follows the current macOS output device and does not switch outputs itself.
 
-By default, diagnostics redact local device names, UIDs, and transport identifiers. Add `--verbose` when collecting full local debug output for yourself:
+Diagnostics print full local device names, UIDs, and transport identifiers:
 
 ```sh
-swift run GlassEQDiagnostics --verbose 2
+swift run GlassEQDiagnostics 2
 ```
 
 `--intentional-crash-after-start` is reserved for crash-reporting and cleanup validation. It starts the engine, prints that the crash-test path was requested, flushes stdout, and aborts deliberately.

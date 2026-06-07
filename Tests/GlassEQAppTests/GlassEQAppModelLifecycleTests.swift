@@ -10,7 +10,7 @@ import Testing
 @Suite
 struct GlassEQAppModelLifecycleTests {
     @Test
-    func retryRunningEngineUpdatesActiveProfileWithoutDefaultLookup() {
+    func retryRunningEngineUpdatesActiveProfileWithoutDefaultLookup() async {
         let runningOutput = makeOutput(uid: "running-output", name: "Running Output")
         let defaultOutput = makeOutput(uid: "default-output", name: "Default Output")
         let engine = FakeAudioEngine()
@@ -19,6 +19,9 @@ struct GlassEQAppModelLifecycleTests {
         let model = makeModel(engine: engine, lookup: lookup)
 
         model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running && engine.updateCalls.count == 1
+        }
 
         #expect(engine.updateCalls.map(\.id) == [model.activeProfile.id])
         #expect(engine.startCalls.isEmpty)
@@ -30,13 +33,16 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
-    func retryStoppedEngineQueriesDefaultOutputAndStarts() {
+    func retryStoppedEngineQueriesDefaultOutputAndStarts() async {
         let output = makeOutput(uid: "default-output", name: "Default Output")
         let engine = FakeAudioEngine()
         let lookup = FakeDefaultOutputLookup(.success(output))
         let model = makeModel(engine: engine, lookup: lookup)
 
         model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
 
         #expect(lookup.defaultOutputCalls == 1)
         #expect(engine.updateCalls.isEmpty)
@@ -48,7 +54,7 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
-    func retryFailedEngineKeepsOutputMetadataWhenStartFails() {
+    func retryFailedEngineKeepsOutputMetadataWhenStartFails() async {
         let output = makeOutput(uid: "metadata-output", name: "Metadata Output")
         let engine = FakeAudioEngine()
         engine.state = .failed("Previous failure")
@@ -57,6 +63,12 @@ struct GlassEQAppModelLifecycleTests {
         let model = makeModel(engine: engine, lookup: lookup)
 
         model.retryAudioEngine()
+        await waitUntil {
+            lookup.defaultOutputCalls == 1
+                && engine.startCalls.count == 1
+                && model.lifecycleState == .stopped
+                && model.currentOutputUID == output.uid
+        }
 
         #expect(lookup.defaultOutputCalls == 1)
         #expect(engine.startCalls.map(\.output) == [output])
@@ -153,6 +165,166 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func runningOutputUIDChangeMutesImmediatelyThenRebuildsSettledOutput() async {
+        let speakers = makeOutput(uid: "speaker-output", name: "Mac Speakers", id: 200)
+        let scarlett = makeOutput(uid: "scarlett-output", name: "Scarlett Solo", id: 300)
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(speakers))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .milliseconds(200)
+        )
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(speakers))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        lookup.result = .success(scarlett)
+        observer.emit(.success(scarlett))
+
+        await waitUntil {
+            engine.muteOutputCallCount == 1
+        }
+        #expect(engine.muteOutputCallCount == 1)
+        #expect(model.statusMessage == localized("Audio output changed; rebuilding..."))
+        #expect(engine.startCalls.map(\.output) == [speakers])
+
+        await waitUntil {
+            engine.startCalls.map(\.output) == [speakers, scarlett]
+        }
+
+        #expect(model.currentOutputUID == scarlett.uid)
+        #expect(model.lifecycleState == .running)
+    }
+
+    @Test
+    func runningOutputFormatChangeMutesImmediatelyThenRebuildsSettledOutput() async {
+        let initialOutput = makeOutput(
+            uid: "same-output",
+            name: "USB DAC",
+            id: 200,
+            nominalSampleRate: 48_000,
+            bufferFrameSize: 256
+        )
+        let changedOutput = makeOutput(
+            uid: "same-output",
+            name: "USB DAC",
+            id: 200,
+            nominalSampleRate: 44_100,
+            bufferFrameSize: 512
+        )
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(initialOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .milliseconds(200)
+        )
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(initialOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        lookup.result = .success(changedOutput)
+        observer.emit(.success(changedOutput))
+
+        await waitUntil {
+            engine.muteOutputCallCount == 1
+        }
+        #expect(engine.muteOutputCallCount == 1)
+        #expect(model.statusMessage == localized("Audio output format changed; rebuilding..."))
+        #expect(engine.startCalls.map(\.output) == [initialOutput])
+
+        await waitUntil {
+            engine.startCalls.map(\.output) == [initialOutput, changedOutput]
+        }
+
+        #expect(model.currentOutputSampleRate == changedOutput.nominalSampleRate)
+        #expect(model.currentOutputBufferFrameSize == changedOutput.bufferFrameSize)
+    }
+
+    @Test
+    func staleAsyncStartCompletionDoesNotReplaceNewerRouteSwitch() async {
+        let firstOutput = makeOutput(uid: "first-output", name: "First Output", id: 200)
+        let secondOutput = makeOutput(uid: "second-output", name: "Second Output", id: 300)
+        let engine = FakeAudioEngine()
+        engine.startDelaySecondsByUID[firstOutput.uid] = 0.08
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            engine.startCalls.count == 1
+        }
+
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil {
+            model.lifecycleState == .running
+                && model.currentOutputUID == secondOutput.uid
+                && engine.startCalls.contains { $0.output == secondOutput }
+        }
+
+        #expect(model.currentOutputUID == secondOutput.uid)
+        #expect(model.currentOutputName == secondOutput.name)
+        #expect(model.statusMessage == localized("Processing \(secondOutput.name) with \(model.activeProfile.name)"))
+        #expect(engine.stopCallCount == 0)
+
+        try? await Task.sleep(for: .milliseconds(120))
+        #expect(engine.state == .running(output: secondOutput))
+    }
+
+    @Test
+    func userStopDuringSlowStartCleansUpAfterCancelledStartFinishes() async {
+        let output = makeOutput(uid: "slow-start-output", name: "Slow Start Output", id: 200)
+        let engine = FakeAudioEngine()
+        engine.startDelaySeconds = 0.08
+        let lookup = FakeDefaultOutputLookup(.success(output))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            engine.startCalls.count == 1
+        }
+
+        model.stop()
+
+        await waitUntil {
+            engine.stopCallCount == 2
+        }
+
+        #expect(engine.stopCallCount == 2)
+        #expect(!model.isRunning)
+        #expect(model.lifecycleState == .stopped)
+    }
+
+    @Test
     func staleObserverCallbackAfterStopAndRestartIsIgnored() async {
         let staleOutput = makeOutput(uid: "stale-output", name: "Stale Output")
         let liveOutput = makeOutput(uid: "live-output", name: "Live Output")
@@ -232,6 +404,9 @@ struct GlassEQAppModelLifecycleTests {
         )
 
         model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
         model.preview(profile: preview)
         model.start()
         let preSleepObserver = observers.observers[0]
@@ -274,6 +449,9 @@ struct GlassEQAppModelLifecycleTests {
         )
 
         model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
         model.start()
         model.handleWillSleep()
         model.handleDidWake()
@@ -336,7 +514,7 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
-    func sessionActivationRestartsPendingSleepReconnect() async {
+    func sessionActivationDuringPendingSleepReconnectDoesNotResetRetryBudget() async {
         let output = makeOutput(uid: "late-session-wake-output", name: "Late Session Wake Output")
         let engine = FakeAudioEngine()
         let lookup = FakeDefaultOutputLookup(.success(output))
@@ -362,10 +540,8 @@ struct GlassEQAppModelLifecycleTests {
         }
 
         model.handleSessionDidBecomeActive()
-        await waitUntil {
-            observers.observers[1].startCalls == [true, true]
-        }
-        #expect(observers.observers[1].startCalls == [true, true])
+        await settleAsyncWork()
+        #expect(observers.observers[1].startCalls == [true])
 
         observers.observers[1].emit(.success(output))
         await waitUntil {
@@ -483,7 +659,7 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
-    func sessionActivationRebuildsRunningOutputThroughExistingObserver() async {
+    func sessionActivationDoesNotRebuildRunningOutputWithoutSleepIntent() async {
         let output = makeOutput(uid: "unlock-output", name: "Unlock Output")
         let engine = FakeAudioEngine()
         let lookup = FakeDefaultOutputLookup(.success(output))
@@ -502,38 +678,36 @@ struct GlassEQAppModelLifecycleTests {
         await waitUntil {
             model.lifecycleState == .running && engine.startCalls.count == 1
         }
+        let lookupCallsBeforeActivation = lookup.defaultOutputCalls
 
         model.handleSessionDidBecomeActive()
+        await settleAsyncWork()
 
-        #expect(engine.muteOutputCallCount == 1)
-        #expect(model.lifecycleState == .waking)
-        await waitUntil {
-            observer.startCalls == [true, true]
-        }
-
-        observer.emit(.success(output))
-        await waitUntil {
-            model.lifecycleState == .running && engine.startCalls.count == 2
-        }
-
+        #expect(engine.muteOutputCallCount == 0)
+        #expect(model.lifecycleState == .running)
+        #expect(observer.startCalls == [true])
         #expect(observers.observers.count == 1)
-        #expect(engine.startCalls.map(\.output) == [output, output])
+        #expect(engine.startCalls.map(\.output) == [output])
+        #expect(lookup.defaultOutputCalls == lookupCallsBeforeActivation)
         #expect(model.isRunning)
     }
 
     @Test
-    func screenLockStopsBluetoothRouteAndUnlockRebuildsFreshDefaultOutput() async {
-        let airPods = makeOutput(
-            uid: "airpods-output",
-            name: "AirPods",
-            id: 100,
-            transportType: kAudioDeviceTransportTypeBluetooth
+    func wakingProfileActionsUpdateStateWithoutDirectEngineMutation() async throws {
+        let output = makeOutput(uid: "waking-profile-output", name: "Waking Profile Output")
+        let fallback = makeProfile(name: "Fallback")
+        let applied = makeProfile(name: "Applied During Wake")
+        let mapped = makeProfile(name: "Mapped During Wake")
+        let preview = makeProfile(name: "Preview During Wake")
+        let store = ProfileStore(
+            profiles: [fallback, applied, mapped, preview],
+            fallbackProfileID: fallback.id
         )
-        let speakers = makeOutput(uid: "speaker-output", name: "Mac Speakers", id: 200)
         let engine = FakeAudioEngine()
-        let lookup = FakeDefaultOutputLookup(.success(airPods))
+        let lookup = FakeDefaultOutputLookup(.success(output))
         let observers = FakeDefaultOutputObserverFactory()
         let model = makeModel(
+            store: store,
             engine: engine,
             lookup: lookup,
             observers: observers,
@@ -542,40 +716,52 @@ struct GlassEQAppModelLifecycleTests {
         )
 
         model.start()
-        let lockedObserver = observers.observers[0]
-        lockedObserver.emit(.success(airPods))
+        observers.observers[0].emit(.success(output))
         await waitUntil {
             model.lifecycleState == .running && engine.startCalls.count == 1
         }
-        lookup.result = .success(speakers)
 
-        model.handleScreenDidLock()
-
-        #expect(lockedObserver.stopCallCount == 1)
-        #expect(engine.stopCallCount == 1)
-        #expect(!model.isRunning)
-        #expect(model.lifecycleState == .stopped)
-
-        model.handleScreenDidUnlock()
+        engine.startDelaySeconds = 0.08
+        model.handleWillSleep()
+        model.handleDidWake()
         await waitUntil {
             observers.observers.count == 2 && observers.observers[1].startCalls == [true]
         }
-
-        observers.observers[1].emit(.success(speakers))
+        observers.observers[1].emit(.success(output))
         await waitUntil {
-            model.lifecycleState == .running && engine.startCalls.count == 2
+            model.lifecycleState == .waking && engine.startCalls.count == 2
         }
 
-        #expect(engine.startCalls.map(\.output) == [airPods, speakers])
-        #expect(model.currentOutputUID == speakers.uid)
+        try model.apply(profile: applied)
+        try model.useForCurrentOutput(profile: mapped)
+        model.setBypass(true)
+        model.preview(profile: preview)
+        model.stopPreview()
+
+        #expect(model.lifecycleState == .waking)
+        #expect(model.activeProfile.id == mapped.id)
+        #expect(model.activeProfile.isBypassed)
+        #expect(model.previewReturnProfile == nil)
+        #expect(engine.updateCalls.isEmpty)
+        #expect(engine.updateDSPCalls.isEmpty)
+        #expect(engine.setBypassedCalls.isEmpty)
+        #expect(model.profileStore.profile(forOutputUID: output.uid).id == mapped.id)
+
+        await waitUntil {
+            model.lifecycleState == .running
+                && engine.startCalls.last?.profile.id == mapped.id
+                && engine.startCalls.last?.profile.isBypassed == true
+        }
+
         #expect(model.isRunning)
+        #expect(model.statusMessage == localized("Processing \(output.name) with \(mapped.name)"))
     }
 
     @Test
-    func screenLockLeavesNonBluetoothRouteRunning() async {
-        let speakers = makeOutput(uid: "speaker-output", name: "Mac Speakers")
+    func userStoppedEngineBeforeSleepDoesNotReconnectOnWake() async {
+        let output = makeOutput(uid: "stopped-before-sleep-output", name: "Stopped Before Sleep Output")
         let engine = FakeAudioEngine()
-        let lookup = FakeDefaultOutputLookup(.success(speakers))
+        let lookup = FakeDefaultOutputLookup(.success(output))
         let observers = FakeDefaultOutputObserverFactory()
         let model = makeModel(
             engine: engine,
@@ -586,17 +772,23 @@ struct GlassEQAppModelLifecycleTests {
         )
 
         model.start()
-        observers.observers[0].emit(.success(speakers))
+        let observer = observers.observers[0]
+        observer.emit(.success(output))
         await waitUntil {
             model.lifecycleState == .running && engine.startCalls.count == 1
         }
 
-        model.handleScreenDidLock()
+        model.stop()
+        model.handleWillSleep()
+        model.handleDidWake()
+        await settleAsyncWork()
 
-        #expect(engine.stopCallCount == 0)
-        #expect(observers.observers[0].stopCallCount == 0)
-        #expect(model.lifecycleState == .running)
-        #expect(model.isRunning)
+        #expect(engine.startCalls.map(\.output) == [output])
+        #expect(observers.observers.count == 1)
+        #expect(observer.stopCallCount == 1)
+        #expect(!model.isRunning)
+        #expect(model.lifecycleState == .stopped)
+        #expect(model.statusMessage == localized("Stopped"))
     }
 
     @Test
@@ -916,15 +1108,17 @@ private func makeOutput(
     uid: String = "output",
     name: String = "Output",
     id: AudioObjectID = 100,
+    nominalSampleRate: Double = 48_000,
+    bufferFrameSize: UInt32 = 256,
     transportType: UInt32? = nil
 ) -> AudioOutputDevice {
     AudioOutputDevice(
         id: id,
         uid: uid,
         name: name,
-        nominalSampleRate: 48_000,
+        nominalSampleRate: nominalSampleRate,
         outputChannelCount: 2,
-        bufferFrameSize: 256,
+        bufferFrameSize: bufferFrameSize,
         transportType: transportType
     )
 }
@@ -999,7 +1193,7 @@ private struct FakeCodeSigningValidator: SettingsCodeSigningValidating {
     }
 }
 
-private final class FakeDefaultOutputLookup: DefaultOutputLookingUp {
+private final class FakeDefaultOutputLookup: DefaultOutputLookingUp, @unchecked Sendable {
     private(set) var defaultOutputCalls = 0
     var result: Result<AudioOutputDevice, Error>
 
@@ -1045,7 +1239,7 @@ private final class FakeDefaultOutputObserver: DefaultOutputObserving {
     }
 }
 
-private final class FakeAudioEngine: AudioEngineControlling {
+private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable {
     struct StartCall: Equatable {
         var output: AudioOutputDevice
         var profile: EQProfile
@@ -1055,6 +1249,8 @@ private final class FakeAudioEngine: AudioEngineControlling {
     var startError: Error?
     var updateError: Error?
     var updateDSPResult = true
+    var startDelaySeconds: TimeInterval = 0
+    var startDelaySecondsByUID: [String: TimeInterval] = [:]
     private(set) var startCalls: [StartCall] = []
     private(set) var updateCalls: [EQProfile] = []
     private(set) var updateDSPCalls: [EQProfile] = []
@@ -1065,6 +1261,10 @@ private final class FakeAudioEngine: AudioEngineControlling {
 
     func start(output: AudioOutputDevice, profile: EQProfile) throws {
         startCalls.append(StartCall(output: output, profile: profile))
+        let delay = startDelaySecondsByUID[output.uid] ?? startDelaySeconds
+        if delay > 0 {
+            Thread.sleep(forTimeInterval: delay)
+        }
         if let startError {
             state = .failed("Start failed")
             throw startError

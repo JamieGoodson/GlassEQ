@@ -59,34 +59,150 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
-    func bufferFrameRestorationPolicyRestoresOnlyWhenOutputChanges() {
-        let current = output(id: 42, uid: "same", channelCount: 2)
+    func outputDeviceUIDLookupResolvesDefaultOutput() throws {
+        let defaultOutput = try CoreAudioDeviceQuery.defaultOutputDevice()
+        let resolvedOutput = try #require(try CoreAudioDeviceQuery.outputDevice(uid: defaultOutput.uid))
 
-        #expect(!SystemTapAudioEngine.shouldRestoreBufferFrameSizeBeforeRestart(
-            currentOutput: nil,
-            nextOutput: current
-        ))
-        #expect(!SystemTapAudioEngine.shouldRestoreBufferFrameSizeBeforeRestart(
-            currentOutput: current,
-            nextOutput: output(id: 42, uid: "same", channelCount: 2)
-        ))
-        #expect(SystemTapAudioEngine.shouldRestoreBufferFrameSizeBeforeRestart(
-            currentOutput: current,
-            nextOutput: output(id: 43, uid: "other", channelCount: 2)
-        ))
+        #expect(resolvedOutput.uid == defaultOutput.uid)
+        #expect(resolvedOutput.outputChannelCount > 0)
+        #expect(try CoreAudioDeviceQuery.outputDevice(uid: "") == nil)
     }
 
     @Test
-    func runtimeBufferFrameSizeCapsOversizedDeviceBuffers() {
-        #expect(SystemTapAudioEngine.runtimeBufferFrameSize(for: output(channelCount: 2, bufferFrameSize: 256)) == 256)
-        #expect(SystemTapAudioEngine.runtimeBufferFrameSize(for: output(channelCount: 2, bufferFrameSize: 16_384)) == 1_024)
+    func sampleRateRestorationUsesFreshUIDDeviceAndVerifiesWrite() {
+        var currentSampleRate = 44_100.0
+        var setCalls: [(sampleRate: Double, objectID: AudioObjectID)] = []
+        let restoration = SystemTapAudioEngine.SampleRateRestoration(
+            uid: "restored-output",
+            originalSampleRate: 48_000
+        )
+
+        let restored = SystemTapAudioEngine.restoreSampleRateRestoration(
+            restoration,
+            outputForUID: { uid in
+                #expect(uid == restoration.uid)
+                return output(
+                    id: 9_001,
+                    uid: uid,
+                    channelCount: 2,
+                    sampleRate: currentSampleRate
+                )
+            },
+            setSampleRate: { sampleRate, objectID in
+                setCalls.append((sampleRate, objectID))
+                currentSampleRate = sampleRate
+            }
+        )
+
+        #expect(restored)
+        #expect(setCalls.count == 1)
+        #expect(setCalls.first?.sampleRate == 48_000)
+        #expect(setCalls.first?.objectID == 9_001)
     }
 
     @Test
-    func preferredBufferFrameSizeDoesNotShrinkStandardSpeakerRoutes() {
+    func sampleRateRestorationIsRetainedWhenDeviceIsAbsentOrWriteCannotBeVerified() {
+        var setCallCount = 0
+        let restoration = SystemTapAudioEngine.SampleRateRestoration(
+            uid: "missing-output",
+            originalSampleRate: 48_000
+        )
+
+        let absentRestored = SystemTapAudioEngine.restoreSampleRateRestoration(
+            restoration,
+            outputForUID: { _ in nil },
+            setSampleRate: { _, _ in setCallCount += 1 }
+        )
+
+        #expect(!absentRestored)
+        #expect(setCallCount == 0)
+
+        let unverifiedRestored = SystemTapAudioEngine.restoreSampleRateRestoration(
+            restoration,
+            outputForUID: { uid in
+                output(id: 9_002, uid: uid, channelCount: 2, sampleRate: 44_100)
+            },
+            setSampleRate: { _, _ in setCallCount += 1 }
+        )
+
+        #expect(!unverifiedRestored)
+        #expect(setCallCount == 1)
+    }
+
+    @Test
+    func bufferFrameSizeRestorationUsesFreshUIDDeviceAndVerifiesWrite() {
+        var currentFrameSize: UInt32 = 512
+        var setCalls: [(frameSize: UInt32, objectID: AudioObjectID)] = []
+        let restoration = SystemTapAudioEngine.BufferFrameSizeRestoration(
+            uid: "buffer-output",
+            originalFrameSize: 256
+        )
+
+        let restored = SystemTapAudioEngine.restoreBufferFrameSizeRestoration(
+            restoration,
+            outputForUID: { uid in
+                #expect(uid == restoration.uid)
+                return output(
+                    id: 9_003,
+                    uid: uid,
+                    channelCount: 2,
+                    bufferFrameSize: currentFrameSize
+                )
+            },
+            setBufferFrameSize: { frameSize, objectID in
+                setCalls.append((frameSize, objectID))
+                currentFrameSize = frameSize
+            }
+        )
+
+        #expect(restored)
+        #expect(setCalls.count == 1)
+        #expect(setCalls.first?.frameSize == 256)
+        #expect(setCalls.first?.objectID == 9_003)
+    }
+
+    @Test
+    func bufferFrameSizeRestorationSkipsAlreadyRestoredDevice() {
+        var didSet = false
+        let restoration = SystemTapAudioEngine.BufferFrameSizeRestoration(
+            uid: "already-restored-buffer-output",
+            originalFrameSize: 256
+        )
+
+        let restored = SystemTapAudioEngine.restoreBufferFrameSizeRestoration(
+            restoration,
+            outputForUID: { uid in
+                output(id: 9_004, uid: uid, channelCount: 2, bufferFrameSize: 256)
+            },
+            setBufferFrameSize: { _, _ in didSet = true }
+        )
+
+        #expect(restored)
+        #expect(!didSet)
+    }
+
+    @Test
+    func monoRuntimeOutputDownmixesStereoInsteadOfUsingLeftOnly() {
+        let samples: [Float] = [
+            1, 3,
+            -2, 4,
+            10, -4
+        ]
+
+        samples.withUnsafeBufferPointer { pointer in
+            #expect(SystemTapAudioEngine.monoDownmix(pointer, frame: 0, sourceChannelCount: 2) == 2)
+            #expect(SystemTapAudioEngine.monoDownmix(pointer, frame: 1, sourceChannelCount: 2) == 1)
+            #expect(SystemTapAudioEngine.monoDownmix(pointer, frame: 2, sourceChannelCount: 2) == 3)
+            #expect(SystemTapAudioEngine.monoDownmix(pointer, frame: -1, sourceChannelCount: 2) == 0)
+            #expect(SystemTapAudioEngine.monoDownmix(pointer, frame: 99, sourceChannelCount: 2) == 0)
+        }
+    }
+
+    @Test
+    func preferredBufferFrameSizeShrinksStandardSpeakerRoutesForLowLatency() {
         #expect(SystemTapAudioEngine.preferredBufferFrameSize(for: output(channelCount: 2, bufferFrameSize: 128)) == 256)
-        #expect(SystemTapAudioEngine.preferredBufferFrameSize(for: output(channelCount: 2, bufferFrameSize: 512)) == 512)
-        #expect(SystemTapAudioEngine.preferredBufferFrameSize(for: output(channelCount: 2, bufferFrameSize: 2_048)) == 1_024)
+        #expect(SystemTapAudioEngine.preferredBufferFrameSize(for: output(channelCount: 2, bufferFrameSize: 512)) == 256)
+        #expect(SystemTapAudioEngine.preferredBufferFrameSize(for: output(channelCount: 2, bufferFrameSize: 2_048)) == 256)
     }
 
     @Test
@@ -100,15 +216,75 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
-    func standardRoutesPrimeMultipleCallbacksBeforePlayback() {
-        #expect(SystemTapAudioEngine.minimumPrimeFrames(
-            for: output(channelCount: 2, bufferFrameSize: 256),
-            runtimeBufferFrameSize: 256
-        ) == 1_024)
-        #expect(SystemTapAudioEngine.minimumPrimeFrames(
-            for: output(channelCount: 2, bufferFrameSize: 512),
-            runtimeBufferFrameSize: 512
-        ) == 1_024)
+    func topologyRebuildAcquiresMuteGuardBeforeRebuildAndReleasesAfter() throws {
+        var events: [String] = []
+        let result = try SystemTapAudioEngine.performTopologyRebuild(
+            acquireMuteGuard: {
+                events.append("acquire")
+                return FakeTopologyRebuildMuteGuard(events: { events.append($0) })
+            },
+            rebuild: {
+                events.append("rebuild")
+                return 7
+            }
+        )
+
+        #expect(result == 7)
+        #expect(events == ["acquire", "rebuild", "release"])
+    }
+
+    @Test
+    func topologyRebuildSkipsTeardownWhenMuteGuardCannotBeAcquired() {
+        var rebuildWasCalled = false
+
+        #expect(throws: TopologyRebuildMuteGuardUnavailable.self) {
+            _ = try SystemTapAudioEngine.performTopologyRebuild(
+                acquireMuteGuard: {
+                    throw CoreAudioError(operation: "test mute guard", status: kAudioHardwareUnspecifiedError)
+                },
+                rebuild: {
+                    rebuildWasCalled = true
+                }
+            )
+        }
+        #expect(!rebuildWasCalled)
+    }
+
+    @Test
+    func selfChangeGuardSuppressesOnlyMatchingDevice() {
+        let changeGuard = CoreAudioSelfChangeGuard(windowMilliseconds: 1_000)
+
+        changeGuard.beginSelfChange(deviceID: 42)
+
+        #expect(changeGuard.isSelfChange(deviceID: 42))
+        #expect(!changeGuard.isSelfChange(deviceID: 43))
+    }
+
+    @Test
+    func selfChangeGuardExpires() async throws {
+        let changeGuard = CoreAudioSelfChangeGuard(windowMilliseconds: 1)
+
+        changeGuard.beginSelfChange(deviceID: 42)
+        try await Task.sleep(nanoseconds: 5_000_000)
+
+        #expect(!changeGuard.isSelfChange(deviceID: 42))
+    }
+
+    @Test
+    func outputObserverNeverSuppressesDeviceAliveNotifications() {
+        let changeGuard = CoreAudioSelfChangeGuard(windowMilliseconds: 1_000)
+        changeGuard.beginSelfChange(deviceID: 42)
+
+        #expect(DefaultOutputDeviceObserver.shouldSuppressSelfInducedOutputChange(
+            selector: kAudioDevicePropertyBufferFrameSize,
+            deviceID: 42,
+            selfChangeGuard: changeGuard
+        ))
+        #expect(!DefaultOutputDeviceObserver.shouldSuppressSelfInducedOutputChange(
+            selector: kAudioDevicePropertyDeviceIsAlive,
+            deviceID: 42,
+            selfChangeGuard: changeGuard
+        ))
     }
 
     @Test
@@ -260,5 +436,17 @@ struct CoreAudioDeviceTests {
             bufferFrameSize: bufferFrameSize,
             transportType: transportType
         )
+    }
+}
+
+private final class FakeTopologyRebuildMuteGuard: TopologyRebuildMuteGuarding {
+    private let record: (String) -> Void
+
+    init(events record: @escaping (String) -> Void) {
+        self.record = record
+    }
+
+    func release() {
+        record("release")
     }
 }

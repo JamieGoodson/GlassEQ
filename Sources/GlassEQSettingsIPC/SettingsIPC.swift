@@ -21,9 +21,27 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
     public var saturatedSamples: UInt64
     public var currentBufferedFrames: Int
     public var maxBufferedFrames: Int
+    public var maximumPlaybackBufferedFrames: Int
     public var minimumPlaybackBufferedFrames: Int
     public var averagePlaybackBufferedFrames: Double
     public var playbackBufferObservations: UInt64
+    public var maximumCaptureCallbackFrames: Int
+    public var maximumPlaybackCallbackFrames: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case capturedFrames
+        case playedFrames
+        case playbackUnderrunFrames
+        case saturatedSamples
+        case currentBufferedFrames
+        case maxBufferedFrames
+        case maximumPlaybackBufferedFrames
+        case minimumPlaybackBufferedFrames
+        case averagePlaybackBufferedFrames
+        case playbackBufferObservations
+        case maximumCaptureCallbackFrames
+        case maximumPlaybackCallbackFrames
+    }
 
     public init(
         capturedFrames: UInt64 = 0,
@@ -32,9 +50,12 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
         saturatedSamples: UInt64 = 0,
         currentBufferedFrames: Int = 0,
         maxBufferedFrames: Int = 0,
+        maximumPlaybackBufferedFrames: Int = 0,
         minimumPlaybackBufferedFrames: Int = 0,
         averagePlaybackBufferedFrames: Double = 0,
-        playbackBufferObservations: UInt64 = 0
+        playbackBufferObservations: UInt64 = 0,
+        maximumCaptureCallbackFrames: Int = 0,
+        maximumPlaybackCallbackFrames: Int = 0
     ) {
         self.capturedFrames = capturedFrames
         self.playedFrames = playedFrames
@@ -42,9 +63,30 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
         self.saturatedSamples = saturatedSamples
         self.currentBufferedFrames = currentBufferedFrames
         self.maxBufferedFrames = maxBufferedFrames
+        self.maximumPlaybackBufferedFrames = maximumPlaybackBufferedFrames
         self.minimumPlaybackBufferedFrames = minimumPlaybackBufferedFrames
         self.averagePlaybackBufferedFrames = averagePlaybackBufferedFrames
         self.playbackBufferObservations = playbackBufferObservations
+        self.maximumCaptureCallbackFrames = maximumCaptureCallbackFrames
+        self.maximumPlaybackCallbackFrames = maximumPlaybackCallbackFrames
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            capturedFrames: try container.decodeIfPresent(UInt64.self, forKey: .capturedFrames) ?? 0,
+            playedFrames: try container.decodeIfPresent(UInt64.self, forKey: .playedFrames) ?? 0,
+            playbackUnderrunFrames: try container.decodeIfPresent(UInt64.self, forKey: .playbackUnderrunFrames) ?? 0,
+            saturatedSamples: try container.decodeIfPresent(UInt64.self, forKey: .saturatedSamples) ?? 0,
+            currentBufferedFrames: try container.decodeIfPresent(Int.self, forKey: .currentBufferedFrames) ?? 0,
+            maxBufferedFrames: try container.decodeIfPresent(Int.self, forKey: .maxBufferedFrames) ?? 0,
+            maximumPlaybackBufferedFrames: try container.decodeIfPresent(Int.self, forKey: .maximumPlaybackBufferedFrames) ?? 0,
+            minimumPlaybackBufferedFrames: try container.decodeIfPresent(Int.self, forKey: .minimumPlaybackBufferedFrames) ?? 0,
+            averagePlaybackBufferedFrames: try container.decodeIfPresent(Double.self, forKey: .averagePlaybackBufferedFrames) ?? 0,
+            playbackBufferObservations: try container.decodeIfPresent(UInt64.self, forKey: .playbackBufferObservations) ?? 0,
+            maximumCaptureCallbackFrames: try container.decodeIfPresent(Int.self, forKey: .maximumCaptureCallbackFrames) ?? 0,
+            maximumPlaybackCallbackFrames: try container.decodeIfPresent(Int.self, forKey: .maximumPlaybackCallbackFrames) ?? 0
+        )
     }
 }
 
@@ -270,7 +312,7 @@ public enum SettingsPipeCodec {
         _ message: SettingsPipeMessage,
         maximumLineBytes: Int = Self.maximumLineBytes
     ) throws -> Data {
-        var data = try SettingsXPCCodec.encoder.encode(message)
+        var data = try SettingsPipeJSONCodec.encoder.encode(message)
         guard data.count + 1 <= maximumLineBytes else {
             throw SettingsPipeError.frameTooLarge(byteCount: data.count + 1, maximum: maximumLineBytes)
         }
@@ -279,7 +321,7 @@ public enum SettingsPipeCodec {
     }
 
     public static func decodeLine(_ data: Data) throws -> SettingsPipeMessage {
-        try SettingsXPCCodec.decoder.decode(SettingsPipeMessage.self, from: data)
+        try SettingsPipeJSONCodec.decoder.decode(SettingsPipeMessage.self, from: data)
     }
 }
 
@@ -344,59 +386,7 @@ public actor SettingsPipeLineDecoder {
     }
 }
 
-public final class SettingsXPCEnvelope: NSObject, NSSecureCoding {
-    public static var supportsSecureCoding: Bool { true }
-
-    public let data: Data
-
-    public init(data: Data) {
-        self.data = data
-        super.init()
-    }
-
-    public required init?(coder: NSCoder) {
-        guard let data = coder.decodeObject(of: NSData.self, forKey: "data") as Data? else {
-            return nil
-        }
-        self.data = data
-        super.init()
-    }
-
-    public func encode(with coder: NSCoder) {
-        coder.encode(data as NSData, forKey: "data")
-    }
-
-    public static func encode<T: Encodable>(_ value: T, encoder: JSONEncoder = SettingsXPCCodec.encoder) throws -> SettingsXPCEnvelope {
-        try SettingsXPCEnvelope(data: encoder.encode(value))
-    }
-
-    public func decode<T: Decodable>(_ type: T.Type, decoder: JSONDecoder = SettingsXPCCodec.decoder) throws -> T {
-        try decoder.decode(type, from: data)
-    }
-}
-
-public enum SettingsXPCCodec {
-    public static let encoder = JSONEncoder()
-    public static let decoder = JSONDecoder()
-}
-
-@objc public protocol GlassEQSettingsHostXPC: NSObjectProtocol {
-    func connect(token: String, withReply reply: @escaping (SettingsXPCEnvelope?, NSString?) -> Void)
-    func performCommand(_ envelope: SettingsXPCEnvelope, withReply reply: @escaping (SettingsXPCEnvelope?, NSString?) -> Void)
-    func disconnect()
-}
-
-@objc public protocol GlassEQSettingsClientXPC: NSObjectProtocol {
-    func receiveEvent(_ envelope: SettingsXPCEnvelope)
-    func terminate()
-}
-
-public enum SettingsXPCInterfaceFactory {
-    public static func hostInterface() -> NSXPCInterface {
-        NSXPCInterface(with: GlassEQSettingsHostXPC.self)
-    }
-
-    public static func clientInterface() -> NSXPCInterface {
-        NSXPCInterface(with: GlassEQSettingsClientXPC.self)
-    }
+enum SettingsPipeJSONCodec {
+    static let encoder = JSONEncoder()
+    static let decoder = JSONDecoder()
 }

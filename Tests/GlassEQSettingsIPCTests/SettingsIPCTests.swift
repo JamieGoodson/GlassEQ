@@ -1,31 +1,12 @@
 import Foundation
 import GlassEQCore
 import GlassEQSettingsIPC
+import GlassEQSettingsUI
 import Testing
 @testable import GlassEQSettings
 
 @Suite
 struct SettingsIPCTests {
-    @Test
-    func commandRoundTripsThroughSecureEnvelope() throws {
-        let profile = EQProfile.flatParametric
-        let envelope = try SettingsXPCEnvelope.encode(SettingsCommand.applyProfile(profile))
-
-        let decoded = try envelope.decode(SettingsCommand.self)
-
-        #expect(decoded == .applyProfile(profile))
-    }
-
-    @Test
-    func snapshotRoundTripsThroughSecureEnvelope() throws {
-        let snapshot = SettingsSnapshotDTO.disconnected
-        let envelope = try SettingsXPCEnvelope.encode(SettingsEvent.snapshotChanged(snapshot))
-
-        let decoded = try envelope.decode(SettingsEvent.self)
-
-        #expect(decoded == .snapshotChanged(snapshot))
-    }
-
     @Test
     func pipeMessageRoundTripsConnectRequest() throws {
         let message = SettingsPipeMessage.request(sessionToken: "token", id: "request-1", kind: .connect, command: nil)
@@ -55,6 +36,35 @@ struct SettingsIPCTests {
 
         #expect(decodedResponse == response)
         #expect(decodedEvent == event)
+    }
+
+    @Test
+    func audioMetricsDecodeOldPayloadsWithDefaultedNewFields() throws {
+        let data = Data("""
+        {
+          "capturedFrames": 42,
+          "playedFrames": 24,
+          "playbackUnderrunFrames": 1,
+          "saturatedSamples": 2,
+          "currentBufferedFrames": 512,
+          "maxBufferedFrames": 1024
+        }
+        """.utf8)
+
+        let metrics = try JSONDecoder().decode(SettingsAudioMetricsDTO.self, from: data)
+
+        #expect(metrics.capturedFrames == 42)
+        #expect(metrics.playedFrames == 24)
+        #expect(metrics.playbackUnderrunFrames == 1)
+        #expect(metrics.saturatedSamples == 2)
+        #expect(metrics.currentBufferedFrames == 512)
+        #expect(metrics.maxBufferedFrames == 1024)
+        #expect(metrics.maximumPlaybackBufferedFrames == 0)
+        #expect(metrics.minimumPlaybackBufferedFrames == 0)
+        #expect(metrics.averagePlaybackBufferedFrames == 0)
+        #expect(metrics.playbackBufferObservations == 0)
+        #expect(metrics.maximumCaptureCallbackFrames == 0)
+        #expect(metrics.maximumPlaybackCallbackFrames == 0)
     }
 
     @Test
@@ -172,6 +182,71 @@ struct SettingsIPCTests {
             )
         }
     }
+
+    @Test
+    @MainActor
+    func settingsLaunchConnectsWhenModelAttachesBeforeArgumentsAreParsed() async {
+        let factory = FakeSettingsPipeClientFactory()
+        let coordinator = SettingsLaunchCoordinator(clientFactory: factory)
+        let model = GlassEQSettingsViewModel()
+
+        coordinator.attach(model: model)
+        #expect(model.commandErrorMessage == nil)
+        coordinator.finishLaunching(arguments: launchArguments(token: "token-before"))
+        await coordinator.waitForConnectionTask()
+
+        #expect(model.isConnected)
+        #expect(model.commandErrorMessage == nil)
+        #expect(factory.launchInfos.map(\.token) == ["token-before"])
+    }
+
+    @Test
+    @MainActor
+    func settingsLaunchConnectsWhenArgumentsAreParsedBeforeModelAttaches() async {
+        let factory = FakeSettingsPipeClientFactory()
+        let coordinator = SettingsLaunchCoordinator(clientFactory: factory)
+        let model = GlassEQSettingsViewModel()
+
+        coordinator.finishLaunching(arguments: launchArguments(token: "token-after"))
+        coordinator.attach(model: model)
+        await coordinator.waitForConnectionTask()
+
+        #expect(model.isConnected)
+        #expect(model.commandErrorMessage == nil)
+        #expect(factory.launchInfos.map(\.token) == ["token-after"])
+    }
+
+    @Test
+    @MainActor
+    func settingsLaunchWithoutGlassEQArgumentsShowsDirectLaunchWarning() {
+        let factory = FakeSettingsPipeClientFactory()
+        let coordinator = SettingsLaunchCoordinator(clientFactory: factory)
+        let model = GlassEQSettingsViewModel()
+
+        coordinator.attach(model: model)
+        coordinator.finishLaunching(arguments: ["GlassEQSettings"])
+
+        #expect(!model.isConnected)
+        #expect(model.commandErrorMessage == "Settings was not launched by GlassEQ.")
+        #expect(factory.launchInfos.isEmpty)
+    }
+
+    @Test
+    @MainActor
+    func settingsLaunchValidationFailureSurfacesConnectionError() async {
+        let factory = FakeSettingsPipeClientFactory(
+            makeError: SettingsCommandFailure(message: "Settings was launched by an unexpected host application.")
+        )
+        let coordinator = SettingsLaunchCoordinator(clientFactory: factory)
+        let model = GlassEQSettingsViewModel()
+
+        coordinator.finishLaunching(arguments: launchArguments(token: "invalid-host"))
+        coordinator.attach(model: model)
+        await coordinator.waitForConnectionTask()
+
+        #expect(!model.isConnected)
+        #expect(model.commandErrorMessage == "Settings was launched by an unexpected host application.")
+    }
 }
 
 private struct FakeHostProcessResolver: SettingsHostProcessResolving {
@@ -180,4 +255,74 @@ private struct FakeHostProcessResolver: SettingsHostProcessResolving {
     func snapshot(for processIdentifier: pid_t) -> SettingsHostProcessSnapshot {
         snapshot
     }
+}
+
+@MainActor
+private final class FakeSettingsPipeClientFactory: SettingsPipeClientMaking {
+    private let makeError: (any Error)?
+    private let connectError: (any Error)?
+    private let snapshot: SettingsSnapshotDTO
+    private(set) var launchInfos: [SettingsLaunchInfo] = []
+
+    init(
+        snapshot: SettingsSnapshotDTO = .disconnected,
+        makeError: (any Error)? = nil,
+        connectError: (any Error)? = nil
+    ) {
+        self.snapshot = snapshot
+        self.makeError = makeError
+        self.connectError = connectError
+    }
+
+    func makeClient(
+        launchInfo: SettingsLaunchInfo,
+        model: GlassEQSettingsViewModel
+    ) throws -> any SettingsPipeClientConnection {
+        if let makeError {
+            throw makeError
+        }
+        launchInfos.append(launchInfo)
+        return FakeSettingsPipeClient(
+            token: launchInfo.token,
+            snapshot: snapshot,
+            connectError: connectError
+        )
+    }
+}
+
+@MainActor
+private final class FakeSettingsPipeClient: SettingsPipeClientConnection, @unchecked Sendable {
+    let token: String
+    private let snapshot: SettingsSnapshotDTO
+    private let connectError: (any Error)?
+    private(set) var didDisconnect = false
+
+    init(token: String, snapshot: SettingsSnapshotDTO, connectError: (any Error)?) {
+        self.token = token
+        self.snapshot = snapshot
+        self.connectError = connectError
+    }
+
+    func connect() async throws -> SettingsSnapshotDTO {
+        if let connectError {
+            throw connectError
+        }
+        return snapshot
+    }
+
+    func perform(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
+        SettingsCommandResponse()
+    }
+
+    func disconnect() {
+        didDisconnect = true
+    }
+}
+
+private func launchArguments(token: String) -> [String] {
+    [
+        "GlassEQSettings",
+        "--glasseq-settings-token", token,
+        "--glasseq-main-pid", "123"
+    ]
 }
