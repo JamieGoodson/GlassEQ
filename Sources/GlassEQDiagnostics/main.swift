@@ -2,7 +2,6 @@ import Darwin
 import Foundation
 import GlassEQAudio
 import GlassEQCore
-import GlassEQDiagnosticsSupport
 
 let arguments = Array(CommandLine.arguments.dropFirst().drop { $0 == "--" })
 if arguments.first == "dsp-benchmark" || arguments.first == "--dsp-benchmark" {
@@ -25,7 +24,6 @@ private struct DiagnosticsOptions {
     var duration: TimeInterval = 3
     var holdAfterStart: TimeInterval = 3
     var health = false
-    var verbose = false
     var expectPermissionDenied = false
     var intentionalCrashAfterStart = false
 
@@ -39,8 +37,6 @@ private struct DiagnosticsOptions {
             switch argument {
             case "--health":
                 health = true
-            case "--verbose":
-                verbose = true
             case "--expect-permission-denied":
                 expectPermissionDenied = true
             case "--intentional-crash-after-start":
@@ -106,18 +102,18 @@ private func runDiagnostics(options: DiagnosticsOptions) -> Int32 {
         if options.health {
             print("Mode: health")
         }
-        print("Output: \(diagnosticsDeviceName(output.name, verbose: options.verbose))")
-        print("UID: \(diagnosticsIdentifier(output.uid, verbose: options.verbose))")
+        print("Output: \(output.name)")
+        print("UID: \(output.uid)")
         print("Sample rate: \(output.nominalSampleRate)")
         print("Output channels: \(output.outputChannelCount)")
-        print("Buffer frames: \(output.bufferFrameSize)")
+        print("Buffer frames (before tuning): \(output.bufferFrameSize)")
         if let transportType = output.transportType {
-            print("Transport type: \(diagnosticsIdentifier(String(transportType), verbose: options.verbose))")
+            print("Transport type: \(transportType)")
         }
 
-        printAudioEngineStatus(.starting, verbose: options.verbose)
+        printAudioEngineStatus(.starting)
         try engine.start(output: output, profile: .flatGraphic31)
-        printAudioEngineStatus(engine.status, verbose: options.verbose)
+        printAudioEngineStatus(engine.status)
 
         if case .running(let activeOutput) = engine.state {
             print("Active buffer frames: \(activeOutput.bufferFrameSize)")
@@ -134,7 +130,7 @@ private func runDiagnostics(options: DiagnosticsOptions) -> Int32 {
         let metrics = engine.snapshotMetrics()
         engine.stop()
         printMetrics(metrics, sampleRate: output.nominalSampleRate)
-        printAudioEngineStatus(.stopped, verbose: options.verbose)
+        printAudioEngineStatus(.stopped)
         print("Engine stopped cleanly.")
 
         if options.expectPermissionDenied {
@@ -149,12 +145,8 @@ private func runDiagnostics(options: DiagnosticsOptions) -> Int32 {
     } catch {
         engine.stop()
         let status = audioEngineStatus(from: error)
-        printAudioEngineStatus(status, verbose: options.verbose)
-        if options.verbose {
-            print("GlassEQ diagnostics failed: \(error)")
-        } else {
-            print("GlassEQ diagnostics failed. Rerun with --verbose for full local device details.")
-        }
+        printAudioEngineStatus(status)
+        print("GlassEQ diagnostics failed: \(error)")
 
         guard options.expectPermissionDenied else {
             return 1
@@ -220,7 +212,7 @@ private func audioEngineStatus(from error: Error) -> AudioEngineStatus {
     return .failed(failure)
 }
 
-private func printAudioEngineStatus(_ status: AudioEngineStatus, verbose: Bool) {
+private func printAudioEngineStatus(_ status: AudioEngineStatus) {
     switch status {
     case .stopped:
         print("Status: stopped")
@@ -228,23 +220,19 @@ private func printAudioEngineStatus(_ status: AudioEngineStatus, verbose: Bool) 
         print("Status: starting")
     case .running(let output):
         print("Status: running")
-        print("Status output: \(diagnosticsDeviceName(output.name, verbose: verbose))")
+        print("Status output: \(output.name)")
     case .permissionRequired(let failure):
         print("Status: permission required")
-        printAudioEngineFailure(failure, verbose: verbose)
+        printAudioEngineFailure(failure)
     case .failed(let failure):
         print("Status: failed")
-        printAudioEngineFailure(failure, verbose: verbose)
+        printAudioEngineFailure(failure)
     }
 }
 
-private func printAudioEngineFailure(_ failure: AudioEngineFailure, verbose: Bool) {
+private func printAudioEngineFailure(_ failure: AudioEngineFailure) {
     print("Failure category: \(failure.category)")
-    if verbose {
-        print("Failure message: \(failure.userMessage)")
-    } else {
-        print("Failure message: <redacted>")
-    }
+    print("Failure message: \(failure.userMessage)")
     print("Failure operation: \(failure.operation)")
     if let status = failure.status {
         print("Failure OSStatus: \(formatOSStatus(status))")
@@ -260,13 +248,16 @@ private func printMetrics(_ metrics: AudioEngineMetrics, sampleRate: Double) {
     print("Playback underrun frames: \(metrics.playbackUnderrunFrames)")
     print("Saturated samples: \(metrics.saturatedSamples)")
     print("Buffered frames at stop: \(metrics.currentBufferedFrames)")
-    print("Max buffered frames: \(metrics.maxBufferedFrames)")
-    print(String(format: "Max buffered latency: %.2f ms", Double(metrics.maxBufferedFrames) / sampleRate * 1_000))
+    print("Max ring buffered frames: \(metrics.maxBufferedFrames)")
+    print("Max playback buffered frames: \(metrics.maximumPlaybackBufferedFrames)")
+    print("Max capture callback frames: \(metrics.maximumCaptureCallbackFrames)")
+    print("Max playback callback frames: \(metrics.maximumPlaybackCallbackFrames)")
+    print(String(format: "Max playback buffered latency: %.2f ms", Double(metrics.maximumPlaybackBufferedFrames) / sampleRate * 1_000))
     print("Playback latency observations: \(metrics.playbackBufferObservations)")
     print(String(format: "GlassEQ added latency: min %.2f ms, avg %.2f ms, max %.2f ms",
                  Double(metrics.minimumPlaybackBufferedFrames) / sampleRate * 1_000,
                  metrics.averagePlaybackBufferedFrames / sampleRate * 1_000,
-                 Double(metrics.maxBufferedFrames) / sampleRate * 1_000))
+                 Double(metrics.maximumPlaybackBufferedFrames) / sampleRate * 1_000))
 }
 
 private struct DSPBenchmarkCase {
