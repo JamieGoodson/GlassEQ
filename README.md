@@ -25,7 +25,7 @@ GlassEQ takes a different route. It uses **Core Audio process taps**, Apple's mo
 
 ## Download & install
 
-Grab `GlassEQ-alpha-0.7-macos26-arm64.zip` from the [alpha-0.7 release](https://github.com/juhokoskela/GlassEQ/releases/tag/alpha-0.7), then:
+Grab `GlassEQ-alpha-0.8-macos26-arm64.zip` from the [alpha-0.8 release](https://github.com/juhokoskela/GlassEQ/releases/tag/alpha-0.8), then:
 
 1. Unzip it.
 2. Move `GlassEQ.app` to `/Applications`.
@@ -37,7 +37,7 @@ On first run GlassEQ asks for **system audio capture permission** — that's wha
 
 ### About this alpha
 
-GlassEQ is an early alpha: Apple Silicon only, tested on macOS 26, with no automatic updates or crash reporting yet. Expect the occasional rough edge, and please report any hardware-specific audio issues you run into. See [Docs/AlphaTesting.md](Docs/AlphaTesting.md), [Docs/Distribution.md](Docs/Distribution.md), and [Docs/ReleaseNotes-alpha-0.7.md](Docs/ReleaseNotes-alpha-0.7.md) before installing a build.
+GlassEQ is an early alpha: Apple Silicon only, tested on macOS 26, with no automatic updates or crash reporting yet. Expect the occasional rough edge, and please report any hardware-specific audio issues you run into. See [Docs/AlphaTesting.md](Docs/AlphaTesting.md), [Docs/Distribution.md](Docs/Distribution.md), and [Docs/ReleaseNotes-alpha-0.8.md](Docs/ReleaseNotes-alpha-0.8.md) before installing a build.
 
 ## How it works
 
@@ -69,12 +69,12 @@ During normal listening GlassEQ is just a menu bar app and the audio engine, con
 ### Security & privacy
 
 - Sandboxed: requests only the audio-capture permission it needs to function.
-- The settings helper is code-signature-checked (expected identity, same signing team) before it's launched and talks to the main app over a token-authenticated local pipe – no networking, no shared files.
+- The settings helper must be inside the app bundle and pass code-signature integrity plus signing-identifier checks before launch and again after launch. Developer ID builds also require the same signing team; ad hoc alpha builds rely on bundle containment, identifier checks, and the private token-authenticated pipe. There is no networking or shared profile storage.
 - No telemetry, no analytics, no cloud sync. Diagnostics run locally and print device details only to your terminal.
 
 ## Known limitations
 
-- **AirPlay outputs are not yet supported.** The DSP engine currently fails to start on AirPlay receivers. GlassEQ fails open, so audio keeps playing to the AirPlay device just without EQ and switching to any other output (built-in, USB, Bluetooth, HDMI) restores processing cleanly.
+- **AirPlay outputs are not yet supported.** The DSP engine currently fails to start on AirPlay receivers and GlassEQ stops processing that route; macOS keeps routing normal system audio to the AirPlay device. Switching to any other output (built-in, USB, Bluetooth, HDMI) restores processing cleanly.
 - **Stereo only.** GlassEQ processes mono and 2-channel outputs, multichannel / surround outputs aren't supported yet.
 - **Bluetooth** routes can still surface Core Audio edge cases, please report device model, macOS version, and steps to reproduce.
 - No automatic updates, no crash reporting, no x86_64 build.

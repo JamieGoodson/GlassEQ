@@ -1,4 +1,6 @@
 @testable import GlassEQAudio
+import Foundation
+import Synchronization
 import Testing
 
 @Suite
@@ -51,6 +53,32 @@ struct RealtimeAudioRingBufferTests {
         #expect(output == [2])
         _ = output.withUnsafeMutableBufferPointer { ring.read(into: $0) }
         #expect(output == [3])
+    }
+
+    @Test
+    func overwriteAfterReadAdvancesFromCurrentReadFrame() {
+        let ring = RealtimeAudioRingBuffer(channelCount: 1, capacityFrames: 4)
+        let first: [Float] = [1, 2, 3]
+        let second: [Float] = [4, 5, 6, 7]
+        var discarded = [Float](repeating: 0, count: 1)
+        var output = [Float](repeating: 0, count: 4)
+
+        _ = first.withUnsafeBufferPointer {
+            ring.writeInterleaved($0, frameCount: 3, sourceChannelCount: 1)
+        }
+        _ = discarded.withUnsafeMutableBufferPointer {
+            ring.readInterleaved(into: $0, frameCount: 1, destinationChannelCount: 1)
+        }
+        let result = second.withUnsafeBufferPointer {
+            ring.writeInterleaved($0, frameCount: 4, sourceChannelCount: 1)
+        }
+        let readFrames = output.withUnsafeMutableBufferPointer {
+            ring.readInterleaved(into: $0, frameCount: 4, destinationChannelCount: 1)
+        }
+
+        #expect(result == RingBufferWriteResult(writtenFrames: 4, droppedInputFrames: 0, droppedBufferedFrames: 2))
+        #expect(readFrames == 4)
+        #expect(output == [4, 5, 6, 7])
     }
 
     @Test
@@ -198,5 +226,61 @@ struct RealtimeAudioRingBufferTests {
         }
         #expect(readFrames == 2)
         #expect(output == [4, 5])
+    }
+
+    @Test
+    func concurrentProducerConsumerKeepsReadFramesMonotonic() {
+        let ring = RealtimeAudioRingBuffer(channelCount: 1, capacityFrames: 64)
+        let producerDone = Atomic<Bool>(false)
+        let sawOutOfOrderFrame = Atomic<Bool>(false)
+        let consumedFrameCount = Atomic<Int>(0)
+        let totalFrames = 20_000
+        let group = DispatchGroup()
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            var frame = [Float](repeating: 0, count: 1)
+            for value in 1...totalFrames {
+                frame[0] = Float(value)
+                frame.withUnsafeBufferPointer {
+                    ring.write($0)
+                }
+                if value.isMultiple(of: 17) {
+                    Thread.sleep(forTimeInterval: 0.000_001)
+                }
+            }
+            producerDone.store(true, ordering: .releasing)
+            group.leave()
+        }
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            var lastFrame = 0
+            var frame = [Float](repeating: 0, count: 1)
+            while !producerDone.load(ordering: .acquiring) || ring.occupancyFrames() > 0 {
+                let hadData = frame.withUnsafeMutableBufferPointer {
+                    ring.read(into: $0)
+                }
+                guard hadData else {
+                    Thread.sleep(forTimeInterval: 0.000_001)
+                    continue
+                }
+
+                let currentFrame = Int(frame[0])
+                if currentFrame <= lastFrame {
+                    sawOutOfOrderFrame.store(true, ordering: .releasing)
+                    break
+                }
+                lastFrame = currentFrame
+                _ = consumedFrameCount.wrappingAdd(1, ordering: .relaxed)
+            }
+            group.leave()
+        }
+
+        #expect(group.wait(timeout: .now() + 5) == .success)
+        let outOfOrder = sawOutOfOrderFrame.load(ordering: .acquiring)
+        let consumed = consumedFrameCount.load(ordering: .acquiring)
+        #expect(!outOfOrder)
+        #expect(consumed > 0)
     }
 }

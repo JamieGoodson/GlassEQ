@@ -66,10 +66,12 @@ public final class RealtimeAudioRingBuffer: @unchecked Sendable {
         let framesToWrite = min(requestedFrames, capacityFrames)
         let firstSourceFrame = requestedFrames - framesToWrite
 
-        let read = readFrame.load(ordering: .acquiring)
         let write = writeFrame.load(ordering: .relaxed)
         let retainedFrames = max(0, capacityFrames - framesToWrite)
-        let droppedFrames = max(0, occupancyFrames(read: read, write: write) - retainedFrames)
+        var droppedFrames = max(
+            0,
+            occupancyFrames(read: readFrame.load(ordering: .acquiring), write: write) - retainedFrames
+        )
         if droppedFrames > 0 {
             guard enterOverwriteGate() else {
                 return RingBufferWriteResult(
@@ -81,7 +83,11 @@ public final class RealtimeAudioRingBuffer: @unchecked Sendable {
             defer {
                 leaveOverwriteGate()
             }
-            readFrame.store(advance(read, by: droppedFrames), ordering: .releasing)
+            let gatedRead = readFrame.load(ordering: .acquiring)
+            droppedFrames = max(0, occupancyFrames(read: gatedRead, write: write) - retainedFrames)
+            if droppedFrames > 0 {
+                readFrame.store(advance(gatedRead, by: droppedFrames), ordering: .releasing)
+            }
         }
 
         if sourceChannelCount == channelCount,
@@ -124,10 +130,6 @@ public final class RealtimeAudioRingBuffer: @unchecked Sendable {
             return 0
         }
 
-        let read = readFrame.load(ordering: .relaxed)
-        let write = writeFrame.load(ordering: .acquiring)
-        let framesToRead = min(requestedFrames, occupancyFrames(read: read, write: write))
-
         guard enterOverwriteGate() else {
             zeroFill(samples, startFrame: 0, frameCount: requestedFrames, channelCount: destinationChannelCount)
             return 0
@@ -135,6 +137,10 @@ public final class RealtimeAudioRingBuffer: @unchecked Sendable {
         defer {
             leaveOverwriteGate()
         }
+
+        let read = readFrame.load(ordering: .acquiring)
+        let write = writeFrame.load(ordering: .acquiring)
+        let framesToRead = min(requestedFrames, occupancyFrames(read: read, write: write))
 
         if destinationChannelCount == channelCount,
            let source = storage.baseAddress,
@@ -225,6 +231,8 @@ public final class RealtimeAudioRingBuffer: @unchecked Sendable {
         overwriteGate.store(false, ordering: .releasing)
     }
 
+    // Write path copies linear source into wrapped storage; read path below copies
+    // wrapped storage back out. The pointer overloads keep those directions distinct.
     private func copyMatchingChannels(
         source: UnsafePointer<Float>,
         destination: UnsafeMutablePointer<Float>,

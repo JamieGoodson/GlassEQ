@@ -14,20 +14,26 @@ public enum ProfileStoreLoadStatus: Equatable, Sendable {
     case loaded
     case missingStore
     case repairedReferences(ProfileStoreRepairSummary)
+    case repairedInvalidStore(backupURL: URL, ProfileStoreRepairSummary)
     case recoveredDefaults(backupURL: URL)
     case backupFailed
+    case unsupportedSchemaVersion(version: Int, maximumSupported: Int)
 }
 
 public enum ProfileStoreValidationError: Error, Equatable, Sendable, LocalizedError {
     case inputTooLarge(byteCount: Int, maximum: Int)
+    case unsupportedSchemaVersion(version: Int, maximumSupported: Int)
     case invalidProfileCount(count: Int, allowed: ClosedRange<Int>)
     case invalidOutputMappingCount(count: Int, allowed: ClosedRange<Int>)
+    case duplicateProfileID(profileID: UUID)
     case missingFallbackProfile(profileID: UUID)
     case emptyProfileName(profileID: UUID)
     case profileNameTooLong(profileID: UUID, byteCount: Int, maximum: Int)
     case outputUIDTooLong(mappingIndex: Int, byteCount: Int, maximum: Int)
     case valueOutOfRange(profileID: UUID, field: String, value: Double, range: ClosedRange<Double>)
+    case tooManyFilters(profileID: UUID, channel: String, count: Int, maximum: Int)
     case tooManyActiveFilters(profileID: UUID, channel: String, count: Int, maximum: Int)
+    case tooManyStereoFilters(profileID: UUID, count: Int, maximum: Int)
     case tooManyStereoActiveFilters(profileID: UUID, count: Int, maximum: Int)
     case invalidGraphicBandCount(profileID: UUID, channel: String, count: Int, expected: Int)
 
@@ -35,10 +41,14 @@ public enum ProfileStoreValidationError: Error, Equatable, Sendable, LocalizedEr
         switch self {
         case let .inputTooLarge(byteCount, maximum):
             return "Profile store is \(byteCount) bytes, which exceeds the \(maximum)-byte limit."
+        case let .unsupportedSchemaVersion(version, maximumSupported):
+            return "Profile store schema \(version) is newer than this build supports (\(maximumSupported))."
         case let .invalidProfileCount(count, allowed):
             return "Profile store has \(count) profiles; expected \(allowed.lowerBound)...\(allowed.upperBound)."
         case let .invalidOutputMappingCount(count, allowed):
             return "Profile store has \(count) output mappings; expected \(allowed.lowerBound)...\(allowed.upperBound)."
+        case let .duplicateProfileID(profileID):
+            return "Profile store contains duplicate profile ID \(profileID)."
         case let .missingFallbackProfile(profileID):
             return "Profile store fallback profile \(profileID) does not exist."
         case .emptyProfileName:
@@ -49,8 +59,12 @@ public enum ProfileStoreValidationError: Error, Equatable, Sendable, LocalizedEr
             return "Output mapping \(mappingIndex) has \(byteCount) UTF-8 bytes, which exceeds the \(maximum)-byte limit."
         case let .valueOutOfRange(_, field, value, range):
             return "Profile store contains \(field) \(format(value)), outside the allowed range \(format(range.lowerBound))...\(format(range.upperBound))."
+        case let .tooManyFilters(_, channel, count, maximum):
+            return "Profile store contains \(count) \(channel) filters, which exceeds the \(maximum)-filter channel limit."
         case let .tooManyActiveFilters(_, channel, count, maximum):
             return "Profile store contains \(count) active \(channel) filters, which exceeds the \(maximum)-filter channel limit."
+        case let .tooManyStereoFilters(_, count, maximum):
+            return "Profile store contains \(count) stereo filters, which exceeds the \(maximum)-filter stereo limit."
         case let .tooManyStereoActiveFilters(_, count, maximum):
             return "Profile store contains \(count) active stereo filters, which exceeds the \(maximum)-filter stereo limit."
         case let .invalidGraphicBandCount(_, channel, count, expected):
@@ -69,20 +83,28 @@ public enum ProfilePersistence {
     public static let outputMappingCountRange = 0...256
     public static let maxProfileNameUTF8Bytes = 120
     public static let maxOutputUIDUTF8Bytes = 512
-    public static let maxActiveFiltersPerChannel = 128
-    public static let maxStereoActiveFilters = 256
-    public static let frequencyRange: ClosedRange<Double> = 1...96_000
+    public static let maxFiltersPerChannel = 128
+    public static let maxStereoFilters = 256
+    public static let maxActiveFiltersPerChannel = maxFiltersPerChannel
+    public static let maxStereoActiveFilters = maxStereoFilters
+    public static let frequencyRange: ClosedRange<Double> = 1...24_000
     public static let gainRange: ClosedRange<Double> = -120...120
     public static let preampRange: ClosedRange<Double> = -120...120
     public static let qRange: ClosedRange<Double> = 0.01...100
 
-    public static let encoder: JSONEncoder = {
+    public static var encoder: JSONEncoder {
+        makeEncoder()
+    }
+
+    public static var decoder: JSONDecoder {
+        JSONDecoder()
+    }
+
+    private static func makeEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return encoder
-    }()
-
-    public static let decoder = JSONDecoder()
+    }
 
     public static func encode(_ store: ProfileStore) throws -> Data {
         try encoder.encode(store)
@@ -100,6 +122,19 @@ public enum ProfilePersistence {
     }
 
     public static func validate(_ store: ProfileStore) throws {
+        guard store.schemaVersion <= ProfileStore.currentSchemaVersion else {
+            throw ProfileStoreValidationError.unsupportedSchemaVersion(
+                version: store.schemaVersion,
+                maximumSupported: ProfileStore.currentSchemaVersion
+            )
+        }
+        guard store.schemaVersion > 0 else {
+            throw ProfileStoreValidationError.unsupportedSchemaVersion(
+                version: store.schemaVersion,
+                maximumSupported: ProfileStore.currentSchemaVersion
+            )
+        }
+
         guard profileCountRange.contains(store.profiles.count) else {
             throw ProfileStoreValidationError.invalidProfileCount(
                 count: store.profiles.count,
@@ -114,7 +149,12 @@ public enum ProfilePersistence {
             )
         }
 
-        let profileIDs = Set(store.profiles.map(\.id))
+        var profileIDs = Set<UUID>()
+        for profile in store.profiles {
+            guard profileIDs.insert(profile.id).inserted else {
+                throw ProfileStoreValidationError.duplicateProfileID(profileID: profile.id)
+            }
+        }
         guard profileIDs.contains(store.fallbackProfileID) else {
             throw ProfileStoreValidationError.missingFallbackProfile(profileID: store.fallbackProfileID)
         }
@@ -135,10 +175,12 @@ public enum ProfilePersistence {
         }
     }
 
+    public static func validateForCommit(_ store: ProfileStore) throws {
+        _ = try encodeForCommit(store)
+    }
+
     public static func save(_ store: ProfileStore, to url: URL) throws {
-        try validate(store)
-        let data = try encode(store)
-        try validateStoreSize(byteCount: data.count)
+        let data = try encodeForCommit(store)
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try data.write(to: url, options: .atomic)
@@ -153,12 +195,36 @@ public enum ProfilePersistence {
             return recoverInvalidStore(at: url, timestamp: timestamp)
         }
 
+        let data: Data
         do {
-            let data = try Data(contentsOf: url)
+            data = try Data(contentsOf: url)
             try validateStoreSize(byteCount: data.count)
+        } catch {
+            return recoverInvalidStore(at: url, timestamp: timestamp)
+        }
+
+        do {
             var store = try decodeRaw(data)
+            if store.schemaVersion > ProfileStore.currentSchemaVersion {
+                return ProfileStoreLoadResult(
+                    store: defaultStore(),
+                    status: .unsupportedSchemaVersion(
+                        version: store.schemaVersion,
+                        maximumSupported: ProfileStore.currentSchemaVersion
+                    )
+                )
+            }
             let repairSummary = store.repairReferences()
-            try validate(store)
+            do {
+                try validate(store)
+            } catch {
+                return repairInvalidDecodedStore(
+                    store,
+                    initialRepairSummary: repairSummary,
+                    at: url,
+                    timestamp: timestamp
+                )
+            }
 
             if repairSummary.didRepair {
                 try save(store, to: url)
@@ -167,6 +233,25 @@ public enum ProfilePersistence {
 
             return ProfileStoreLoadResult(store: store, status: .loaded)
         } catch {
+            if let repairable = try? decodeRepairableStore(data) {
+                if repairable.store.schemaVersion > ProfileStore.currentSchemaVersion {
+                    return ProfileStoreLoadResult(
+                        store: defaultStore(),
+                        status: .unsupportedSchemaVersion(
+                            version: repairable.store.schemaVersion,
+                            maximumSupported: ProfileStore.currentSchemaVersion
+                        )
+                    )
+                }
+                return repairInvalidDecodedStore(
+                    repairable.store,
+                    initialRepairSummary: ProfileStoreRepairSummary(
+                        removedInvalidProfiles: repairable.removedInvalidProfiles
+                    ),
+                    at: url,
+                    timestamp: timestamp
+                )
+            }
             return recoverInvalidStore(at: url, timestamp: timestamp)
         }
     }
@@ -181,6 +266,23 @@ public enum ProfilePersistence {
         }
 
         return storeURL.deletingLastPathComponent().appendingPathComponent(backupName)
+    }
+
+    public static func resetUnsupportedStore(
+        at url: URL,
+        timestamp: Date = Date()
+    ) throws -> (store: ProfileStore, backupURL: URL) {
+        let store = defaultStore()
+        let backupURL = uniqueInvalidStoreBackupURL(for: url, timestamp: timestamp)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: url, to: backupURL)
+        do {
+            try save(store, to: url)
+        } catch {
+            try? FileManager.default.moveItem(at: backupURL, to: url)
+            throw error
+        }
+        return (store, backupURL)
     }
 
     public static func defaultStoreURL(
@@ -198,6 +300,72 @@ public enum ProfilePersistence {
         guard byteCount <= maxStoreBytes else {
             throw ProfileStoreValidationError.inputTooLarge(byteCount: byteCount, maximum: maxStoreBytes)
         }
+    }
+
+    private static func encodeForCommit(_ store: ProfileStore) throws -> Data {
+        try validate(store)
+        let data = try encode(store)
+        try validateStoreSize(byteCount: data.count)
+        return data
+    }
+
+    private struct ProfileStoreEnvelope: Decodable {
+        var schemaVersion: Int
+        var outputMappings: [OutputDeviceProfileMapping]
+        var fallbackProfileID: UUID
+
+        private enum CodingKeys: String, CodingKey {
+            case schemaVersion
+            case outputMappings
+            case fallbackProfileID
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion)
+                ?? ProfileStore.currentSchemaVersion
+            outputMappings = try container.decode([OutputDeviceProfileMapping].self, forKey: .outputMappings)
+            fallbackProfileID = try container.decode(UUID.self, forKey: .fallbackProfileID)
+        }
+    }
+
+    private static func decodeRepairableStore(_ data: Data) throws -> (
+        store: ProfileStore,
+        removedInvalidProfiles: Int
+    ) {
+        let envelope = try decoder.decode(ProfileStoreEnvelope.self, from: data)
+        let json = try JSONSerialization.jsonObject(with: data)
+        guard let object = json as? [String: Any],
+              let rawProfiles = object["profiles"] as? [Any] else {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(codingPath: [], debugDescription: "Profile store profiles array is missing.")
+            )
+        }
+
+        var profiles: [EQProfile] = []
+        var removedInvalidProfiles = 0
+        for rawProfile in rawProfiles {
+            guard JSONSerialization.isValidJSONObject(rawProfile) else {
+                removedInvalidProfiles += 1
+                continue
+            }
+            do {
+                let profileData = try JSONSerialization.data(withJSONObject: rawProfile)
+                profiles.append(try decoder.decode(EQProfile.self, from: profileData))
+            } catch {
+                removedInvalidProfiles += 1
+            }
+        }
+
+        return (
+            ProfileStore(
+                schemaVersion: envelope.schemaVersion,
+                profiles: profiles,
+                outputMappings: envelope.outputMappings,
+                fallbackProfileID: envelope.fallbackProfileID
+            ),
+            removedInvalidProfiles
+        )
     }
 
     private static func validate(_ profile: EQProfile) throws {
@@ -219,12 +387,12 @@ public enum ProfilePersistence {
         try validate(profile.leftPreampDB, in: preampRange, field: "left preamp", profileID: profile.id)
         try validate(profile.rightPreampDB, in: preampRange, field: "right preamp", profileID: profile.id)
 
-        let linkedActiveCount = try validateFilters(profile.filters, channel: "linked", profileID: profile.id)
-        let leftActiveCount = try validateFilters(profile.leftFilters, channel: "left", profileID: profile.id)
-        let rightActiveCount = try validateFilters(profile.rightFilters, channel: "right", profileID: profile.id)
+        let linkedCounts = try validateFilters(profile.filters, channel: "linked", profileID: profile.id)
+        let leftCounts = try validateFilters(profile.leftFilters, channel: "left", profileID: profile.id)
+        let rightCounts = try validateFilters(profile.rightFilters, channel: "right", profileID: profile.id)
 
         if profile.channelMode == .stereo {
-            let stereoActiveCount = leftActiveCount + rightActiveCount
+            let stereoActiveCount = leftCounts.active + rightCounts.active
             guard stereoActiveCount <= maxStereoActiveFilters else {
                 throw ProfileStoreValidationError.tooManyStereoActiveFilters(
                     profileID: profile.id,
@@ -232,16 +400,48 @@ public enum ProfilePersistence {
                     maximum: maxStereoActiveFilters
                 )
             }
+
+            let stereoFilterCount = leftCounts.total + rightCounts.total
+            guard stereoFilterCount <= maxStereoFilters else {
+                throw ProfileStoreValidationError.tooManyStereoFilters(
+                    profileID: profile.id,
+                    count: stereoFilterCount,
+                    maximum: maxStereoFilters
+                )
+            }
         }
 
         if let expectedBandCount = graphicBandCount(for: profile.mode) {
-            try validateGraphicBandCount(linkedActiveCount, channel: "linked", expected: expectedBandCount, profileID: profile.id)
-            try validateGraphicBandCount(leftActiveCount, channel: "left", expected: expectedBandCount, profileID: profile.id)
-            try validateGraphicBandCount(rightActiveCount, channel: "right", expected: expectedBandCount, profileID: profile.id)
+            switch profile.channelMode {
+            case .linked:
+                try validateGraphicBandCount(
+                    linkedCounts.active,
+                    channel: "linked",
+                    expected: expectedBandCount,
+                    profileID: profile.id
+                )
+            case .stereo:
+                try validateGraphicBandCount(
+                    leftCounts.active,
+                    channel: "left",
+                    expected: expectedBandCount,
+                    profileID: profile.id
+                )
+                try validateGraphicBandCount(
+                    rightCounts.active,
+                    channel: "right",
+                    expected: expectedBandCount,
+                    profileID: profile.id
+                )
+            }
         }
     }
 
-    private static func validateFilters(_ filters: [EQFilter], channel: String, profileID: UUID) throws -> Int {
+    private static func validateFilters(
+        _ filters: [EQFilter],
+        channel: String,
+        profileID: UUID
+    ) throws -> (active: Int, total: Int) {
         var activeCount = 0
 
         for filter in filters {
@@ -263,7 +463,16 @@ public enum ProfilePersistence {
             )
         }
 
-        return activeCount
+        guard filters.count <= maxFiltersPerChannel else {
+            throw ProfileStoreValidationError.tooManyFilters(
+                profileID: profileID,
+                channel: channel,
+                count: filters.count,
+                maximum: maxFiltersPerChannel
+            )
+        }
+
+        return (activeCount, filters.count)
     }
 
     private static func validate(_ value: Double, in range: ClosedRange<Double>, field: String, profileID: UUID) throws {
@@ -304,9 +513,78 @@ public enum ProfilePersistence {
         }
     }
 
+    private static func repairInvalidDecodedStore(
+        _ decodedStore: ProfileStore,
+        initialRepairSummary: ProfileStoreRepairSummary,
+        at url: URL,
+        timestamp: Date
+    ) -> ProfileStoreLoadResult {
+        var store = decodedStore
+        var summary = initialRepairSummary
+        let backupURL = uniqueInvalidStoreBackupURL(for: url, timestamp: timestamp)
+
+        do {
+            try FileManager.default.copyItem(at: url, to: backupURL)
+        } catch {
+            return ProfileStoreLoadResult(store: defaultStore(), status: .backupFailed)
+        }
+
+        let profileCountBeforeRepair = store.profiles.count
+        var seenProfileIDs = Set<UUID>()
+        store.profiles = store.profiles.filter { profile in
+            guard seenProfileIDs.insert(profile.id).inserted else {
+                return false
+            }
+            return (try? validate(profile)) != nil
+        }
+        summary.removedInvalidProfiles += profileCountBeforeRepair - store.profiles.count
+
+        if store.profiles.isEmpty {
+            let defaultStore = defaultStore()
+            do {
+                try save(defaultStore, to: url)
+                return ProfileStoreLoadResult(store: defaultStore, status: .recoveredDefaults(backupURL: backupURL))
+            } catch {
+                return ProfileStoreLoadResult(store: defaultStore, status: .backupFailed)
+            }
+        }
+
+        if store.profiles.count > profileCountRange.upperBound {
+            summary.removedInvalidProfiles += store.profiles.count - profileCountRange.upperBound
+            store.profiles = Array(store.profiles.prefix(profileCountRange.upperBound))
+        }
+
+        let mappingCountBeforeLengthRepair = store.outputMappings.count
+        store.outputMappings.removeAll { mapping in
+            mapping.outputDeviceUID.utf8.count > maxOutputUIDUTF8Bytes
+        }
+        summary.removedOutputMappings += mappingCountBeforeLengthRepair - store.outputMappings.count
+
+        if store.outputMappings.count > outputMappingCountRange.upperBound {
+            summary.removedOutputMappings += store.outputMappings.count - outputMappingCountRange.upperBound
+            store.outputMappings = Array(store.outputMappings.prefix(outputMappingCountRange.upperBound))
+        }
+
+        summary.merge(store.repairReferences())
+
+        do {
+            try validate(store)
+            try save(store, to: url)
+            return ProfileStoreLoadResult(store: store, status: .repairedInvalidStore(backupURL: backupURL, summary))
+        } catch {
+            let defaultStore = defaultStore()
+            do {
+                try save(defaultStore, to: url)
+                return ProfileStoreLoadResult(store: defaultStore, status: .recoveredDefaults(backupURL: backupURL))
+            } catch {
+                return ProfileStoreLoadResult(store: defaultStore, status: .backupFailed)
+            }
+        }
+    }
+
     private static func recoverInvalidStore(at url: URL, timestamp: Date) -> ProfileStoreLoadResult {
         let store = defaultStore()
-        let backupURL = invalidStoreBackupURL(for: url, timestamp: timestamp)
+        let backupURL = uniqueInvalidStoreBackupURL(for: url, timestamp: timestamp)
 
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -317,6 +595,27 @@ public enum ProfilePersistence {
 
         try? save(store, to: url)
         return ProfileStoreLoadResult(store: store, status: .recoveredDefaults(backupURL: backupURL))
+    }
+
+    private static func uniqueInvalidStoreBackupURL(for storeURL: URL, timestamp: Date) -> URL {
+        let first = invalidStoreBackupURL(for: storeURL, timestamp: timestamp)
+        guard FileManager.default.fileExists(atPath: first.path) else {
+            return first
+        }
+
+        let directory = first.deletingLastPathComponent()
+        let baseName = first.deletingPathExtension().lastPathComponent
+        let pathExtension = first.pathExtension
+        for index in 2...999 {
+            let candidateName = pathExtension.isEmpty
+                ? "\(baseName)-\(index)"
+                : "\(baseName)-\(index).\(pathExtension)"
+            let candidate = directory.appendingPathComponent(candidateName)
+            if !FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return directory.appendingPathComponent(UUID().uuidString + "-" + first.lastPathComponent)
     }
 
     private static func defaultStore() -> ProfileStore {

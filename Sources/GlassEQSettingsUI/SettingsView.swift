@@ -136,7 +136,8 @@ public struct SettingsView: View {
                 onCreateParametric: createParametricProfile,
                 onDuplicate: duplicateSelectedProfile,
                 onDelete: deleteSelectedProfile,
-                canDeleteSelectedProfile: canDeleteSelectedProfile
+                canDeleteSelectedProfile: canDeleteSelectedProfile,
+                isReadOnly: isProfileStoreProtected
             )
                 .frame(width: 260)
 
@@ -154,7 +155,8 @@ public struct SettingsView: View {
                                 onStopPreview: stopPreview,
                                 onResetDiagnostics: resetDiagnostics,
                                 onRetryAudioEngine: retryAudioEngine,
-                                onOpenPrivacySettings: openPrivacySettings
+                                onOpenPrivacySettings: openPrivacySettings,
+                                onResetUnsupportedProfileStore: resetUnsupportedProfileStore
                             )
                 .frame(minWidth: 640, maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -202,7 +204,11 @@ public struct SettingsView: View {
     }
 
     private var canDeleteSelectedProfile: Bool {
-        snapshot.profiles.count > 1 && snapshot.selectedProfileID != snapshot.activeProfileID
+        !isProfileStoreProtected && snapshot.profiles.count > 1 && snapshot.selectedProfileID != snapshot.activeProfileID
+    }
+
+    private var isProfileStoreProtected: Bool {
+        snapshot.profileStoreProtection.isProtected
     }
 
     private func selectProfile(_ id: UUID) {
@@ -253,6 +259,10 @@ public struct SettingsView: View {
 
     private func openPrivacySettings() {
         perform(.openPrivacySettings)
+    }
+
+    private func resetUnsupportedProfileStore() {
+        perform(.resetUnsupportedProfileStore)
     }
 
     private func createGraphic31Profile() {
@@ -525,7 +535,10 @@ private struct GraphLegendItem: View {
     }
 }
 
-private struct EQAnalysisSignature: Equatable, Sendable {
+struct EQAnalysisSignature: Equatable, Sendable {
+    static let defaultSampleRate = 48_000.0
+
+    var sampleRate: Double
     var mode: EQMode
     var channelMode: EQChannelMode
     var preampDB: Double
@@ -535,7 +548,8 @@ private struct EQAnalysisSignature: Equatable, Sendable {
     var rightPreampDB: Double
     var rightFilters: [EQFilter]
 
-    init(profile: EQProfile) {
+    init(profile: EQProfile, sampleRate: Double) {
+        self.sampleRate = Self.effectiveSampleRate(sampleRate)
         self.mode = profile.mode
         self.channelMode = profile.channelMode
         self.preampDB = profile.preampDB
@@ -545,9 +559,16 @@ private struct EQAnalysisSignature: Equatable, Sendable {
         self.rightPreampDB = profile.rightPreampDB
         self.rightFilters = profile.rightFilters
     }
+
+    static func effectiveSampleRate(_ sampleRate: Double) -> Double {
+        guard sampleRate.isFinite, sampleRate > 0 else {
+            return defaultSampleRate
+        }
+        return sampleRate
+    }
 }
 
-private struct EQAnalysisSnapshot: Equatable, Sendable {
+struct EQAnalysisSnapshot: Equatable, Sendable {
     var signature: EQAnalysisSignature
     var channelMode: EQChannelMode
     var recommendedPreampDB: Double
@@ -555,20 +576,33 @@ private struct EQAnalysisSnapshot: Equatable, Sendable {
     var leftPoints: [FrequencyResponsePoint]
     var rightPoints: [FrequencyResponsePoint]
 
-    init(profile: EQProfile) {
-        self.signature = EQAnalysisSignature(profile: profile)
+    init(profile: EQProfile, sampleRate: Double) {
+        let sampleRate = EQAnalysisSignature.effectiveSampleRate(sampleRate)
+        self.signature = EQAnalysisSignature(profile: profile, sampleRate: sampleRate)
         self.channelMode = profile.channelMode
-        self.recommendedPreampDB = EQProfileAnalysis.recommendedPreampDB(profile: profile)
+        self.recommendedPreampDB = EQProfileAnalysis.recommendedPreampDB(profile: profile, sampleRate: sampleRate)
 
         switch profile.channelMode {
         case .linked:
-            self.linkedPoints = FrequencyResponse.points(for: profile.filters, preampDB: profile.preampDB)
+            self.linkedPoints = FrequencyResponse.points(
+                for: profile.filters,
+                preampDB: profile.preampDB,
+                sampleRate: sampleRate
+            )
             self.leftPoints = []
             self.rightPoints = []
         case .stereo:
             self.linkedPoints = []
-            self.leftPoints = FrequencyResponse.points(for: profile.leftFilters, preampDB: profile.leftPreampDB)
-            self.rightPoints = FrequencyResponse.points(for: profile.rightFilters, preampDB: profile.rightPreampDB)
+            self.leftPoints = FrequencyResponse.points(
+                for: profile.leftFilters,
+                preampDB: profile.leftPreampDB,
+                sampleRate: sampleRate
+            )
+            self.rightPoints = FrequencyResponse.points(
+                for: profile.rightFilters,
+                preampDB: profile.rightPreampDB,
+                sampleRate: sampleRate
+            )
         }
     }
 
@@ -605,6 +639,7 @@ private struct ProfileSidebar: View {
     var onDuplicate: () -> Void
     var onDelete: () -> Void
     var canDeleteSelectedProfile: Bool
+    var isReadOnly: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -664,6 +699,7 @@ private struct ProfileSidebar: View {
                             .contentShape(.rect)
                     }
                     .help(localized("New 31-band profile"))
+                    .disabled(isReadOnly)
                     .accessibilityLabel(Text(localized("New 31-band profile")))
                     .accessibilityHint(Text(localized("Creates a 31-band graphic equalizer profile")))
 
@@ -675,6 +711,7 @@ private struct ProfileSidebar: View {
                             .contentShape(.rect)
                     }
                     .help(localized("New 10-band profile"))
+                    .disabled(isReadOnly)
                     .accessibilityLabel(Text(localized("New 10-band profile")))
                     .accessibilityHint(Text(localized("Creates a 10-band graphic equalizer profile")))
 
@@ -686,6 +723,7 @@ private struct ProfileSidebar: View {
                             .contentShape(.rect)
                     }
                     .help(localized("New parametric profile"))
+                    .disabled(isReadOnly)
                     .accessibilityLabel(Text(localized("New parametric profile")))
                     .accessibilityHint(Text(localized("Creates a parametric equalizer profile")))
 
@@ -699,6 +737,7 @@ private struct ProfileSidebar: View {
                             .contentShape(.rect)
                     }
                     .help(localized("Duplicate profile"))
+                    .disabled(isReadOnly)
                     .accessibilityLabel(Text(localized("Duplicate profile")))
                     .accessibilityHint(Text(localized("Copies the selected profile")))
 
@@ -760,6 +799,7 @@ private struct ProfileDetail: View {
     var onResetDiagnostics: () -> Void
     var onRetryAudioEngine: () -> Void
     var onOpenPrivacySettings: () -> Void
+    var onResetUnsupportedProfileStore: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -767,8 +807,19 @@ private struct ProfileDetail: View {
                 ProfileHeader(
                     snapshot: snapshot,
                     draftProfile: $draftProfile,
-                    tab: $tab
+                    tab: $tab,
+                    isReadOnly: isProfileStoreProtected
                 )
+            }
+
+            if isProfileStoreProtected {
+                constrainedContent {
+                    ProfileStoreProtectionBanner(
+                        protection: snapshot.profileStoreProtection,
+                        onReset: onResetUnsupportedProfileStore
+                    )
+                }
+                .fixedSize(horizontal: false, vertical: true)
             }
 
             ScrollView {
@@ -777,13 +828,20 @@ private struct ProfileDetail: View {
                         switch tab {
                         case .editor:
                             EditorTab(
-                                draftProfile: $draftProfile
+                                draftProfile: $draftProfile,
+                                sampleRate: snapshot.currentOutputSampleRate
                             )
+                            .disabled(isProfileStoreProtected)
                         case .importer:
-                            ImportTab(profile: draftProfile, onImport: onImport)
+                            ImportTab(
+                                profile: draftProfile,
+                                isReadOnly: isProfileStoreProtected,
+                                onImport: onImport
+                            )
                         case .output:
                             OutputTab(
                                 snapshot: snapshot,
+                                isProfileStoreProtected: isProfileStoreProtected,
                                 onUseForCurrentOutput: onUseForCurrentOutput,
                                 onSetFallback: onSetFallback,
                                 onResetDiagnostics: onResetDiagnostics,
@@ -809,6 +867,7 @@ private struct ProfileDetail: View {
                         hasUnsavedDraft: hasUnsavedDraft,
                         currentOutputUID: snapshot.currentOutputUID,
                         isPreviewing: snapshot.isPreviewing,
+                        isReadOnly: isProfileStoreProtected,
                         onApply: onApply,
                         onRevert: onRevert,
                         onPreview: onPreview,
@@ -834,12 +893,17 @@ private struct ProfileDetail: View {
             .frame(maxWidth: 860, alignment: .topLeading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
     }
+
+    private var isProfileStoreProtected: Bool {
+        snapshot.profileStoreProtection.isProtected
+    }
 }
 
 private struct ProfileHeader: View {
     var snapshot: SettingsSnapshot
     @Binding var draftProfile: EQProfile
     @Binding var tab: EditorSection
+    var isReadOnly: Bool
     @State private var isRenaming = false
 
     var body: some View {
@@ -850,6 +914,7 @@ private struct ProfileHeader: View {
                         TextField(localized("Profile name"), text: $draftProfile.name)
                             .textFieldStyle(.roundedBorder)
                             .frame(maxWidth: 280)
+                            .disabled(isReadOnly)
                             .accessibilityLabel(Text(localized("Profile name")))
                         Button(localized("Done")) {
                             isRenaming = false
@@ -869,6 +934,7 @@ private struct ProfileHeader: View {
                                 .contentShape(.rect)
                         }
                         .buttonStyle(.borderless)
+                        .disabled(isReadOnly)
                         .help(localized("Rename profile"))
                         .accessibilityLabel(Text(localized("Rename profile")))
                         .accessibilityHint(Text(localized("Edits the selected profile name")))
@@ -897,6 +963,34 @@ private struct ProfileHeader: View {
             .accessibilityHint(Text(localized("Switches between editor, import, and output details")))
         }
         .cardPanel(padding: 16)
+    }
+}
+
+private struct ProfileStoreProtectionBanner: View {
+    var protection: SettingsProfileStoreProtectionDTO
+    var onReset: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: "lock.fill")
+                .foregroundStyle(Color.orange)
+                .accessibilityHidden(true)
+            Text(protection.message)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            Button(role: .destructive) {
+                onReset()
+            } label: {
+                Label(protection.resetButtonTitle, systemImage: "arrow.counterclockwise")
+                    .frame(minHeight: 28)
+                    .contentShape(.rect)
+            }
+            .controlSize(.large)
+            .accessibilityLabel(Text(protection.resetButtonTitle))
+        }
+        .cardPanel(padding: 14)
     }
 }
 
@@ -948,13 +1042,20 @@ private extension EQChannelMode {
 
 private struct EditorTab: View {
     @Binding var draftProfile: EQProfile
+    var sampleRate: Double
     @State private var editChannel = EQEditChannel.left
     @State private var analysis: EQAnalysisSnapshot
     @State private var analysisTask: Task<Void, Never>?
 
-    init(draftProfile: Binding<EQProfile>) {
+    init(draftProfile: Binding<EQProfile>, sampleRate: Double) {
         self._draftProfile = draftProfile
-        self._analysis = State(initialValue: EQAnalysisSnapshot(profile: draftProfile.wrappedValue))
+        self.sampleRate = sampleRate
+        self._analysis = State(
+            initialValue: EQAnalysisSnapshot(
+                profile: draftProfile.wrappedValue,
+                sampleRate: sampleRate
+            )
+        )
     }
 
     var body: some View {
@@ -1070,12 +1171,13 @@ private struct EditorTab: View {
     }
 
     private var analysisSignature: EQAnalysisSignature {
-        EQAnalysisSignature(profile: draftProfile)
+        EQAnalysisSignature(profile: draftProfile, sampleRate: sampleRate)
     }
 
     private func refreshAnalysisIfNeeded(debounced: Bool) {
         let profile = draftProfile
-        let signature = EQAnalysisSignature(profile: profile)
+        let sampleRate = sampleRate
+        let signature = EQAnalysisSignature(profile: profile, sampleRate: sampleRate)
         guard analysis.signature != signature else {
             return
         }
@@ -1093,11 +1195,11 @@ private struct EditorTab: View {
             }
 
             let nextAnalysis = await Task.detached(priority: .userInitiated) {
-                EQAnalysisSnapshot(profile: profile)
+                EQAnalysisSnapshot(profile: profile, sampleRate: sampleRate)
             }.value
 
             guard !Task.isCancelled,
-                  EQAnalysisSignature(profile: draftProfile) == nextAnalysis.signature else {
+                  EQAnalysisSignature(profile: draftProfile, sampleRate: sampleRate) == nextAnalysis.signature else {
                 return
             }
             analysis = nextAnalysis
@@ -1210,6 +1312,7 @@ private struct ApplyBar: View {
     var hasUnsavedDraft: Bool
     var currentOutputUID: String
     var isPreviewing: Bool
+    var isReadOnly: Bool
     var onApply: () -> Void
     var onRevert: () -> Void
     var onPreview: () -> Void
@@ -1234,19 +1337,20 @@ private struct ApplyBar: View {
                 onApply()
             }
             .keyboardShortcut(.return, modifiers: .command)
-            .disabled(!hasUnsavedDraft)
+            .disabled(isReadOnly || !hasUnsavedDraft)
             .buttonStyle(ToolbarButtonStyle(prominent: true))
 
             Button(isPreviewing ? localized("Stop Preview") : localized("Preview")) {
                 isPreviewing ? onStopPreview() : onPreview()
             }
+            .disabled(isReadOnly && !isPreviewing)
             .buttonStyle(ToolbarButtonStyle())
             .accessibilityValue(Text(isPreviewing ? localized("Previewing") : localized("Not previewing")))
 
             Button(localized("Assign to current output")) {
                 onUseForCurrentOutput()
             }
-            .disabled(currentOutputUID.isEmpty)
+            .disabled(isReadOnly || currentOutputUID.isEmpty)
             .buttonStyle(ToolbarButtonStyle())
             .accessibilityHint(Text(currentOutputUID.isEmpty ? localized("No current output is available") : localized("Maps the selected profile to the current output device")))
         }
@@ -1677,6 +1781,7 @@ private struct SliderRow: View {
 
 private struct ImportTab: View {
     var profile: EQProfile
+    var isReadOnly: Bool
     var onImport: (ImportFormat, String, String) async -> Bool
     @State private var importFormat: ImportFormat
     @State private var importName: String
@@ -1684,8 +1789,9 @@ private struct ImportTab: View {
     @State private var isEditorVisible = false
     @State private var isImporting = false
 
-    init(profile: EQProfile, onImport: @escaping (ImportFormat, String, String) async -> Bool) {
+    init(profile: EQProfile, isReadOnly: Bool, onImport: @escaping (ImportFormat, String, String) async -> Bool) {
         self.profile = profile
+        self.isReadOnly = isReadOnly
         self.onImport = onImport
         _importFormat = State(initialValue: .autoEQ)
         _importName = State(initialValue: localized("Imported Profile"))
@@ -1776,7 +1882,7 @@ private struct ImportTab: View {
                         .frame(minHeight: 28)
                         .contentShape(.rect)
                 }
-                .disabled(!isEditorVisible || importText.isEmpty || isImporting)
+                .disabled(isReadOnly || !isEditorVisible || importText.isEmpty || isImporting)
                 .controlSize(.large)
             }
             .cardPanel(padding: 12)
@@ -1786,6 +1892,7 @@ private struct ImportTab: View {
 
 private struct OutputTab: View {
     var snapshot: SettingsSnapshot
+    var isProfileStoreProtected: Bool
     var onUseForCurrentOutput: () -> Void
     var onSetFallback: () -> Void
     var onResetDiagnostics: () -> Void
@@ -1817,12 +1924,13 @@ private struct OutputTab: View {
                         Button(localized("Use for this output")) {
                             onUseForCurrentOutput()
                         }
-                        .disabled(snapshot.currentOutputUID.isEmpty)
+                        .disabled(isProfileStoreProtected || snapshot.currentOutputUID.isEmpty)
                         .controlSize(.large)
 
                         Button(localized("Set as fallback profile")) {
                             onSetFallback()
                         }
+                        .disabled(isProfileStoreProtected)
                         .controlSize(.large)
                     }
                 }

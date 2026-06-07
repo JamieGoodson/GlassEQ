@@ -86,5 +86,7 @@ chmod +x "$SETTINGS_MACOS_DIR/$SETTINGS_APP_NAME"
 
 codesign --force --sign - --identifier com.glasseq.app.settings --entitlements "$ROOT_DIR/GlassEQSettings.entitlements" "$SETTINGS_APP_DIR" >/dev/null
 codesign --force --sign - --entitlements "$ROOT_DIR/GlassEQ.entitlements" "$APP_DIR" >/dev/null
+codesign --verify --strict --verbose=2 "$SETTINGS_APP_DIR" >/dev/null
+codesign --verify --strict --verbose=2 "$APP_DIR" >/dev/null
 
 echo "$APP_DIR"

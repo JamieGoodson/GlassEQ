@@ -31,7 +31,7 @@ struct ProfilePersistenceTests {
     }
 
     @Test
-    func loadLeavesInvalidOriginalUntouchedWhenBackupFails() throws {
+    func loadUsesUniqueInvalidBackupNameWhenTimestampCollides() throws {
         let url = try temporaryStoreURL()
         defer { removeTemporaryStoreDirectory(for: url) }
         let invalidData = Data("not json".utf8)
@@ -42,9 +42,14 @@ struct ProfilePersistenceTests {
 
         let result = ProfilePersistence.load(from: url, timestamp: timestamp)
 
-        #expect(result.status == .backupFailed)
+        guard case .recoveredDefaults(let recoveredBackupURL) = result.status else {
+            Issue.record("Expected invalid store recovery, got \(result.status)")
+            return
+        }
         #expect(result.store.profiles == ProfileStore.defaultProfiles)
-        #expect(try Data(contentsOf: url) == invalidData)
+        #expect(recoveredBackupURL != backupURL)
+        #expect(recoveredBackupURL.lastPathComponent.contains("-2"))
+        #expect(try Data(contentsOf: recoveredBackupURL) == invalidData)
         #expect(try Data(contentsOf: backupURL) == collisionData)
     }
 
@@ -63,6 +68,177 @@ struct ProfilePersistenceTests {
         }
         #expect((try Data(contentsOf: backupURL)).count == oversizedData.count)
         #expect(try ProfilePersistence.decode(Data(contentsOf: url)).profiles == ProfileStore.defaultProfiles)
+    }
+
+    @Test
+    func loadFutureSchemaUsesDefaultsWithoutModifyingStore() throws {
+        let url = try temporaryStoreURL()
+        defer { removeTemporaryStoreDirectory(for: url) }
+        let profile = EQProfile(name: "Future", mode: .parametric, filters: [])
+        let futureStore = ProfileStore(
+            schemaVersion: ProfileStore.currentSchemaVersion + 1,
+            profiles: [profile],
+            fallbackProfileID: profile.id
+        )
+        let data = try ProfilePersistence.encoder.encode(futureStore)
+        try data.write(to: url)
+
+        let result = ProfilePersistence.load(from: url, timestamp: timestamp)
+
+        #expect(result.store.profiles == ProfileStore.defaultProfiles)
+        #expect(result.status == .unsupportedSchemaVersion(
+            version: ProfileStore.currentSchemaVersion + 1,
+            maximumSupported: ProfileStore.currentSchemaVersion
+        ))
+        #expect(try Data(contentsOf: url) == data)
+    }
+
+    @Test
+    func loadRepairsInvalidProfileWithoutDroppingValidProfiles() throws {
+        let url = try temporaryStoreURL()
+        defer { removeTemporaryStoreDirectory(for: url) }
+        let valid = EQProfile(name: "Valid", mode: .parametric, filters: [])
+        let invalid = EQProfile(name: "", mode: .parametric, filters: [])
+        let store = ProfileStore(
+            profiles: [valid, invalid],
+            outputMappings: [
+                OutputDeviceProfileMapping(outputDeviceUID: "speaker", profileID: valid.id),
+                OutputDeviceProfileMapping(outputDeviceUID: "broken", profileID: invalid.id)
+            ],
+            fallbackProfileID: invalid.id
+        )
+        let invalidData = try ProfilePersistence.encoder.encode(store)
+        try invalidData.write(to: url)
+
+        let result = ProfilePersistence.load(from: url, timestamp: timestamp)
+
+        guard case .repairedInvalidStore(let backupURL, let summary) = result.status else {
+            Issue.record("Expected invalid profile repair, got \(result.status)")
+            return
+        }
+        #expect(try Data(contentsOf: backupURL) == invalidData)
+        #expect(result.store.profiles == [valid])
+        #expect(result.store.outputMappings == [OutputDeviceProfileMapping(outputDeviceUID: "speaker", profileID: valid.id)])
+        #expect(result.store.fallbackProfileID == valid.id)
+        #expect(summary.removedInvalidProfiles == 1)
+        #expect(summary.repairedFallbackProfileID)
+        #expect(summary.removedOutputMappings == 1)
+    }
+
+    @Test
+    func loadDropsProfileWithMalformedFilterWithoutResettingStore() throws {
+        let url = try temporaryStoreURL()
+        defer { removeTemporaryStoreDirectory(for: url) }
+        let valid = EQProfile(name: "Valid", mode: .parametric, filters: [])
+        let invalid = EQProfile(
+            name: "Malformed",
+            mode: .parametric,
+            filters: [EQFilter(kind: .peak, frequency: 1_000, gainDB: 1, q: 1)]
+        )
+        var invalidObject = try profileJSONObject(invalid)
+        var filters = try #require(invalidObject["filters"] as? [[String: Any]])
+        filters[0]["frequency"] = "not-a-number"
+        invalidObject["filters"] = filters
+        let invalidData = try rawStoreData(
+            profiles: [
+                try profileJSONObject(valid),
+                invalidObject
+            ],
+            outputMappings: [
+                OutputDeviceProfileMapping(outputDeviceUID: "speaker", profileID: valid.id),
+                OutputDeviceProfileMapping(outputDeviceUID: "broken", profileID: invalid.id)
+            ],
+            fallbackProfileID: invalid.id
+        )
+        try invalidData.write(to: url)
+
+        let result = ProfilePersistence.load(from: url, timestamp: timestamp)
+
+        guard case .repairedInvalidStore(let backupURL, let summary) = result.status else {
+            Issue.record("Expected malformed profile repair, got \(result.status)")
+            return
+        }
+        #expect(try Data(contentsOf: backupURL) == invalidData)
+        #expect(result.store.profiles == [valid])
+        #expect(result.store.outputMappings == [
+            OutputDeviceProfileMapping(outputDeviceUID: "speaker", profileID: valid.id)
+        ])
+        #expect(result.store.fallbackProfileID == valid.id)
+        #expect(summary.removedInvalidProfiles == 1)
+        #expect(summary.removedOutputMappings == 1)
+        #expect(summary.repairedFallbackProfileID)
+        #expect(try ProfilePersistence.decode(Data(contentsOf: url)) == result.store)
+    }
+
+    @Test
+    func loadRecoversDefaultsWhenAllProfilesFailRepairableDecode() throws {
+        let url = try temporaryStoreURL()
+        defer { removeTemporaryStoreDirectory(for: url) }
+        let invalid = EQProfile(
+            name: "Malformed",
+            mode: .parametric,
+            filters: [EQFilter(kind: .peak, frequency: 1_000, gainDB: 1, q: 1)]
+        )
+        var invalidObject = try profileJSONObject(invalid)
+        var filters = try #require(invalidObject["filters"] as? [[String: Any]])
+        filters[0]["q"] = "bad-q"
+        invalidObject["filters"] = filters
+        let invalidData = try rawStoreData(
+            profiles: [invalidObject],
+            outputMappings: [
+                OutputDeviceProfileMapping(outputDeviceUID: "broken", profileID: invalid.id)
+            ],
+            fallbackProfileID: invalid.id
+        )
+        try invalidData.write(to: url)
+
+        let result = ProfilePersistence.load(from: url, timestamp: timestamp)
+
+        guard case .recoveredDefaults(let backupURL) = result.status else {
+            Issue.record("Expected malformed store recovery, got \(result.status)")
+            return
+        }
+        #expect(try Data(contentsOf: backupURL) == invalidData)
+        #expect(result.store.profiles == ProfileStore.defaultProfiles)
+        #expect(try ProfilePersistence.decode(Data(contentsOf: url)).profiles == ProfileStore.defaultProfiles)
+    }
+
+    @Test
+    func loadRepairsDuplicateProfileIDsByKeepingFirstProfile() throws {
+        let url = try temporaryStoreURL()
+        defer { removeTemporaryStoreDirectory(for: url) }
+        let duplicateID = UUID()
+        let first = EQProfile(id: duplicateID, name: "First", mode: .parametric, filters: [])
+        let duplicate = EQProfile(id: duplicateID, name: "Duplicate", mode: .parametric, filters: [])
+        let valid = EQProfile(name: "Valid", mode: .parametric, filters: [])
+        let missingProfileID = UUID()
+        let store = ProfileStore(
+            profiles: [first, duplicate, valid],
+            outputMappings: [
+                OutputDeviceProfileMapping(outputDeviceUID: "speaker", profileID: duplicateID),
+                OutputDeviceProfileMapping(outputDeviceUID: "missing", profileID: missingProfileID)
+            ],
+            fallbackProfileID: missingProfileID
+        )
+        let invalidData = try ProfilePersistence.encoder.encode(store)
+        try invalidData.write(to: url)
+
+        let result = ProfilePersistence.load(from: url, timestamp: timestamp)
+
+        guard case .repairedInvalidStore(let backupURL, let summary) = result.status else {
+            Issue.record("Expected invalid store repair, got \(result.status)")
+            return
+        }
+        #expect(try Data(contentsOf: backupURL) == invalidData)
+        #expect(result.store.profiles == [first, valid])
+        #expect(result.store.outputMappings == [
+            OutputDeviceProfileMapping(outputDeviceUID: "speaker", profileID: duplicateID)
+        ])
+        #expect(result.store.fallbackProfileID == first.id)
+        #expect(summary.removedInvalidProfiles == 1)
+        #expect(summary.repairedFallbackProfileID)
+        #expect(summary.removedOutputMappings == 1)
+        #expect(try ProfilePersistence.decode(Data(contentsOf: url)) == result.store)
     }
 
     @Test
@@ -128,6 +304,14 @@ struct ProfilePersistenceTests {
         try expectValidationFailure(
             ProfileStore(profiles: [profile], fallbackProfileID: missingFallbackID),
             expected: .missingFallbackProfile(profileID: missingFallbackID)
+        )
+
+        let duplicateID = UUID()
+        let firstDuplicate = EQProfile(id: duplicateID, name: "First", mode: .parametric, filters: [])
+        let secondDuplicate = EQProfile(id: duplicateID, name: "Second", mode: .parametric, filters: [])
+        try expectValidationFailure(
+            ProfileStore(profiles: [firstDuplicate, secondDuplicate], fallbackProfileID: duplicateID),
+            expected: .duplicateProfileID(profileID: duplicateID)
         )
 
         let tooManyMappings = (0...ProfilePersistence.outputMappingCountRange.upperBound).map {
@@ -206,6 +390,21 @@ struct ProfilePersistenceTests {
             )
         )
 
+        let abovePolicyFrequency = EQProfile(
+            name: "Above Policy Frequency",
+            mode: .parametric,
+            filters: [EQFilter(kind: .peak, frequency: 24_001, gainDB: 0, q: 1)]
+        )
+        try expectValidationFailure(
+            ProfileStore(profiles: [abovePolicyFrequency], fallbackProfileID: abovePolicyFrequency.id),
+            expected: .valueOutOfRange(
+                profileID: abovePolicyFrequency.id,
+                field: "frequency",
+                value: 24_001,
+                range: ProfilePersistence.frequencyRange
+            )
+        )
+
         let tooManyFilters = EQProfile(
             name: "Too Many",
             mode: .parametric,
@@ -220,6 +419,23 @@ struct ProfilePersistenceTests {
                 channel: "linked",
                 count: ProfilePersistence.maxActiveFiltersPerChannel + 1,
                 maximum: ProfilePersistence.maxActiveFiltersPerChannel
+            )
+        )
+
+        let tooManyDisabledFilters = EQProfile(
+            name: "Too Many Disabled",
+            mode: .parametric,
+            filters: (0...ProfilePersistence.maxFiltersPerChannel).map {
+                EQFilter(kind: .peak, frequency: Double($0 + 1), gainDB: 0, q: 1, isEnabled: false)
+            }
+        )
+        try expectValidationFailure(
+            ProfileStore(profiles: [tooManyDisabledFilters], fallbackProfileID: tooManyDisabledFilters.id),
+            expected: .tooManyFilters(
+                profileID: tooManyDisabledFilters.id,
+                channel: "linked",
+                count: ProfilePersistence.maxFiltersPerChannel + 1,
+                maximum: ProfilePersistence.maxFiltersPerChannel
             )
         )
     }
@@ -262,5 +478,27 @@ struct ProfilePersistenceTests {
 
     private func removeTemporaryStoreDirectory(for url: URL) {
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+    }
+
+    private func profileJSONObject(_ profile: EQProfile) throws -> [String: Any] {
+        let object = try JSONSerialization.jsonObject(with: ProfilePersistence.encoder.encode(profile))
+        return try #require(object as? [String: Any])
+    }
+
+    private func rawStoreData(
+        profiles: [[String: Any]],
+        outputMappings: [OutputDeviceProfileMapping],
+        fallbackProfileID: UUID
+    ) throws -> Data {
+        let mappingObject = try JSONSerialization.jsonObject(
+            with: ProfilePersistence.encoder.encode(outputMappings)
+        )
+        let object: [String: Any] = [
+            "schemaVersion": ProfileStore.currentSchemaVersion,
+            "profiles": profiles,
+            "outputMappings": try #require(mappingObject as? [[String: Any]]),
+            "fallbackProfileID": fallbackProfileID.uuidString
+        ]
+        return try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
     }
 }

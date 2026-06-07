@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  swift:
+    name: Swift build and tests
+    runs-on: macos-26
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
+
+      - name: Build release app bundle
+        run: ./Scripts/build-release-app.sh
+
+      - name: Verify signatures
+        run: |
+          codesign --verify --strict --verbose=2 .build/release-app/GlassEQ.app/Contents/Helpers/GlassEQSettings.app
+          codesign --verify --strict --verbose=2 .build/release-app/GlassEQ.app

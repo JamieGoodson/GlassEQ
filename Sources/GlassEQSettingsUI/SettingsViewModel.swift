@@ -63,6 +63,9 @@ public final class GlassEQSettingsViewModel {
             snapshot.currentOutputChannelCount = currentOutput.channelCount
             snapshot.currentOutputBufferFrameSize = currentOutput.bufferFrameSize
         }
+        if let profileStoreProtection = patch.profileStoreProtection {
+            snapshot.profileStoreProtection = profileStoreProtection
+        }
         switch patch.currentOutputMappedProfileID {
         case .set(let profileID):
             snapshot.currentOutputMappedProfileID = profileID

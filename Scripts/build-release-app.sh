@@ -19,8 +19,12 @@ APP_NAME="GlassEQ"
 APP_TARGET="GlassEQApp"
 SETTINGS_APP_NAME="GlassEQSettings"
 SETTINGS_APP_TARGET="GlassEQSettings"
-VERSION="${VERSION:-0.7.0}"
-BUILD="${BUILD:-9}"
+source_plist_value() {
+    /usr/libexec/PlistBuddy -c "Print :$1" "$2"
+}
+
+VERSION="${VERSION:-$(source_plist_value CFBundleShortVersionString "$ROOT_DIR/Sources/GlassEQApp/Info.plist")}"
+BUILD="${BUILD:-$(source_plist_value CFBundleVersion "$ROOT_DIR/Sources/GlassEQApp/Info.plist")}"
 RELEASE_CHANNEL="${RELEASE_CHANNEL:-alpha}"
 ARCH="${ARCH:-arm64}"
 RELEASE_LABEL="${RELEASE_LABEL:-}"
@@ -258,8 +262,8 @@ else
         "$APP_DIR" >/dev/null
 fi
 
-codesign --verify --strict --deep --verbose=2 "$SETTINGS_APP_DIR" >/dev/null
-codesign --verify --strict --deep --verbose=2 "$APP_DIR" >/dev/null
+codesign --verify --strict --verbose=2 "$SETTINGS_APP_DIR" >/dev/null
+codesign --verify --strict --verbose=2 "$APP_DIR" >/dev/null
 
 if [[ "$RELEASE_CHANNEL" == "production" ]]; then
     NOTARY_ZIP="$DIST_DIR/$APP_NAME-$RELEASE_LABEL-macos26-$ARCH-notary-submit.zip"
@@ -267,8 +271,8 @@ if [[ "$RELEASE_CHANNEL" == "production" ]]; then
     ditto -c -k --keepParent --norsrc --noextattr --noqtn --noacl "$APP_DIR" "$NOTARY_ZIP"
     xcrun notarytool submit "$NOTARY_ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
     xcrun stapler staple "$APP_DIR"
-    codesign --verify --strict --deep --verbose=2 "$SETTINGS_APP_DIR" >/dev/null
-    codesign --verify --strict --deep --verbose=2 "$APP_DIR" >/dev/null
+    codesign --verify --strict --verbose=2 "$SETTINGS_APP_DIR" >/dev/null
+    codesign --verify --strict --verbose=2 "$APP_DIR" >/dev/null
     spctl --assess --type execute --verbose=4 "$APP_DIR"
 fi
 

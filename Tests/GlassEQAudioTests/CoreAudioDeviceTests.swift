@@ -59,6 +59,27 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
+    func unsupportedRuntimeChannelCountSkipsDevicePreparation() {
+        var didPrepareDevice = false
+
+        do {
+            _ = try SystemTapAudioEngine.performAfterRuntimeChannelValidation(
+                for: output(channelCount: 6, sampleRate: 44_100)
+            ) {
+                didPrepareDevice = true
+                return output(channelCount: 6, sampleRate: 48_000)
+            }
+            Issue.record("Expected multichannel output to be rejected")
+        } catch let error as AudioDeviceAvailabilityError {
+            #expect(error == .unsupportedOutputChannelCount(42, 6))
+        } catch {
+            Issue.record("Expected unsupported channel count error, got \(error)")
+        }
+
+        #expect(!didPrepareDevice)
+    }
+
+    @Test
     func outputDeviceUIDLookupResolvesDefaultOutput() throws {
         let defaultOutput = try CoreAudioDeviceQuery.defaultOutputDevice()
         let resolvedOutput = try #require(try CoreAudioDeviceQuery.outputDevice(uid: defaultOutput.uid))
@@ -66,6 +87,55 @@ struct CoreAudioDeviceTests {
         #expect(resolvedOutput.uid == defaultOutput.uid)
         #expect(resolvedOutput.outputChannelCount > 0)
         #expect(try CoreAudioDeviceQuery.outputDevice(uid: "") == nil)
+    }
+
+    @Test
+    func sampleRateMutationRecordsRestorationBeforeDeviceWrite() throws {
+        let output = output(uid: "record-before-set", channelCount: 2, sampleRate: 44_100)
+        var events: [String] = []
+
+        try SystemTapAudioEngine.setSampleRateAfterRecordingRestoration(
+            48_000,
+            on: output,
+            needsRestoration: true,
+            recordRestoration: { restoration in
+                #expect(restoration.uid == output.uid)
+                #expect(restoration.originalSampleRate == 44_100)
+                events.append("record")
+            },
+            installRestoration: { restoration in
+                #expect(restoration.uid == output.uid)
+                events.append("install")
+            },
+            setSampleRate: { sampleRate, objectID in
+                #expect(sampleRate == 48_000)
+                #expect(objectID == output.id)
+                events.append("set")
+            }
+        )
+
+        #expect(events == ["record", "install", "set"])
+    }
+
+    @Test
+    func sampleRateMutationSkipsDeviceWriteWhenRestorationRecordFails() {
+        let output = output(uid: "record-fails", channelCount: 2, sampleRate: 44_100)
+        var didInstall = false
+        var didSet = false
+
+        #expect(throws: TestDeviceMutationError.recordFailed) {
+            try SystemTapAudioEngine.setSampleRateAfterRecordingRestoration(
+                48_000,
+                on: output,
+                needsRestoration: true,
+                recordRestoration: { _ in throw TestDeviceMutationError.recordFailed },
+                installRestoration: { _ in didInstall = true },
+                setSampleRate: { _, _ in didSet = true }
+            )
+        }
+
+        #expect(!didInstall)
+        #expect(!didSet)
     }
 
     @Test
@@ -182,6 +252,97 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
+    func persistedDeviceRestorationRestoresAndClearsVerifiedSettings() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GlassEQDeviceRestoration-\(UUID().uuidString).json")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+        }
+        try PersistedAudioDeviceRestorationStore.recordSampleRate(uid: "dac", originalSampleRate: 48_000, at: url)
+        try PersistedAudioDeviceRestorationStore.recordBufferFrameSize(uid: "dac", originalFrameSize: 256, at: url)
+        var sampleRate = 44_100.0
+        var frameSize: UInt32 = 512
+
+        SystemTapAudioEngine.restorePersistedDeviceSettings(
+            at: url,
+            outputForUID: { uid in
+                output(uid: uid, channelCount: 2, sampleRate: sampleRate, bufferFrameSize: frameSize)
+            },
+            setSampleRate: { nextSampleRate, _ in
+                sampleRate = nextSampleRate
+            },
+            setBufferFrameSize: { nextFrameSize, _ in
+                frameSize = nextFrameSize
+            }
+        )
+
+        #expect(PersistedAudioDeviceRestorationStore.load(from: url).isEmpty)
+        #expect(sampleRate == 48_000)
+        #expect(frameSize == 256)
+    }
+
+    @Test
+    func persistedDeviceRestorationKeepsUnavailableDeviceRecords() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GlassEQDeviceRestoration-\(UUID().uuidString).json")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+        }
+        try PersistedAudioDeviceRestorationStore.recordSampleRate(uid: "missing", originalSampleRate: 48_000, at: url)
+
+        SystemTapAudioEngine.restorePersistedDeviceSettings(
+            at: url,
+            outputForUID: { _ in nil },
+            setSampleRate: { _, _ in Issue.record("Unexpected sample-rate write") },
+            setBufferFrameSize: { _, _ in Issue.record("Unexpected buffer-size write") }
+        )
+
+        #expect(PersistedAudioDeviceRestorationStore.load(from: url)["missing"]?.originalSampleRate == 48_000)
+    }
+
+    @Test
+    func persistedDeviceRestorationDoesNotOverwritePendingOriginals() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GlassEQDeviceRestoration-\(UUID().uuidString).json")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+        }
+
+        try PersistedAudioDeviceRestorationStore.recordSampleRate(uid: "dac", originalSampleRate: 48_000, at: url)
+        try PersistedAudioDeviceRestorationStore.recordSampleRate(uid: "dac", originalSampleRate: 44_100, at: url)
+        try PersistedAudioDeviceRestorationStore.recordBufferFrameSize(uid: "dac", originalFrameSize: 256, at: url)
+        try PersistedAudioDeviceRestorationStore.recordBufferFrameSize(uid: "dac", originalFrameSize: 512, at: url)
+
+        let record = try #require(PersistedAudioDeviceRestorationStore.load(from: url)["dac"])
+        #expect(record.originalSampleRate == 48_000)
+        #expect(record.originalBufferFrameSize == 256)
+    }
+
+    @Test
+    func persistedDeviceRestorationFoldsDuplicateUIDRecordsWithoutTrapping() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GlassEQDeviceRestoration-\(UUID().uuidString).json")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+        }
+        let records = [
+            PersistedAudioDeviceRestorationRecord(uid: "dac", originalSampleRate: 48_000),
+            PersistedAudioDeviceRestorationRecord(uid: "dac", originalSampleRate: 44_100),
+            PersistedAudioDeviceRestorationRecord(uid: "dac", originalBufferFrameSize: 256),
+            PersistedAudioDeviceRestorationRecord(uid: "dac", originalBufferFrameSize: 512),
+            PersistedAudioDeviceRestorationRecord(uid: "headphones", originalBufferFrameSize: 1_024)
+        ]
+        try JSONEncoder().encode(records).write(to: url)
+
+        let loaded = PersistedAudioDeviceRestorationStore.load(from: url)
+
+        let dac = try #require(loaded["dac"])
+        #expect(dac.originalSampleRate == 48_000)
+        #expect(dac.originalBufferFrameSize == 256)
+        #expect(loaded["headphones"]?.originalBufferFrameSize == 1_024)
+    }
+
+    @Test
     func monoRuntimeOutputDownmixesStereoInsteadOfUsingLeftOnly() {
         let samples: [Float] = [
             1, 3,
@@ -196,6 +357,35 @@ struct CoreAudioDeviceTests {
             #expect(SystemTapAudioEngine.monoDownmix(pointer, frame: -1, sourceChannelCount: 2) == 0)
             #expect(SystemTapAudioEngine.monoDownmix(pointer, frame: 99, sourceChannelCount: 2) == 0)
         }
+    }
+
+    @Test
+    func monoSourceDuplicatesIntoSingleInterleavedStereoOutputBuffer() {
+        let samples: [Float] = [1, 2]
+        var destination: [Float] = [-1, -1, -1, -1, -1, -1]
+
+        samples.withUnsafeBufferPointer { source in
+            destination.withUnsafeMutableBufferPointer { destinationBuffer in
+                let audioBuffer = AudioBuffer(
+                    mNumberChannels: 2,
+                    mDataByteSize: UInt32(destinationBuffer.count * MemoryLayout<Float>.stride),
+                    mData: destinationBuffer.baseAddress
+                )
+                var audioBufferList = AudioBufferList(mNumberBuffers: 1, mBuffers: audioBuffer)
+                withUnsafeMutablePointer(to: &audioBufferList) { audioBufferListPointer in
+                    SystemTapAudioEngine.copyInterleavedSamples(
+                        source,
+                        sourceFrameOffset: 0,
+                        destinationFrameOffset: 1,
+                        frameCount: 2,
+                        sourceChannelCount: 1,
+                        to: UnsafeMutableAudioBufferListPointer(audioBufferListPointer)
+                    )
+                }
+            }
+        }
+
+        #expect(destination == [-1, -1, 1, 1, 2, 2])
     }
 
     @Test
@@ -285,6 +475,49 @@ struct CoreAudioDeviceTests {
             deviceID: 42,
             selfChangeGuard: changeGuard
         ))
+    }
+
+    @Test
+    func refreshCoalescerRunsOnlyLatestScheduledAction() {
+        let queue = DispatchQueue(label: "com.glasseq.tests.refresh-coalescer")
+        let coalescer = DispatchRefreshCoalescer(queue: queue, delay: .milliseconds(10))
+        let counter = LockedCounter()
+
+        queue.sync {
+            coalescer.schedule {
+                counter.increment()
+            }
+            coalescer.schedule {
+                counter.increment()
+            }
+            coalescer.schedule {
+                counter.increment()
+            }
+        }
+
+        Thread.sleep(forTimeInterval: 0.05)
+        queue.sync {}
+
+        #expect(counter.value == 1)
+    }
+
+    @Test
+    func refreshCoalescerCancelSuppressesPendingAction() {
+        let queue = DispatchQueue(label: "com.glasseq.tests.refresh-coalescer-cancel")
+        let coalescer = DispatchRefreshCoalescer(queue: queue, delay: .milliseconds(10))
+        let counter = LockedCounter()
+
+        queue.sync {
+            coalescer.schedule {
+                counter.increment()
+            }
+            coalescer.cancelPending()
+        }
+
+        Thread.sleep(forTimeInterval: 0.05)
+        queue.sync {}
+
+        #expect(counter.value == 0)
     }
 
     @Test
@@ -436,6 +669,29 @@ struct CoreAudioDeviceTests {
             bufferFrameSize: bufferFrameSize,
             transportType: transportType
         )
+    }
+}
+
+private enum TestDeviceMutationError: Error {
+    case recordFailed
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return count
     }
 }
 

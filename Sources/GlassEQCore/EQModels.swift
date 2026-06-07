@@ -180,42 +180,81 @@ public struct ProfileStoreRepairSummary: Equatable, Sendable {
     public var repairedFallbackProfileID: Bool
     public var removedOutputMappings: Int
     public var deduplicatedOutputMappings: Int
+    public var removedInvalidProfiles: Int
 
     public var didRepair: Bool {
         restoredDefaultProfiles ||
             repairedFallbackProfileID ||
             removedOutputMappings > 0 ||
-            deduplicatedOutputMappings > 0
+            deduplicatedOutputMappings > 0 ||
+            removedInvalidProfiles > 0
     }
 
     public init(
         restoredDefaultProfiles: Bool = false,
         repairedFallbackProfileID: Bool = false,
         removedOutputMappings: Int = 0,
-        deduplicatedOutputMappings: Int = 0
+        deduplicatedOutputMappings: Int = 0,
+        removedInvalidProfiles: Int = 0
     ) {
         self.restoredDefaultProfiles = restoredDefaultProfiles
         self.repairedFallbackProfileID = repairedFallbackProfileID
         self.removedOutputMappings = removedOutputMappings
         self.deduplicatedOutputMappings = deduplicatedOutputMappings
+        self.removedInvalidProfiles = removedInvalidProfiles
+    }
+
+    mutating func merge(_ other: ProfileStoreRepairSummary) {
+        restoredDefaultProfiles = restoredDefaultProfiles || other.restoredDefaultProfiles
+        repairedFallbackProfileID = repairedFallbackProfileID || other.repairedFallbackProfileID
+        removedOutputMappings += other.removedOutputMappings
+        deduplicatedOutputMappings += other.deduplicatedOutputMappings
+        removedInvalidProfiles += other.removedInvalidProfiles
     }
 }
 
 public struct ProfileStore: Codable, Equatable, Sendable {
+    public static let currentSchemaVersion = 1
     public static let defaultProfiles: [EQProfile] = [.flatGraphic31, .flatGraphic10, .flatParametric]
 
+    public var schemaVersion: Int
     public var profiles: [EQProfile]
     public var outputMappings: [OutputDeviceProfileMapping]
     public var fallbackProfileID: UUID
 
     public init(
+        schemaVersion: Int = ProfileStore.currentSchemaVersion,
         profiles: [EQProfile] = ProfileStore.defaultProfiles,
         outputMappings: [OutputDeviceProfileMapping] = [],
         fallbackProfileID: UUID? = nil
     ) {
+        self.schemaVersion = schemaVersion
         self.profiles = profiles
         self.outputMappings = outputMappings
         self.fallbackProfileID = fallbackProfileID ?? profiles.first?.id ?? EQProfile.flatParametric.id
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case profiles
+        case outputMappings
+        case fallbackProfileID
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? Self.currentSchemaVersion
+        profiles = try container.decode([EQProfile].self, forKey: .profiles)
+        outputMappings = try container.decode([OutputDeviceProfileMapping].self, forKey: .outputMappings)
+        fallbackProfileID = try container.decode(UUID.self, forKey: .fallbackProfileID)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(profiles, forKey: .profiles)
+        try container.encode(outputMappings, forKey: .outputMappings)
+        try container.encode(fallbackProfileID, forKey: .fallbackProfileID)
     }
 
     @discardableResult

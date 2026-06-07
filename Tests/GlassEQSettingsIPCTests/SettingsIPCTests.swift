@@ -1,9 +1,9 @@
 import Foundation
 import GlassEQCore
 import GlassEQSettingsIPC
-import GlassEQSettingsUI
 import Testing
 @testable import GlassEQSettings
+@testable import GlassEQSettingsUI
 
 @Suite
 struct SettingsIPCTests {
@@ -16,6 +16,17 @@ struct SettingsIPCTests {
 
         #expect(decoded == message)
         try decoded.validateSessionToken("token")
+    }
+
+    @Test
+    func pipeMessageRoundTripsBootstrapToken() throws {
+        let message = SettingsPipeMessage.bootstrap(sessionToken: "bootstrap-token")
+
+        let encoded = try SettingsPipeCodec.encodeLine(message)
+        let decoded = try SettingsPipeCodec.decodeLine(Data(encoded.dropLast()))
+
+        #expect(decoded == message)
+        try decoded.validateSessionToken("bootstrap-token")
     }
 
     @Test
@@ -68,11 +79,51 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func settingsAnalysisUsesCurrentOutputSampleRateWithFallback() {
+        let profile = EQProfile(
+            name: "Analysis",
+            mode: .parametric,
+            filters: [
+                EQFilter(kind: .peak, frequency: 20_000, gainDB: 8, q: 8)
+            ]
+        )
+
+        let routeAnalysis = EQAnalysisSnapshot(profile: profile, sampleRate: 44_100)
+        let fallbackAnalysis = EQAnalysisSnapshot(profile: profile, sampleRate: 0)
+
+        #expect(routeAnalysis.signature.sampleRate == 44_100)
+        #expect(fallbackAnalysis.signature.sampleRate == EQAnalysisSignature.defaultSampleRate)
+        #expect(routeAnalysis.signature != fallbackAnalysis.signature)
+        #expect(routeAnalysis.linkedPoints == FrequencyResponse.points(
+            for: profile.filters,
+            preampDB: profile.preampDB,
+            sampleRate: 44_100
+        ))
+        #expect(routeAnalysis.recommendedPreampDB == EQProfileAnalysis.recommendedPreampDB(
+            profile: profile,
+            sampleRate: 44_100
+        ))
+    }
+
+    @Test
     func pipeMessageRejectsMismatchedSessionToken() throws {
         let message = SettingsPipeMessage.event(sessionToken: "actual", event: .shutdown)
 
         #expect(throws: SettingsPipeError.sessionTokenMismatch) {
             try message.validateSessionToken("expected")
+        }
+    }
+
+    @Test
+    func pipeMessageValidatesUTF8TokenBytes() throws {
+        let message = SettingsPipeMessage.event(sessionToken: "å-token", event: .shutdown)
+
+        try message.validateSessionToken("å-token")
+        #expect(throws: SettingsPipeError.sessionTokenMismatch) {
+            try message.validateSessionToken("å-tokem")
+        }
+        #expect(throws: SettingsPipeError.sessionTokenMismatch) {
+            try message.validateSessionToken("å-token-extra")
         }
     }
 
@@ -104,6 +155,228 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func pipeReadPumpPreservesChunkOrder() throws {
+        let first = SettingsPipeMessage.bootstrap(sessionToken: "token")
+        let second = SettingsPipeMessage.request(sessionToken: "token", id: "request-1", kind: .connect, command: nil)
+        let third = SettingsPipeMessage.event(sessionToken: "token", event: .shutdown)
+        let firstLine = try SettingsPipeCodec.encodeLine(first)
+        let secondLine = try SettingsPipeCodec.encodeLine(second)
+        let thirdLine = try SettingsPipeCodec.encodeLine(third)
+        let splitIndex = firstLine.index(firstLine.startIndex, offsetBy: firstLine.count / 2)
+        let recorder = SettingsPipePumpRecorder(expectedMessageCount: 3)
+        let pipe = Pipe()
+        let pump = SettingsPipeReadPump(
+            label: "com.glasseq.tests.settings-pipe-read-pump",
+            onMessages: { recorder.record($0) },
+            onEndOfFile: { recorder.recordEndOfFile() }
+        )
+
+        pump.install(on: pipe.fileHandleForReading)
+        defer {
+            pump.invalidate(handle: pipe.fileHandleForReading)
+            try? pipe.fileHandleForReading.close()
+            try? pipe.fileHandleForWriting.close()
+        }
+
+        try pipe.fileHandleForWriting.write(contentsOf: Data(firstLine[..<splitIndex]))
+        try pipe.fileHandleForWriting.write(contentsOf: Data(firstLine[splitIndex...]) + secondLine + thirdLine)
+
+        #expect(recorder.waitForMessages(timeout: .now() + 2))
+        let snapshot = recorder.snapshot()
+        #expect(snapshot.messages == [first, second, third])
+        #expect(snapshot.errorCount == 0)
+    }
+
+    @Test
+    func pipeWritePumpEnqueueDoesNotBlockOnSlowSink() {
+        let sink = BlockingSettingsPipeWriteSink()
+        let completion = DispatchSemaphore(value: 0)
+        let pump = SettingsPipeWritePump(
+            label: "com.glasseq.tests.settings-pipe-write-pump.blocking",
+            sink: SettingsPipeWriteSink { data in
+                sink.write(data)
+            }
+        )
+        let message = SettingsPipeMessage.event(sessionToken: "token", event: .shutdown)
+
+        let start = Date()
+        pump.enqueue(message) { _ in
+            completion.signal()
+        }
+        let elapsed = Date().timeIntervalSince(start)
+
+        #expect(elapsed < 0.05)
+        #expect(sink.waitUntilWriteStarted(timeout: .now() + 1))
+        sink.unblock()
+        #expect(completion.wait(timeout: .now() + 1) == .success)
+    }
+
+    @Test
+    func pipeWritePumpPreservesFIFOOrder() {
+        let recorder = SettingsPipeWriteRecorder(expectedWriteCount: 3)
+        let pump = SettingsPipeWritePump(
+            label: "com.glasseq.tests.settings-pipe-write-pump.order",
+            sink: SettingsPipeWriteSink { data in
+                try recorder.write(data)
+            }
+        )
+        let messages: [SettingsPipeMessage] = [
+            .bootstrap(sessionToken: "token"),
+            .request(sessionToken: "token", id: "request-1", kind: .connect, command: nil),
+            .event(sessionToken: "token", event: .shutdown)
+        ]
+
+        for message in messages {
+            pump.enqueue(message) { result in
+                recorder.recordCompletion(result)
+            }
+        }
+
+        #expect(recorder.waitForCompletions(timeout: .now() + 2))
+        let snapshot = recorder.snapshot()
+        #expect(snapshot.messages == messages)
+        #expect(snapshot.successCount == 3)
+        #expect(snapshot.errorCount == 0)
+    }
+
+    @Test
+    func pipeWritePumpReportsWriteFailure() {
+        let recorder = SettingsPipeWriteRecorder(expectedWriteCount: 1)
+        let pump = SettingsPipeWritePump(
+            label: "com.glasseq.tests.settings-pipe-write-pump.failure",
+            sink: SettingsPipeWriteSink { _ in
+                throw SettingsPipeWriteTestError.failed
+            }
+        )
+
+        let start = Date()
+        pump.enqueue(.event(sessionToken: "token", event: .shutdown)) { result in
+            recorder.recordCompletion(result)
+        }
+        let elapsed = Date().timeIntervalSince(start)
+
+        #expect(elapsed < 0.05)
+        #expect(recorder.waitForCompletions(timeout: .now() + 1))
+        let snapshot = recorder.snapshot()
+        #expect(snapshot.messages.isEmpty)
+        #expect(snapshot.successCount == 0)
+        #expect(snapshot.errorCount == 1)
+    }
+
+    @Test
+    func pipeWritePumpReportsBrokenPipeWithoutSIGPIPETermination() throws {
+        let pipe = Pipe()
+        try pipe.fileHandleForReading.close()
+        defer {
+            try? pipe.fileHandleForWriting.close()
+        }
+        let completion = SettingsPipeResultRecorder()
+        let pump = SettingsPipeWritePump(
+            label: "com.glasseq.tests.settings-pipe-write-pump.closed-pipe",
+            fileHandle: pipe.fileHandleForWriting
+        )
+
+        pump.enqueue(.event(sessionToken: "token", event: .shutdown)) { result in
+            completion.record(result)
+        }
+
+        #expect(completion.wait(timeout: .now() + 2))
+        guard case .failure = completion.result else {
+            Issue.record("Expected broken pipe write to fail")
+            return
+        }
+    }
+
+    @Test
+    func pipeWritePumpDrainClosesAfterQueuedWritesFinish() {
+        let sink = BlockingSettingsPipeWriteSink()
+        let writeCompletion = SettingsPipeResultRecorder()
+        let drainCompletion = SettingsPipeResultRecorder()
+        let pump = SettingsPipeWritePump(
+            label: "com.glasseq.tests.settings-pipe-write-pump.drain",
+            sink: SettingsPipeWriteSink(
+                { data in
+                    sink.write(data)
+                },
+                close: {
+                    sink.close()
+                }
+            )
+        )
+
+        pump.enqueue(.event(sessionToken: "token", event: .shutdown)) { result in
+            writeCompletion.record(result)
+        }
+        #expect(sink.waitUntilWriteStarted(timeout: .now() + 1))
+
+        pump.drainAndClose { result in
+            drainCompletion.record(result)
+        }
+
+        #expect(!sink.waitUntilClosed(timeout: .now() + 0.05))
+        sink.unblock()
+
+        #expect(writeCompletion.wait(timeout: .now() + 1))
+        #expect(drainCompletion.wait(timeout: .now() + 1))
+        #expect(sink.closeCount == 1)
+        #expect(writeCompletion.result?.isSuccess == true)
+        #expect(drainCompletion.result?.isSuccess == true)
+    }
+
+    @Test
+    func pipeWritePumpRejectsEnqueueAfterDrain() {
+        let sink = BlockingSettingsPipeWriteSink()
+        let drainCompletion = SettingsPipeResultRecorder()
+        let enqueueCompletion = SettingsPipeResultRecorder()
+        let pump = SettingsPipeWritePump(
+            label: "com.glasseq.tests.settings-pipe-write-pump.closed",
+            sink: SettingsPipeWriteSink(
+                { _ in },
+                close: {
+                    sink.close()
+                }
+            )
+        )
+
+        pump.drainAndClose { result in
+            drainCompletion.record(result)
+        }
+        #expect(drainCompletion.wait(timeout: .now() + 1))
+
+        pump.enqueue(.event(sessionToken: "token", event: .shutdown)) { result in
+            enqueueCompletion.record(result)
+        }
+
+        #expect(enqueueCompletion.wait(timeout: .now() + 1))
+        #expect(sink.closeCount == 1)
+        #expect(enqueueCompletion.result?.isClosedPipePumpFailure == true)
+    }
+
+    @Test
+    func orderedMainActorDeliveryPreservesCallbackOrder() {
+        let delivery = SettingsPipeOrderedMainActorDelivery(
+            label: "com.glasseq.tests.settings-pipe-delivery.order"
+        )
+        let recorder = OrderedDeliveryRecorder(expectedCount: 4)
+
+        delivery.enqueue {
+            recorder.record("messages-1")
+        }
+        delivery.enqueue {
+            recorder.record("failure")
+        }
+        delivery.enqueue {
+            recorder.record("messages-2")
+        }
+        delivery.enqueue {
+            recorder.record("eof")
+        }
+
+        #expect(recorder.wait(timeout: .now() + 2))
+        #expect(recorder.events == ["messages-1", "failure", "messages-2", "eof"])
+    }
+
+    @Test
     func pipeLineBufferRejectsOversizedUnterminatedFrame() throws {
         var buffer = SettingsPipeLineBuffer(maximumLineBytes: 4)
 
@@ -126,7 +399,12 @@ struct SettingsIPCTests {
                 channelCount: 2,
                 bufferFrameSize: 256
             ),
-            currentOutputMappedProfileID: .set(profileID)
+            currentOutputMappedProfileID: .set(profileID),
+            profileStoreProtection: SettingsProfileStoreProtectionDTO(
+                isProtected: true,
+                message: "Newer store",
+                resetButtonTitle: "Reset profiles for this version"
+            )
         )
         let message = SettingsPipeMessage.event(sessionToken: "token", event: .snapshotPatched(patch))
 
@@ -139,7 +417,6 @@ struct SettingsIPCTests {
     func settingsHostValidationChecksProcessParentAndBundleID() throws {
         let launchInfo = try #require(SettingsLaunchInfo(commandLineArguments: [
             "GlassEQSettings",
-            "--glasseq-settings-token", "token",
             "--glasseq-main-pid", "123"
         ]))
 
@@ -192,12 +469,12 @@ struct SettingsIPCTests {
 
         coordinator.attach(model: model)
         #expect(model.commandErrorMessage == nil)
-        coordinator.finishLaunching(arguments: launchArguments(token: "token-before"))
+        coordinator.finishLaunching(arguments: launchArguments())
         await coordinator.waitForConnectionTask()
 
         #expect(model.isConnected)
         #expect(model.commandErrorMessage == nil)
-        #expect(factory.launchInfos.map(\.token) == ["token-before"])
+        #expect(factory.launchInfos.map(\.mainProcessIdentifier) == [123])
     }
 
     @Test
@@ -207,13 +484,13 @@ struct SettingsIPCTests {
         let coordinator = SettingsLaunchCoordinator(clientFactory: factory)
         let model = GlassEQSettingsViewModel()
 
-        coordinator.finishLaunching(arguments: launchArguments(token: "token-after"))
+        coordinator.finishLaunching(arguments: launchArguments())
         coordinator.attach(model: model)
         await coordinator.waitForConnectionTask()
 
         #expect(model.isConnected)
         #expect(model.commandErrorMessage == nil)
-        #expect(factory.launchInfos.map(\.token) == ["token-after"])
+        #expect(factory.launchInfos.map(\.mainProcessIdentifier) == [123])
     }
 
     @Test
@@ -240,7 +517,7 @@ struct SettingsIPCTests {
         let coordinator = SettingsLaunchCoordinator(clientFactory: factory)
         let model = GlassEQSettingsViewModel()
 
-        coordinator.finishLaunching(arguments: launchArguments(token: "invalid-host"))
+        coordinator.finishLaunching(arguments: launchArguments())
         coordinator.attach(model: model)
         await coordinator.waitForConnectionTask()
 
@@ -283,7 +560,6 @@ private final class FakeSettingsPipeClientFactory: SettingsPipeClientMaking {
         }
         launchInfos.append(launchInfo)
         return FakeSettingsPipeClient(
-            token: launchInfo.token,
             snapshot: snapshot,
             connectError: connectError
         )
@@ -292,13 +568,12 @@ private final class FakeSettingsPipeClientFactory: SettingsPipeClientMaking {
 
 @MainActor
 private final class FakeSettingsPipeClient: SettingsPipeClientConnection, @unchecked Sendable {
-    let token: String
+    let token: String? = "fake-token"
     private let snapshot: SettingsSnapshotDTO
     private let connectError: (any Error)?
     private(set) var didDisconnect = false
 
-    init(token: String, snapshot: SettingsSnapshotDTO, connectError: (any Error)?) {
-        self.token = token
+    init(snapshot: SettingsSnapshotDTO, connectError: (any Error)?) {
         self.snapshot = snapshot
         self.connectError = connectError
     }
@@ -319,10 +594,226 @@ private final class FakeSettingsPipeClient: SettingsPipeClientConnection, @unche
     }
 }
 
-private func launchArguments(token: String) -> [String] {
+private func launchArguments() -> [String] {
     [
         "GlassEQSettings",
-        "--glasseq-settings-token", token,
         "--glasseq-main-pid", "123"
     ]
+}
+
+private final class SettingsPipePumpRecorder: @unchecked Sendable {
+    private let expectedMessageCount: Int
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var messages: [SettingsPipeMessage] = []
+    private var errorCount = 0
+    private var endOfFileCount = 0
+
+    init(expectedMessageCount: Int) {
+        self.expectedMessageCount = expectedMessageCount
+    }
+
+    func record(_ result: Result<[SettingsPipeMessage], any Error>) {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+
+        switch result {
+        case .success(let messages):
+            self.messages.append(contentsOf: messages)
+        case .failure:
+            errorCount += 1
+        }
+
+        if self.messages.count >= expectedMessageCount {
+            semaphore.signal()
+        }
+    }
+
+    func recordEndOfFile() {
+        lock.lock()
+        endOfFileCount += 1
+        lock.unlock()
+    }
+
+    func waitForMessages(timeout: DispatchTime) -> Bool {
+        semaphore.wait(timeout: timeout) == .success
+    }
+
+    func snapshot() -> (messages: [SettingsPipeMessage], errorCount: Int, endOfFileCount: Int) {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return (messages, errorCount, endOfFileCount)
+    }
+}
+
+private enum SettingsPipeWriteTestError: Error {
+    case failed
+}
+
+private extension Result where Success == Void, Failure == any Error {
+    var isSuccess: Bool {
+        if case .success = self {
+            return true
+        }
+        return false
+    }
+
+    var isClosedPipePumpFailure: Bool {
+        if case .failure(let error as SettingsPipeWritePumpError) = self,
+           error == .closed {
+            return true
+        }
+        return false
+    }
+}
+
+private final class SettingsPipeResultRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var _result: Result<Void, any Error>?
+
+    var result: Result<Void, any Error>? {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return _result
+    }
+
+    func record(_ result: Result<Void, any Error>) {
+        lock.lock()
+        _result = result
+        lock.unlock()
+        semaphore.signal()
+    }
+
+    func wait(timeout: DispatchTime) -> Bool {
+        semaphore.wait(timeout: timeout) == .success
+    }
+}
+
+private final class OrderedDeliveryRecorder: @unchecked Sendable {
+    private let expectedCount: Int
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var _events: [String] = []
+
+    init(expectedCount: Int) {
+        self.expectedCount = expectedCount
+    }
+
+    var events: [String] {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return _events
+    }
+
+    func record(_ event: String) {
+        lock.lock()
+        _events.append(event)
+        let shouldSignal = _events.count >= expectedCount
+        lock.unlock()
+
+        if shouldSignal {
+            semaphore.signal()
+        }
+    }
+
+    func wait(timeout: DispatchTime) -> Bool {
+        semaphore.wait(timeout: timeout) == .success
+    }
+}
+
+private final class BlockingSettingsPipeWriteSink: @unchecked Sendable {
+    private let started = DispatchSemaphore(value: 0)
+    private let unblocker = DispatchSemaphore(value: 0)
+    private let closed = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var _closeCount = 0
+
+    var closeCount: Int {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return _closeCount
+    }
+
+    func write(_ data: Data) {
+        started.signal()
+        _ = unblocker.wait(timeout: .now() + 2)
+    }
+
+    func waitUntilWriteStarted(timeout: DispatchTime) -> Bool {
+        started.wait(timeout: timeout) == .success
+    }
+
+    func unblock() {
+        unblocker.signal()
+    }
+
+    func close() {
+        lock.lock()
+        _closeCount += 1
+        lock.unlock()
+        closed.signal()
+    }
+
+    func waitUntilClosed(timeout: DispatchTime) -> Bool {
+        closed.wait(timeout: timeout) == .success
+    }
+}
+
+private final class SettingsPipeWriteRecorder: @unchecked Sendable {
+    private let expectedWriteCount: Int
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var messages: [SettingsPipeMessage] = []
+    private var successCount = 0
+    private var errorCount = 0
+
+    init(expectedWriteCount: Int) {
+        self.expectedWriteCount = expectedWriteCount
+    }
+
+    func write(_ data: Data) throws {
+        let message = try SettingsPipeCodec.decodeLine(Data(data.dropLast()))
+        lock.lock()
+        messages.append(message)
+        lock.unlock()
+    }
+
+    func recordCompletion(_ result: Result<Void, any Error>) {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        switch result {
+        case .success:
+            successCount += 1
+        case .failure:
+            errorCount += 1
+        }
+        if successCount + errorCount >= expectedWriteCount {
+            semaphore.signal()
+        }
+    }
+
+    func waitForCompletions(timeout: DispatchTime) -> Bool {
+        semaphore.wait(timeout: timeout) == .success
+    }
+
+    func snapshot() -> (messages: [SettingsPipeMessage], successCount: Int, errorCount: Int) {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return (messages, successCount, errorCount)
+    }
 }

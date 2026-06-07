@@ -1,3 +1,4 @@
+import Darwin
 import GlassEQCore
 import Foundation
 import Testing
@@ -72,6 +73,25 @@ struct EQCoreTests {
 
         #expect(recommended < -11.5)
         #expect(recommended > -13.0)
+    }
+
+    @Test
+    func recommendedPreampFallbackUsesQuieterStereoPreamp() {
+        let profile = EQProfile(
+            name: "Stereo Cut",
+            mode: .parametric,
+            channelMode: .stereo,
+            preampDB: 0,
+            filters: [],
+            leftPreampDB: -3,
+            leftFilters: [EQFilter(kind: .peak, frequency: 1_000, gainDB: -6, q: 1)],
+            rightPreampDB: -9,
+            rightFilters: [EQFilter(kind: .peak, frequency: 1_000, gainDB: -3, q: 1)]
+        )
+
+        let recommended = EQProfileAnalysis.recommendedPreampDB(profile: profile, sampleRate: 48_000)
+
+        #expect(recommended == -9)
     }
 
     @Test
@@ -252,6 +272,9 @@ struct EQCoreTests {
 
     @Test
     func dspCallbackPathStaysWithinGenerousDebugBudget() {
+        guard !isThreadSanitizerRuntimeLoaded else {
+            return
+        }
         let profile = EQProfile.flatGraphic31
         var processor = EQProcessor(configuration: EQConfiguration(profile: profile, sampleRate: 48_000, channelCount: 2))
         var samples = makeStereoTestBlock(frameCount: 256, sampleRate: 48_000)
@@ -341,6 +364,57 @@ struct EQCoreTests {
     }
 
     @Test
+    func realtimeCompatiblePreparedConfigurationUpdatesConfigAndResetsChangedState() throws {
+        let initial = EQProfile(
+            name: "Initial",
+            mode: .parametric,
+            preampDB: -2,
+            filters: [
+                EQFilter(kind: .peak, frequency: 500, gainDB: 8, q: 1),
+                EQFilter(kind: .highShelf, frequency: 8_000, gainDB: 1, q: 0.7)
+            ]
+        )
+        var updated = initial
+        updated.name = "Updated"
+        updated.preampDB = -4
+        updated.filters[0].frequency = 2_000
+        updated.filters[0].gainDB = -8
+        updated.filters[1].frequency = 10_000
+        updated.filters[1].gainDB = -3
+        updated.isBypassed = true
+
+        var processor = EQProcessor(configuration: EQConfiguration(profile: initial, sampleRate: 48_000, channelCount: 2))
+        var warmup = makeStereoTestBlock(frameCount: 512, sampleRate: 48_000)
+        processor.processInterleaved(&warmup, channelCount: 2)
+
+        let retiredStorage = processor.applyRealtimeCompatiblePreparedConfiguration(
+            EQRenderConfiguration(profile: updated, sampleRate: 48_000, channelCount: 2)
+        )
+
+        #expect(retiredStorage != nil)
+        #expect(processor.configuration.isBypassed)
+        #expect(processor.configuration.preampLinearGain == EQConfiguration(
+            profile: updated,
+            sampleRate: 48_000,
+            channelCount: 2
+        ).preampLinearGain)
+
+        updated.isBypassed = false
+        _ = processor.applyRealtimeCompatiblePreparedConfiguration(
+            EQRenderConfiguration(profile: updated, sampleRate: 48_000, channelCount: 2)
+        )
+        var fresh = EQProcessor(configuration: EQConfiguration(profile: updated, sampleRate: 48_000, channelCount: 2))
+        var warmedNext = makeStereoTestBlock(frameCount: 128, sampleRate: 48_000)
+        var freshNext = warmedNext
+
+        processor.processInterleaved(&warmedNext, channelCount: 2)
+        fresh.processInterleaved(&freshNext, channelCount: 2)
+
+        let maxDelta = zip(warmedNext, freshNext).map { abs($0 - $1) }.max() ?? 0
+        #expect(maxDelta < 0.000_001)
+    }
+
+    @Test
     func identicalPreparedConfigurationPreservesWarmedState() {
         let profile = EQProfile(
             name: "Stateful",
@@ -353,13 +427,16 @@ struct EQCoreTests {
 
         var withoutApply = processor
         var withIdenticalApply = processor
-        withIdenticalApply.applyPreparedConfiguration(EQRenderConfiguration(profile: profile, sampleRate: 48_000, channelCount: 2))
+        let retiredStorage = withIdenticalApply.applyRealtimeCompatiblePreparedConfiguration(
+            EQRenderConfiguration(profile: profile, sampleRate: 48_000, channelCount: 2)
+        )
 
         var expected = makeStereoTestBlock(frameCount: 128, sampleRate: 48_000)
         var actual = expected
         withoutApply.processInterleaved(&expected, channelCount: 2)
         withIdenticalApply.processInterleaved(&actual, channelCount: 2)
 
+        #expect(retiredStorage != nil)
         #expect(actual == expected)
     }
 
@@ -540,4 +617,16 @@ struct EQCoreTests {
         }
         return value
     }
+}
+
+private var isThreadSanitizerRuntimeLoaded: Bool {
+    for index in 0..<_dyld_image_count() {
+        guard let imageName = _dyld_get_image_name(index) else {
+            continue
+        }
+        if String(cString: imageName).contains("libclang_rt.tsan") {
+            return true
+        }
+    }
+    return false
 }

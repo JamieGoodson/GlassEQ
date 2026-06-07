@@ -1,5 +1,30 @@
+import Darwin
 import Foundation
 import GlassEQCore
+
+private struct UncheckedSendable<Value>: @unchecked Sendable {
+    let value: Value
+}
+
+private extension NSLock {
+    func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock()
+        defer {
+            unlock()
+        }
+        return try body()
+    }
+}
+
+public enum SettingsPipeProcessSignalPolicy {
+    private static let ignoreSIGPIPEOnce: Void = {
+        _ = Darwin.signal(SIGPIPE, SIG_IGN)
+    }()
+
+    public static func ignoreBrokenPipeSignal() {
+        _ = ignoreSIGPIPEOnce
+    }
+}
 
 public enum SettingsImportFormat: String, CaseIterable, Codable, Identifiable, Sendable {
     case autoEQ = "AutoEQ / EqualizerAPO"
@@ -111,6 +136,26 @@ public enum SettingsOptionalUUIDPatchDTO: Codable, Equatable, Sendable {
     case clear
 }
 
+public struct SettingsProfileStoreProtectionDTO: Codable, Equatable, Sendable {
+    public var isProtected: Bool
+    public var message: String
+    public var resetButtonTitle: String
+
+    public init(
+        isProtected: Bool = false,
+        message: String = "",
+        resetButtonTitle: String = ""
+    ) {
+        self.isProtected = isProtected
+        self.message = message
+        self.resetButtonTitle = resetButtonTitle
+    }
+
+    public static var unprotected: SettingsProfileStoreProtectionDTO {
+        SettingsProfileStoreProtectionDTO()
+    }
+}
+
 public struct SettingsSnapshotPatchDTO: Codable, Equatable, Sendable {
     public var statusMessage: String?
     public var isPreviewing: Bool?
@@ -121,6 +166,7 @@ public struct SettingsSnapshotPatchDTO: Codable, Equatable, Sendable {
     public var fallbackProfileID: UUID?
     public var currentOutput: SettingsOutputDTO?
     public var currentOutputMappedProfileID: SettingsOptionalUUIDPatchDTO?
+    public var profileStoreProtection: SettingsProfileStoreProtectionDTO?
 
     public init(
         statusMessage: String? = nil,
@@ -131,7 +177,8 @@ public struct SettingsSnapshotPatchDTO: Codable, Equatable, Sendable {
         activeProfileName: String? = nil,
         fallbackProfileID: UUID? = nil,
         currentOutput: SettingsOutputDTO? = nil,
-        currentOutputMappedProfileID: SettingsOptionalUUIDPatchDTO? = nil
+        currentOutputMappedProfileID: SettingsOptionalUUIDPatchDTO? = nil,
+        profileStoreProtection: SettingsProfileStoreProtectionDTO? = nil
     ) {
         self.statusMessage = statusMessage
         self.isPreviewing = isPreviewing
@@ -142,6 +189,7 @@ public struct SettingsSnapshotPatchDTO: Codable, Equatable, Sendable {
         self.fallbackProfileID = fallbackProfileID
         self.currentOutput = currentOutput
         self.currentOutputMappedProfileID = currentOutputMappedProfileID
+        self.profileStoreProtection = profileStoreProtection
     }
 }
 
@@ -161,6 +209,7 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
     public var statusMessage: String
     public var metrics: SettingsAudioMetricsDTO
     public var isPreviewing: Bool
+    public var profileStoreProtection: SettingsProfileStoreProtectionDTO
 
     public init(
         profiles: [EQProfile],
@@ -177,7 +226,8 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
         fallbackProfileID: UUID,
         statusMessage: String,
         metrics: SettingsAudioMetricsDTO,
-        isPreviewing: Bool
+        isPreviewing: Bool,
+        profileStoreProtection: SettingsProfileStoreProtectionDTO = .unprotected
     ) {
         self.profiles = profiles
         self.selectedProfileID = selectedProfileID
@@ -194,6 +244,7 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
         self.statusMessage = statusMessage
         self.metrics = metrics
         self.isPreviewing = isPreviewing
+        self.profileStoreProtection = profileStoreProtection
     }
 
     public static var disconnected: SettingsSnapshotDTO {
@@ -213,7 +264,8 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
             fallbackProfileID: profile.id,
             statusMessage: "Connecting to GlassEQ...",
             metrics: SettingsAudioMetricsDTO(),
-            isPreviewing: false
+            isPreviewing: false,
+            profileStoreProtection: .unprotected
         )
     }
 }
@@ -233,6 +285,7 @@ public enum SettingsCommand: Codable, Equatable, Sendable {
     case openPrivacySettings
     case startMetricsPolling
     case stopMetricsPolling
+    case resetUnsupportedProfileStore
 }
 
 public struct SettingsCommandResponse: Codable, Equatable, Sendable {
@@ -271,13 +324,15 @@ public enum SettingsPipeRequestKind: String, Codable, Equatable, Sendable {
 }
 
 public enum SettingsPipeMessage: Codable, Equatable, Sendable {
+    case bootstrap(sessionToken: String)
     case request(sessionToken: String, id: String, kind: SettingsPipeRequestKind, command: SettingsCommand?)
     case response(sessionToken: String, id: String, response: SettingsCommandResponse?, error: String?)
     case event(sessionToken: String, event: SettingsEvent)
 
     public var sessionToken: String {
         switch self {
-        case .request(let sessionToken, _, _, _),
+        case .bootstrap(let sessionToken),
+             .request(let sessionToken, _, _, _),
              .response(let sessionToken, _, _, _),
              .event(let sessionToken, _):
             sessionToken
@@ -285,9 +340,22 @@ public enum SettingsPipeMessage: Codable, Equatable, Sendable {
     }
 
     public func validateSessionToken(_ expected: String) throws {
-        guard sessionToken == expected else {
+        guard Self.constantTimeEquals(sessionToken, expected) else {
             throw SettingsPipeError.sessionTokenMismatch
         }
+    }
+
+    private static func constantTimeEquals(_ lhs: String, _ rhs: String) -> Bool {
+        let lhsBytes = Array(lhs.utf8)
+        let rhsBytes = Array(rhs.utf8)
+        let count = max(lhsBytes.count, rhsBytes.count)
+        var difference = lhsBytes.count ^ rhsBytes.count
+        for index in 0..<count {
+            let lhsByte = index < lhsBytes.count ? Int(lhsBytes[index]) : 0
+            let rhsByte = index < rhsBytes.count ? Int(rhsBytes[index]) : 0
+            difference |= lhsByte ^ rhsByte
+        }
+        return difference == 0
     }
 }
 
@@ -312,7 +380,7 @@ public enum SettingsPipeCodec {
         _ message: SettingsPipeMessage,
         maximumLineBytes: Int = Self.maximumLineBytes
     ) throws -> Data {
-        var data = try SettingsPipeJSONCodec.encoder.encode(message)
+        var data = try SettingsPipeJSONCodec.makeEncoder().encode(message)
         guard data.count + 1 <= maximumLineBytes else {
             throw SettingsPipeError.frameTooLarge(byteCount: data.count + 1, maximum: maximumLineBytes)
         }
@@ -321,7 +389,7 @@ public enum SettingsPipeCodec {
     }
 
     public static func decodeLine(_ data: Data) throws -> SettingsPipeMessage {
-        try SettingsPipeJSONCodec.decoder.decode(SettingsPipeMessage.self, from: data)
+        try SettingsPipeJSONCodec.makeDecoder().decode(SettingsPipeMessage.self, from: data)
     }
 }
 
@@ -387,6 +455,239 @@ public actor SettingsPipeLineDecoder {
 }
 
 enum SettingsPipeJSONCodec {
-    static let encoder = JSONEncoder()
-    static let decoder = JSONDecoder()
+    static func makeEncoder() -> JSONEncoder {
+        JSONEncoder()
+    }
+
+    static func makeDecoder() -> JSONDecoder {
+        JSONDecoder()
+    }
+}
+
+public final class SettingsPipeReadPump: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let onMessages: @Sendable (Result<[SettingsPipeMessage], any Error>) -> Void
+    private let onEndOfFile: @Sendable () -> Void
+    private var buffer: SettingsPipeLineBuffer
+
+    public init(
+        label: String,
+        maximumLineBytes: Int = SettingsPipeCodec.maximumLineBytes,
+        onMessages: @escaping @Sendable (Result<[SettingsPipeMessage], any Error>) -> Void,
+        onEndOfFile: @escaping @Sendable () -> Void
+    ) {
+        self.queue = DispatchQueue(label: label)
+        self.buffer = SettingsPipeLineBuffer(maximumLineBytes: maximumLineBytes)
+        self.onMessages = onMessages
+        self.onEndOfFile = onEndOfFile
+    }
+
+    public func install(on handle: FileHandle) {
+        handle.readabilityHandler = { [weak self] handle in
+            guard let self else {
+                return
+            }
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                queue.async { [self] in
+                    self.onEndOfFile()
+                }
+                return
+            }
+            queue.async { [self] in
+                do {
+                    let lines = try self.buffer.append(data)
+                    let messages = try lines.map(SettingsPipeCodec.decodeLine)
+                    self.onMessages(.success(messages))
+                } catch {
+                    self.onMessages(.failure(error))
+                }
+            }
+        }
+    }
+
+    public func invalidate(handle: FileHandle?) {
+        handle?.readabilityHandler = nil
+        queue.async { [weak self] in
+            self?.buffer.removeAll(keepingCapacity: false)
+        }
+    }
+}
+
+public final class SettingsPipeOrderedMainActorDelivery: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let lock = NSLock()
+    private var generation = 0
+    private var isActive = true
+
+    public init(label: String) {
+        self.queue = DispatchQueue(label: label)
+    }
+
+    public func enqueue(_ operation: @escaping @MainActor () -> Void) {
+        let scheduledGeneration: Int? = lock.withLock {
+            guard isActive else {
+                return nil
+            }
+            return generation
+        }
+        guard let scheduledGeneration else {
+            return
+        }
+
+        queue.async { [weak self] in
+            guard let self,
+                  self.isCurrent(scheduledGeneration) else {
+                return
+            }
+            let semaphore = DispatchSemaphore(value: 0)
+            let operation = UncheckedSendable(value: operation)
+            Task { @MainActor in
+                defer {
+                    semaphore.signal()
+                }
+                guard self.isCurrent(scheduledGeneration) else {
+                    return
+                }
+                operation.value()
+            }
+            semaphore.wait()
+        }
+    }
+
+    public func invalidate() {
+        lock.withLock {
+            isActive = false
+            generation += 1
+        }
+    }
+
+    private func isCurrent(_ scheduledGeneration: Int) -> Bool {
+        lock.withLock {
+            isActive && generation == scheduledGeneration
+        }
+    }
+}
+
+public struct SettingsPipeWriteSink: Sendable {
+    private let writeBody: @Sendable (Data) throws -> Void
+    private let closeBody: @Sendable () throws -> Void
+
+    public init(
+        _ writeBody: @escaping @Sendable (Data) throws -> Void,
+        close closeBody: @escaping @Sendable () throws -> Void = {}
+    ) {
+        self.writeBody = writeBody
+        self.closeBody = closeBody
+    }
+
+    public init(fileHandle: FileHandle) {
+        SettingsPipeProcessSignalPolicy.ignoreBrokenPipeSignal()
+        let handle = UncheckedSendable(value: fileHandle)
+        self.writeBody = { data in
+            try handle.value.write(contentsOf: data)
+        }
+        self.closeBody = {
+            try handle.value.close()
+        }
+    }
+
+    func write(_ data: Data) throws {
+        try writeBody(data)
+    }
+
+    func close() throws {
+        try closeBody()
+    }
+}
+
+public enum SettingsPipeWritePumpError: Error, Equatable, LocalizedError, Sendable {
+    case closed
+
+    public var errorDescription: String? {
+        switch self {
+        case .closed:
+            return "Settings IPC pipe is closed."
+        }
+    }
+}
+
+public final class SettingsPipeWritePump: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let sink: SettingsPipeWriteSink
+    private let lock = NSLock()
+    private var isClosing = false
+
+    public init(label: String, sink: SettingsPipeWriteSink) {
+        self.queue = DispatchQueue(label: label)
+        self.sink = sink
+    }
+
+    public convenience init(label: String, fileHandle: FileHandle) {
+        self.init(label: label, sink: SettingsPipeWriteSink(fileHandle: fileHandle))
+    }
+
+    public func enqueue(
+        _ message: SettingsPipeMessage,
+        completion: @escaping @Sendable (Result<Void, any Error>) -> Void = { _ in }
+    ) {
+        guard markEnqueueAccepted() else {
+            queue.async {
+                completion(.failure(SettingsPipeWritePumpError.closed))
+            }
+            return
+        }
+
+        queue.async { [sink] in
+            do {
+                let data = try SettingsPipeCodec.encodeLine(message)
+                try sink.write(data)
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    public func drainAndClose(
+        completion: @escaping @Sendable (Result<Void, any Error>) -> Void = { _ in }
+    ) {
+        let shouldClose = lock.withLock {
+            guard !isClosing else {
+                return false
+            }
+            isClosing = true
+            return true
+        }
+
+        guard shouldClose else {
+            queue.async {
+                completion(.success(()))
+            }
+            return
+        }
+
+        queue.async { [sink] in
+            do {
+                try sink.close()
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    public func drainAndClose() async -> Result<Void, any Error> {
+        await withCheckedContinuation { continuation in
+            drainAndClose { result in
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
+    private func markEnqueueAccepted() -> Bool {
+        lock.withLock {
+            !isClosing
+        }
+    }
 }
