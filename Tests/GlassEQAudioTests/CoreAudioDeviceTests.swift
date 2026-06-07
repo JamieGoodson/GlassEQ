@@ -199,6 +199,35 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
+    func monoSourceDuplicatesIntoSingleInterleavedStereoOutputBuffer() {
+        let samples: [Float] = [1, 2]
+        var destination: [Float] = [-1, -1, -1, -1, -1, -1]
+
+        samples.withUnsafeBufferPointer { source in
+            destination.withUnsafeMutableBufferPointer { destinationBuffer in
+                let audioBuffer = AudioBuffer(
+                    mNumberChannels: 2,
+                    mDataByteSize: UInt32(destinationBuffer.count * MemoryLayout<Float>.stride),
+                    mData: destinationBuffer.baseAddress
+                )
+                var audioBufferList = AudioBufferList(mNumberBuffers: 1, mBuffers: audioBuffer)
+                withUnsafeMutablePointer(to: &audioBufferList) { audioBufferListPointer in
+                    SystemTapAudioEngine.copyInterleavedSamples(
+                        source,
+                        sourceFrameOffset: 0,
+                        destinationFrameOffset: 1,
+                        frameCount: 2,
+                        sourceChannelCount: 1,
+                        to: UnsafeMutableAudioBufferListPointer(audioBufferListPointer)
+                    )
+                }
+            }
+        }
+
+        #expect(destination == [-1, -1, 1, 1, 2, 2])
+    }
+
+    @Test
     func preferredBufferFrameSizeShrinksStandardSpeakerRoutesForLowLatency() {
         #expect(SystemTapAudioEngine.preferredBufferFrameSize(for: output(channelCount: 2, bufferFrameSize: 128)) == 256)
         #expect(SystemTapAudioEngine.preferredBufferFrameSize(for: output(channelCount: 2, bufferFrameSize: 512)) == 256)

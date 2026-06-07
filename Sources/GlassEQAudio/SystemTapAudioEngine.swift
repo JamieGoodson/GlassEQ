@@ -755,58 +755,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             sourceChannelCount: Int,
             to buffers: UnsafeMutableAudioBufferListPointer
         ) {
-            let sourceChannelCount = max(sourceChannelCount, 1)
-            if buffers.count == 1,
-               let data = buffers[0].mData?.assumingMemoryBound(to: Float.self),
-               Int(buffers[0].mNumberChannels) == 1,
-               sourceChannelCount > 1,
-               frameCount > 0,
-               sourceFrameOffset >= 0,
-               destinationFrameOffset >= 0 {
-                let destinationSamples = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.stride
-                for frameIndex in 0..<frameCount where destinationFrameOffset + frameIndex < destinationSamples {
-                    data[destinationFrameOffset + frameIndex] = SystemTapAudioEngine.monoDownmix(
-                        samples,
-                        frame: sourceFrameOffset + frameIndex,
-                        sourceChannelCount: sourceChannelCount
-                    )
-                }
-                return
-            }
-
-            if buffers.count == 1,
-               let data = buffers[0].mData?.assumingMemoryBound(to: Float.self),
-               Int(buffers[0].mNumberChannels) == sourceChannelCount,
-               frameCount > 0,
-               sourceFrameOffset >= 0,
-               destinationFrameOffset >= 0 {
-                let copySamples = frameCount * sourceChannelCount
-                let sourceSampleStart = sourceFrameOffset * sourceChannelCount
-                let destinationSampleStart = destinationFrameOffset * sourceChannelCount
-                let destinationSamples = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.stride
-                if sourceSampleStart + copySamples <= samples.count,
-                   destinationSampleStart + copySamples <= destinationSamples,
-                   let source = samples.baseAddress {
-                    data.advanced(by: destinationSampleStart)
-                        .update(from: source.advanced(by: sourceSampleStart), count: copySamples)
-                    return
-                }
-            }
-
-            for bufferIndex in buffers.indices {
-                guard let data = buffers[bufferIndex].mData?.assumingMemoryBound(to: Float.self) else {
-                    continue
-                }
-                let sourceChannel = min(bufferIndex, sourceChannelCount - 1)
-                let destinationSampleCount = Int(buffers[bufferIndex].mDataByteSize) / MemoryLayout<Float>.stride
-                for frameIndex in 0..<frameCount where destinationFrameOffset + frameIndex < destinationSampleCount {
-                    let sourceIndex = (sourceFrameOffset + frameIndex) * sourceChannelCount + sourceChannel
-                    guard sourceIndex < samples.count else {
-                        continue
-                    }
-                    data[destinationFrameOffset + frameIndex] = samples[sourceIndex]
-                }
-            }
+            SystemTapAudioEngine.copyInterleavedSamples(
+                samples,
+                sourceFrameOffset: sourceFrameOffset,
+                destinationFrameOffset: destinationFrameOffset,
+                frameCount: frameCount,
+                sourceChannelCount: sourceChannelCount,
+                to: buffers
+            )
         }
 
         private func enter(_ gate: borrowing Atomic<Bool>) -> Bool {
@@ -1291,6 +1247,93 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             return samples[sampleBase]
         }
         return (samples[sampleBase] + samples[sampleBase + 1]) * 0.5
+    }
+
+    static func copyInterleavedSamples(
+        _ samples: UnsafeBufferPointer<Float>,
+        sourceFrameOffset: Int,
+        destinationFrameOffset: Int,
+        frameCount: Int,
+        sourceChannelCount: Int,
+        to buffers: UnsafeMutableAudioBufferListPointer
+    ) {
+        let sourceChannelCount = max(sourceChannelCount, 1)
+        if buffers.count == 1,
+           let data = buffers[0].mData?.assumingMemoryBound(to: Float.self),
+           Int(buffers[0].mNumberChannels) == 1,
+           sourceChannelCount > 1,
+           frameCount > 0,
+           sourceFrameOffset >= 0,
+           destinationFrameOffset >= 0 {
+            let destinationSamples = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.stride
+            for frameIndex in 0..<frameCount where destinationFrameOffset + frameIndex < destinationSamples {
+                data[destinationFrameOffset + frameIndex] = monoDownmix(
+                    samples,
+                    frame: sourceFrameOffset + frameIndex,
+                    sourceChannelCount: sourceChannelCount
+                )
+            }
+            return
+        }
+
+        if buffers.count == 1,
+           let data = buffers[0].mData?.assumingMemoryBound(to: Float.self),
+           sourceChannelCount == 1,
+           Int(buffers[0].mNumberChannels) > 1,
+           frameCount > 0,
+           sourceFrameOffset >= 0,
+           destinationFrameOffset >= 0 {
+            let destinationChannelCount = Int(buffers[0].mNumberChannels)
+            let destinationSamples = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.stride
+            for frameIndex in 0..<frameCount {
+                let sourceIndex = sourceFrameOffset + frameIndex
+                guard sourceIndex < samples.count else {
+                    continue
+                }
+                let destinationBase = (destinationFrameOffset + frameIndex) * destinationChannelCount
+                guard destinationBase < destinationSamples else {
+                    continue
+                }
+                for channel in 0..<destinationChannelCount where destinationBase + channel < destinationSamples {
+                    data[destinationBase + channel] = samples[sourceIndex]
+                }
+            }
+            return
+        }
+
+        if buffers.count == 1,
+           let data = buffers[0].mData?.assumingMemoryBound(to: Float.self),
+           Int(buffers[0].mNumberChannels) == sourceChannelCount,
+           frameCount > 0,
+           sourceFrameOffset >= 0,
+           destinationFrameOffset >= 0 {
+            let copySamples = frameCount * sourceChannelCount
+            let sourceSampleStart = sourceFrameOffset * sourceChannelCount
+            let destinationSampleStart = destinationFrameOffset * sourceChannelCount
+            let destinationSamples = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.stride
+            if sourceSampleStart + copySamples <= samples.count,
+               destinationSampleStart + copySamples <= destinationSamples,
+               let source = samples.baseAddress {
+                data.advanced(by: destinationSampleStart)
+                    .update(from: source.advanced(by: sourceSampleStart), count: copySamples)
+                return
+            }
+        }
+
+        for bufferIndex in buffers.indices {
+            guard let data = buffers[bufferIndex].mData?.assumingMemoryBound(to: Float.self) else {
+                continue
+            }
+            let sourceChannel = min(bufferIndex, sourceChannelCount - 1)
+            let destinationSampleCount = Int(buffers[bufferIndex].mDataByteSize) / MemoryLayout<Float>.stride
+            for frameIndex in 0..<frameCount where destinationFrameOffset + frameIndex < destinationSampleCount {
+                let sourceIndex = (sourceFrameOffset + frameIndex) * sourceChannelCount + sourceChannel
+                guard sourceIndex < samples.count else {
+                    continue
+                }
+                data[destinationFrameOffset + frameIndex] = samples[sourceIndex]
+            }
+        }
     }
 
     static func performTopologyRebuild<T>(
