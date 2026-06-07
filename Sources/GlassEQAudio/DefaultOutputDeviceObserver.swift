@@ -1,9 +1,37 @@
 import CoreAudio
 import Foundation
 
+final class DispatchRefreshCoalescer: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let delay: DispatchTimeInterval
+    private var generation = 0
+
+    init(queue: DispatchQueue, delay: DispatchTimeInterval) {
+        self.queue = queue
+        self.delay = delay
+    }
+
+    func cancelPending() {
+        generation += 1
+    }
+
+    func schedule(_ operation: @escaping @Sendable () -> Void) {
+        generation += 1
+        let scheduledGeneration = generation
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self,
+                  self.generation == scheduledGeneration else {
+                return
+            }
+            operation()
+        }
+    }
+}
+
 public final class DefaultOutputDeviceObserver: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "com.glasseq.default-output-observer")
+    private let queue: DispatchQueue
     private let queueSpecific = DispatchSpecificKey<Void>()
+    private let refreshCoalescer: DispatchRefreshCoalescer
     private var systemListeners: [ListenerToken] = []
     private var outputListeners: [ListenerToken] = []
     private var observedOutputID = AudioObjectID(kAudioObjectUnknown)
@@ -17,6 +45,9 @@ public final class DefaultOutputDeviceObserver: @unchecked Sendable {
     }
 
     public init(onChange: @escaping @Sendable (Result<AudioOutputDevice, Error>) -> Void) {
+        let queue = DispatchQueue(label: "com.glasseq.default-output-observer")
+        self.queue = queue
+        self.refreshCoalescer = DispatchRefreshCoalescer(queue: queue, delay: .milliseconds(50))
         self.onChange = onChange
         queue.setSpecific(key: queueSpecific, value: ())
     }
@@ -31,9 +62,35 @@ public final class DefaultOutputDeviceObserver: @unchecked Sendable {
         }
     }
 
+    public func startAsync(sendInitialValue: Bool = true) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async { [weak self] in
+                guard let self else {
+                    continuation.resume()
+                    return
+                }
+                do {
+                    try self.startOnQueue(sendInitialValue: sendInitialValue)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     public func stop() {
         performOnQueue {
             stopOnQueue()
+        }
+    }
+
+    public func stopAsync() async {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                self?.stopOnQueue()
+                continuation.resume()
+            }
         }
     }
 
@@ -65,6 +122,7 @@ public final class DefaultOutputDeviceObserver: @unchecked Sendable {
         removeOutputListeners()
         removeListeners(&systemListeners)
         isStarted = false
+        refreshCoalescer.cancelPending()
     }
 
     private func refreshObservedOutput(sendChange: Bool) {
@@ -83,6 +141,19 @@ public final class DefaultOutputDeviceObserver: @unchecked Sendable {
             if sendChange {
                 onChange(.failure(error))
             }
+        }
+    }
+
+    private func scheduleRefreshObservedOutput(sendChange: Bool) {
+        guard isStarted else {
+            return
+        }
+        refreshCoalescer.schedule { [weak self] in
+            guard let self,
+                  self.isStarted else {
+                return
+            }
+            self.refreshObservedOutput(sendChange: sendChange)
         }
     }
 
@@ -127,7 +198,7 @@ public final class DefaultOutputDeviceObserver: @unchecked Sendable {
             mElement: kAudioObjectPropertyElementMain
         )
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.refreshObservedOutput(sendChange: true)
+            self?.scheduleRefreshObservedOutput(sendChange: true)
         }
         try checkOSStatus(
             AudioObjectAddPropertyListenerBlock(
@@ -170,17 +241,17 @@ public final class DefaultOutputDeviceObserver: @unchecked Sendable {
             guard selector != kAudioDevicePropertyDeviceIsAlive else {
                 do {
                     guard try CoreAudioDeviceQuery.isDeviceAlive(id: outputID) else {
-                        self.refreshObservedOutput(sendChange: true)
+                        self.scheduleRefreshObservedOutput(sendChange: true)
                         return
                     }
                 } catch {
-                    self.refreshObservedOutput(sendChange: true)
+                    self.scheduleRefreshObservedOutput(sendChange: true)
                     return
                 }
-                self.refreshObservedOutput(sendChange: true)
+                self.scheduleRefreshObservedOutput(sendChange: true)
                 return
             }
-            self.refreshObservedOutput(sendChange: true)
+            self.scheduleRefreshObservedOutput(sendChange: true)
         }
         try checkOSStatus(
             AudioObjectAddPropertyListenerBlock(

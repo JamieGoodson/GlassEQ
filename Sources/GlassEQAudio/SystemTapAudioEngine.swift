@@ -64,6 +64,14 @@ struct TopologyRebuildMuteGuardUnavailable: Error, LocalizedError {
     }
 }
 
+private struct AudioEngineInternalError: Error, LocalizedError {
+    var message: String
+
+    var errorDescription: String? {
+        message
+    }
+}
+
 public final class SystemTapAudioEngine: @unchecked Sendable {
     private static let preferredBufferFrameSize: UInt32 = 256
     private static let preferredBluetoothBufferFrameSize: UInt32 = 512
@@ -91,7 +99,19 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         var activeProfile: EQProfile?
         var bufferFrameSizeRestorations: [String: BufferFrameSizeRestoration] = [:]
         var sampleRateRestorations: [String: SampleRateRestoration] = [:]
+        var outputRebuildGeneration = 0
     }
+
+    private struct OutputRebuildPreparation {
+        var generation: Int
+        var output: AudioOutputDevice
+        var profile: EQProfile
+        var runtime: AudioRuntime
+        var tapSampleRate: Double
+        var originalBufferFrameSize: UInt32
+    }
+
+    private struct StaleOutputRebuild: Error {}
 
     struct BufferFrameSizeRestoration: Equatable, Sendable {
         var uid: String
@@ -775,6 +795,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     }
 
     private let control = Mutex(ControlState())
+    private let restorationStoreURL: URL
 
     public var state: AudioEngineState {
         control.withLock { $0.state }
@@ -784,31 +805,57 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         control.withLock { $0.status }
     }
 
-    public init() {}
+    public init(restorationStoreURL: URL? = nil) {
+        let restorationStoreURL = restorationStoreURL ?? PersistedAudioDeviceRestorationStore.defaultURL()
+        self.restorationStoreURL = restorationStoreURL
+        Self.restorePersistedDeviceSettings(at: restorationStoreURL)
+    }
 
     deinit {
         stop()
     }
 
     public func start(output: AudioOutputDevice, profile: EQProfile) throws {
-        try control.withLock { state in
-            let previousState = state.state
-            let previousStatus = state.status
-            state.status = .starting
-            do {
+        var previousState = AudioEngineState.stopped
+        var previousStatus = AudioEngineStatus.stopped
+        var activePreparation: OutputRebuildPreparation?
+
+        do {
+            let preparation = try control.withLock { state in
+                previousState = state.state
+                previousStatus = state.status
+                state.status = .starting
                 // The capture half (one global muted tap @ the tap rate) is created once and
                 // kept alive across output switches, so dry audio never leaks to a newly
                 // selected device. Only the output half is (re)built for `output`.
                 try ensureCaptureHalfLocked(&state, profile: profile)
-                try rebuildOutputHalfLocked(&state, output: output, profile: profile)
+                return try prepareOutputRebuildLocked(&state, output: output, profile: profile)
+            }
+            activePreparation = preparation
+            let matchedOutput = try forceSampleRate(preparation.tapSampleRate, on: preparation.output)
+            try control.withLock { state in
+                try finishOutputRebuildLocked(&state, preparation: preparation, matchedOutput: matchedOutput)
                 let active = state.activeOutput ?? output
                 state.state = .running(output: active)
                 state.status = .running(output: active)
-            } catch {
+            }
+        } catch is StaleOutputRebuild {
+            return
+        } catch {
+            var shouldRethrow = true
+            control.withLock { state in
+                if let activePreparation,
+                   state.outputRebuildGeneration != activePreparation.generation {
+                    shouldRethrow = false
+                    return
+                }
                 if error is TopologyRebuildMuteGuardUnavailable {
                     state.state = previousState
                     state.status = previousStatus
-                    throw error
+                    if case .running = previousState {
+                        shouldRethrow = false
+                    }
+                    return
                 }
                 let failure = audioEngineFailure(from: error)
                 // Any failure tears the tap down too, so the system is never left muted
@@ -820,6 +867,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 } else {
                     state.status = .failed(failure)
                 }
+            }
+            if shouldRethrow {
                 throw error
             }
         }
@@ -837,6 +886,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
         let freshOutput = try CoreAudioDeviceQuery.outputDevice(id: output.id)
         try start(output: freshOutput, profile: profile)
+        let didApplyProfile = control.withLock { state in
+            state.activeProfile == profile
+        }
+        guard didApplyProfile else {
+            throw TopologyRebuildMuteGuardUnavailable(
+                underlyingError: AudioEngineInternalError(message: "Profile rebuild was not applied.")
+            )
+        }
     }
 
     @discardableResult
@@ -1023,26 +1080,55 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     // MARK: - Output half (swappable; device forced to the tap rate so no resampling)
 
-    private func rebuildOutputHalfLocked(
+    private func prepareOutputRebuildLocked(
         _ state: inout ControlState,
         output: AudioOutputDevice,
         profile: EQProfile
-    ) throws {
+    ) throws -> OutputRebuildPreparation {
         guard let runtime = state.runtime else {
             throw CoreAudioError(operation: "rebuildOutputHalf(missing runtime)", status: kAudioHardwareNotRunningError)
         }
-
-        stopOutputHalfLocked(&state)
-
         // Match the device to the tap's fixed rate so the EQ'd stream needs no resampling.
         let originalBufferFrameSize = output.bufferFrameSize
-        let matchedOutput = try forceSampleRate(state.tapSampleRate, on: output, state: &state)
+        _ = try Self.supportedRuntimeChannelCount(for: output)
+        stopOutputHalfLocked(&state)
+        if state.tapSampleRate > 0, abs(output.nominalSampleRate - state.tapSampleRate) >= 1 {
+            try recordSampleRateRestorationIfNeeded(for: output, state: &state)
+        }
+        return OutputRebuildPreparation(
+            generation: state.outputRebuildGeneration,
+            output: output,
+            profile: profile,
+            runtime: runtime,
+            tapSampleRate: state.tapSampleRate,
+            originalBufferFrameSize: originalBufferFrameSize
+        )
+    }
+
+    private func finishOutputRebuildLocked(
+        _ state: inout ControlState,
+        preparation: OutputRebuildPreparation,
+        matchedOutput: AudioOutputDevice
+    ) throws {
+        guard state.outputRebuildGeneration == preparation.generation,
+              state.runtime === preparation.runtime,
+              state.captureRunning else {
+            throw StaleOutputRebuild()
+        }
+        let runtime = preparation.runtime
+        let output = preparation.output
         _ = try Self.supportedRuntimeChannelCount(for: matchedOutput)
         if state.bufferFrameSizeRestorations[output.uid] == nil {
-            state.bufferFrameSizeRestorations[output.uid] = BufferFrameSizeRestoration(
+            let restoration = BufferFrameSizeRestoration(
                 uid: output.uid,
-                originalFrameSize: originalBufferFrameSize
+                originalFrameSize: preparation.originalBufferFrameSize
             )
+            try PersistedAudioDeviceRestorationStore.recordBufferFrameSize(
+                uid: restoration.uid,
+                originalFrameSize: restoration.originalFrameSize,
+                at: restorationStoreURL
+            )
+            state.bufferFrameSizeRestorations[output.uid] = restoration
         }
 
         // Keep our replay muted while we claim and reconfigure the device. The ORDER matters:
@@ -1075,10 +1161,11 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         runtime.reprimePlayback()
 
         state.activeOutput = tunedOutput
-        state.activeProfile = profile
+        state.activeProfile = preparation.profile
     }
 
     private func stopOutputHalfLocked(_ state: inout ControlState) {
+        state.outputRebuildGeneration += 1
         if let output = state.activeOutput, let outputIOProcID = state.outputIOProcID {
             _ = AudioDeviceStop(output.id, outputIOProcID)
             _ = AudioDeviceDestroyIOProcID(output.id, outputIOProcID)
@@ -1090,17 +1177,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     private func forceSampleRate(
         _ sampleRate: Double,
-        on output: AudioOutputDevice,
-        state: inout ControlState
+        on output: AudioOutputDevice
     ) throws -> AudioOutputDevice {
         guard sampleRate > 0, abs(output.nominalSampleRate - sampleRate) >= 1 else {
             return output
-        }
-        if state.sampleRateRestorations[output.uid] == nil {
-            state.sampleRateRestorations[output.uid] = SampleRateRestoration(
-                uid: output.uid,
-                originalSampleRate: output.nominalSampleRate
-            )
         }
         try CoreAudioDeviceQuery.setNominalSampleRate(sampleRate, objectID: output.id)
         for _ in 0..<3 {
@@ -1117,10 +1197,49 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         )
     }
 
+    private func recordSampleRateRestorationIfNeeded(
+        for output: AudioOutputDevice,
+        state: inout ControlState
+    ) throws {
+        guard state.sampleRateRestorations[output.uid] == nil else {
+            return
+        }
+        let restoration = SampleRateRestoration(
+            uid: output.uid,
+            originalSampleRate: output.nominalSampleRate
+        )
+        try PersistedAudioDeviceRestorationStore.recordSampleRate(
+            uid: restoration.uid,
+            originalSampleRate: restoration.originalSampleRate,
+            at: restorationStoreURL
+        )
+        state.sampleRateRestorations[output.uid] = restoration
+    }
+
+    static func setSampleRateAfterRecordingRestoration(
+        _ sampleRate: Double,
+        on output: AudioOutputDevice,
+        needsRestoration: Bool,
+        recordRestoration: (SampleRateRestoration) throws -> Void,
+        installRestoration: (SampleRateRestoration) -> Void,
+        setSampleRate: (Double, AudioObjectID) throws -> Void
+    ) throws {
+        if needsRestoration {
+            let restoration = SampleRateRestoration(
+                uid: output.uid,
+                originalSampleRate: output.nominalSampleRate
+            )
+            try recordRestoration(restoration)
+            installRestoration(restoration)
+        }
+        try setSampleRate(sampleRate, output.id)
+    }
+
     private func restoreDeviceSettingsIfNeeded(_ state: inout ControlState) {
         var restoredSampleRateUIDs: [String] = []
         for (uid, restoration) in state.sampleRateRestorations {
             if Self.restoreSampleRateRestoration(restoration) {
+                try? PersistedAudioDeviceRestorationStore.clearSampleRate(uid: uid, at: restorationStoreURL)
                 restoredSampleRateUIDs.append(uid)
             }
         }
@@ -1131,6 +1250,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         var restoredBufferFrameSizeUIDs: [String] = []
         for (uid, restoration) in state.bufferFrameSizeRestorations {
             if Self.restoreBufferFrameSizeRestoration(restoration) {
+                try? PersistedAudioDeviceRestorationStore.clearBufferFrameSize(uid: uid, at: restorationStoreURL)
                 restoredBufferFrameSizeUIDs.append(uid)
             }
         }
@@ -1183,6 +1303,41 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
     }
 
+    static func restorePersistedDeviceSettings(
+        at url: URL,
+        outputForUID: (String) throws -> AudioOutputDevice? = CoreAudioDeviceQuery.outputDevice(uid:),
+        setSampleRate: (Double, AudioObjectID) throws -> Void = CoreAudioDeviceQuery.setNominalSampleRate(_:objectID:),
+        setBufferFrameSize: (UInt32, AudioObjectID) throws -> Void = CoreAudioDeviceQuery.setBufferFrameSize(_:objectID:)
+    ) {
+        var records = PersistedAudioDeviceRestorationStore.load(from: url)
+        guard !records.isEmpty else {
+            return
+        }
+
+        for (uid, record) in records {
+            var updated = record
+            if let originalSampleRate = record.originalSampleRate,
+               restoreSampleRateRestoration(
+                   SampleRateRestoration(uid: uid, originalSampleRate: originalSampleRate),
+                   outputForUID: outputForUID,
+                   setSampleRate: setSampleRate
+               ) {
+                updated.originalSampleRate = nil
+            }
+            if let originalBufferFrameSize = record.originalBufferFrameSize,
+               restoreBufferFrameSizeRestoration(
+                   BufferFrameSizeRestoration(uid: uid, originalFrameSize: originalBufferFrameSize),
+                   outputForUID: outputForUID,
+                   setBufferFrameSize: setBufferFrameSize
+               ) {
+                updated.originalBufferFrameSize = nil
+            }
+            records[uid] = updated.isEmpty ? nil : updated
+        }
+
+        try? PersistedAudioDeviceRestorationStore.save(records, to: url)
+    }
+
     private static func dspProfile(from profile: EQProfile) -> EQProfile {
         var profile = profile
         profile.isBypassed = false
@@ -1222,6 +1377,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             throw AudioDeviceAvailabilityError.unsupportedOutputChannelCount(output.id, output.outputChannelCount)
         }
         return output.outputChannelCount
+    }
+
+    static func performAfterRuntimeChannelValidation<T>(
+        for output: AudioOutputDevice,
+        _ operation: () throws -> T
+    ) throws -> T {
+        _ = try supportedRuntimeChannelCount(for: output)
+        return try operation()
     }
 
     static func monoDownmix(
@@ -1451,6 +1614,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &asbd),
             operation: "AudioObjectGetPropertyData(tap format)"
         )
+        try CoreAudioDeviceQuery.validatePropertySize(
+            actual: size,
+            expected: UInt32(MemoryLayout<AudioStreamBasicDescription>.size),
+            operation: "AudioObjectGetPropertyData(tap format)",
+            objectID: tapID
+        )
         return asbd
     }
 
@@ -1564,6 +1733,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             operation: "AudioObjectGetPropertyData(translate pid)"
         )
 
+        guard processID != kAudioObjectUnknown else {
+            throw AudioDeviceAvailabilityError.invalidDeviceMetadata(
+                AudioObjectID(kAudioObjectSystemObject),
+                "current audio process object is unknown"
+            )
+        }
         return processID
     }
 }

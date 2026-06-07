@@ -120,7 +120,7 @@ private func runDiagnostics(options: DiagnosticsOptions) -> Int32 {
         }
 
         if options.intentionalCrashAfterStart {
-            print("Intentional crash requested after engine start. This crash-test path verifies crash reporter and cleanup behavior.")
+            print("Intentional crash requested after engine start. Pending device setting restoration is persisted and retried on the next launch.")
             fflush(stdout)
             abort()
         }
