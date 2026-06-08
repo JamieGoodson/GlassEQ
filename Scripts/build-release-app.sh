@@ -47,7 +47,7 @@ is_dry_run() {
 }
 
 default_release_label() {
-    if [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+    if [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.0$ ]]; then
         echo "${RELEASE_CHANNEL}-${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
     else
         echo "${RELEASE_CHANNEL}-${VERSION}"

@@ -85,8 +85,8 @@ private enum AppBuildInfo {
            !releaseLabel.isEmpty {
             return releaseLabel
         }
-        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.8.0"
-        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "10"
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.8.1"
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "11"
         return "v\(version) (\(build))"
     }
 }
