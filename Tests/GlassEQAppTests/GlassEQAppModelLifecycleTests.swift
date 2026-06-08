@@ -79,6 +79,34 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsRetryDisabledActiveProfileDoesNotStartEngine() async throws {
+        var disabled = makeProfile(name: "Disabled")
+        disabled.isBypassed = true
+        let output = makeOutput(uid: "retry-disabled-output", name: "Retry Disabled Output")
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(output))
+        let model = makeModel(
+            store: ProfileStore(profiles: [disabled], fallbackProfileID: disabled.id),
+            engine: engine,
+            lookup: lookup
+        )
+
+        let response = try await model.performSettingsCommand(.retryAudioEngine)
+        await settleAsyncWork()
+
+        let snapshot = try #require(response.snapshot)
+        #expect(snapshot.statusMessage == localized("Audio processing disabled"))
+        #expect(snapshot.activeProfileID == disabled.id)
+        #expect(engine.startCalls.isEmpty)
+        #expect(engine.updateCalls.isEmpty)
+        #expect(engine.updateDSPCalls.isEmpty)
+        #expect(engine.stopCallCount == 0)
+        #expect(lookup.defaultOutputCalls == 0)
+        #expect(!model.isRunning)
+        #expect(model.lifecycleState == .stopped)
+    }
+
+    @Test
     func outputChangeClearsPreviewAndStopPreviewIsNoOp() async {
         let fallback = makeProfile(name: "Fallback")
         let preview = makeProfile(name: "Preview")

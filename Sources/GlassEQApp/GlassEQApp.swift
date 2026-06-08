@@ -1533,6 +1533,11 @@ final class GlassEQAppModel {
               lifecycleState != .sleeping else {
             return
         }
+        guard !activeProfile.isBypassed else {
+            synchronizeActiveProfileProcessing()
+            notifyModelDidChange()
+            return
+        }
         guard lifecycleState != .waking else {
             requestWakeReconnectAttempt()
             return
