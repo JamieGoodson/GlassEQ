@@ -15,7 +15,7 @@ struct GlassEQApp: App {
                 .frame(width: 340)
         } label: {
             Image(systemName: model.isRunning ? "slider.horizontal.3" : "slider.horizontal.2.gobackward")
-                .accessibilityLabel(Text(model.isRunning ? localized("GlassEQ active") : localized("GlassEQ stopped")))
+                .accessibilityLabel(Text(model.menuBarAccessibilityLabel))
                 .accessibilityValue(Text(model.statusMessage))
                 .accessibilityHint(Text(localized("Opens GlassEQ controls")))
         }
@@ -495,6 +495,13 @@ final class GlassEQAppModel {
         profileStore.profiles.first(where: { $0.id == selectedProfileID }) ?? activeProfile
     }
 
+    var menuBarAccessibilityLabel: String {
+        if activeProfile.isBypassed {
+            return localized("GlassEQ disabled")
+        }
+        return isRunning ? localized("GlassEQ active") : localized("GlassEQ stopped")
+    }
+
     var currentOutputMappedProfileID: UUID? {
         profileStore.outputMappings.first(where: { $0.outputDeviceUID == currentOutputUID })?.profileID
     }
@@ -662,20 +669,7 @@ final class GlassEQAppModel {
         selectedProfileID = profile.id
         draftProfile = profile
         saveStore()
-        if lifecycleState == .waking {
-            reschedulePendingEngineStartWithActiveProfile()
-            notifyModelDidChange()
-            return
-        }
-        if isRunning {
-            if engine.updateDSP(profile: profile) {
-                statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
-            } else {
-                restartEngineWithActiveProfile(rollback: rollback)
-            }
-        } else {
-            restartEngineWithActiveProfile(rollback: rollback)
-        }
+        synchronizeActiveProfileProcessing(rollback: rollback)
         notifyModelDidChange()
     }
 
@@ -711,20 +705,7 @@ final class GlassEQAppModel {
         selectedProfileID = profile.id
         draftProfile = profile
         saveStore()
-        if lifecycleState == .waking {
-            reschedulePendingEngineStartWithActiveProfile()
-            notifyModelDidChange()
-            return
-        }
-        if isRunning {
-            if engine.updateDSP(profile: profile) {
-                statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
-            } else {
-                restartEngineWithActiveProfile(rollback: rollback)
-            }
-        } else {
-            restartEngineWithActiveProfile(rollback: rollback)
-        }
+        synchronizeActiveProfileProcessing(rollback: rollback)
         notifyModelDidChange()
     }
 
@@ -747,13 +728,7 @@ final class GlassEQAppModel {
                 draftProfile = profile
             }
             saveStore()
-            if lifecycleState == .waking {
-                reschedulePendingEngineStartWithActiveProfile()
-                notifyModelDidChange()
-                return
-            }
-            engine.setBypassed(isBypassed)
-            statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
+            synchronizeActiveProfileProcessing()
             notifyModelDidChange()
         } catch {
             reportProfileActionFailure(error)
@@ -887,7 +862,9 @@ final class GlassEQAppModel {
         activeProfile = profile
         selectedProfileID = profile.id
         draftProfile = profile
-        if engine.updateDSP(profile: profile) {
+        if activeProfile.isBypassed {
+            disableActiveProfileProcessing(updateMetrics: true)
+        } else if engine.updateDSP(profile: profile) {
             statusMessage = localized("Previewing settings for \(profile.name)")
         } else {
             restartEngineWithActiveProfile(rollback: rollback)
@@ -909,7 +886,9 @@ final class GlassEQAppModel {
         activeProfile = profile
         selectedProfileID = profile.id
         draftProfile = profile
-        if engine.updateDSP(profile: profile) {
+        if activeProfile.isBypassed {
+            disableActiveProfileProcessing(updateMetrics: true)
+        } else if engine.updateDSP(profile: profile) {
             statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
         } else {
             restartEngineWithActiveProfile(rollback: rollback)
@@ -1152,7 +1131,11 @@ final class GlassEQAppModel {
             selectedProfileID = activeProfile.id
             draftProfile = activeProfile
 
-            scheduleEngineWork(.start(output: output, profile: activeProfile))
+            if activeProfile.isBypassed {
+                disableActiveProfileProcessing(updateMetrics: false)
+            } else {
+                scheduleEngineWork(.start(output: output, profile: activeProfile))
+            }
         case .failure(let error):
             if lifecycleState == .waking {
                 scheduleWakeReconnectRetry(status: localized("Waiting for audio output after wake: \(error.localizedDescription)"))
@@ -1201,6 +1184,57 @@ final class GlassEQAppModel {
                 return
             }
             self?.completeEngineWork(result, generation: generation)
+        }
+    }
+
+    private func synchronizeActiveProfileProcessing(rollback: ProfileRollback? = nil) {
+        guard lifecycleState != .terminating,
+              lifecycleState != .sleeping else {
+            return
+        }
+
+        guard !activeProfile.isBypassed else {
+            disableActiveProfileProcessing(updateMetrics: true)
+            return
+        }
+
+        if lifecycleState == .waking {
+            reschedulePendingEngineStartWithActiveProfile()
+            return
+        }
+
+        startObserver(sendInitialValue: false)
+        if isRunning {
+            if engine.updateDSP(profile: activeProfile) {
+                statusMessage = processingStatus(outputName: currentOutputName, profileName: activeProfile.name)
+            } else {
+                restartEngineWithActiveProfile(rollback: rollback)
+            }
+        } else {
+            restartEngineWithActiveProfile(rollback: rollback)
+        }
+    }
+
+    private func disableActiveProfileProcessing(updateMetrics: Bool) {
+        let shouldStopEngine = isRunning || engineStartTask != nil || engineStateNeedsStop
+        invalidatePendingOutputChange()
+        invalidatePendingEngineStart()
+        if shouldStopEngine {
+            scheduleEngineStop(updateMetrics: updateMetrics)
+        }
+        lifecycleState = .stopped
+        isRunning = false
+        wakeReconnectAttempts = 0
+        wasRunningBeforeSleep = false
+        statusMessage = disabledStatus(outputName: currentOutputName)
+    }
+
+    private var engineStateNeedsStop: Bool {
+        switch engine.state {
+        case .running, .failed:
+            return true
+        case .stopped:
+            return false
         }
     }
 
@@ -1524,6 +1558,13 @@ final class GlassEQAppModel {
             return localized("Processing \(profileName)")
         }
         return localized("Processing \(outputName) with \(profileName)")
+    }
+
+    private func disabledStatus(outputName: String) -> String {
+        guard !outputName.isEmpty, outputName != noOutputName else {
+            return localized("Audio processing disabled")
+        }
+        return localized("Audio processing disabled for \(outputName)")
     }
 
     func startMetricsPolling() {
@@ -1860,7 +1901,7 @@ private struct MenuBarView: View {
                 .tint(popoverControlsAreActive ? enableButtonTint : nil)
                 .accessibilityLabel(Text(model.activeProfile.isBypassed ? localized("Enable equalizer") : localized("Disable equalizer")))
                 .accessibilityValue(Text(statusBadgeTitle))
-                .accessibilityHint(Text(localized("Toggles audio bypass for the active profile")))
+                .accessibilityHint(Text(localized("Starts or stops system audio processing for the active profile")))
 
                 Button {
                     dismiss()
@@ -1921,10 +1962,10 @@ private struct MenuBarView: View {
     }
 
     private var statusBadgeTitle: String {
-        guard model.isRunning else {
-            return localized("Stopped")
+        if model.activeProfile.isBypassed {
+            return localized("Disabled")
         }
-        return model.activeProfile.isBypassed ? localized("Disabled") : localized("Active")
+        return model.isRunning ? localized("Active") : localized("Stopped")
     }
 
     private var statusBadgeColor: Color {
