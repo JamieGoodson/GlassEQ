@@ -25,7 +25,7 @@ GlassEQ takes a different route. It uses **Core Audio process taps**, Apple's mo
 
 ## Download & install
 
-Grab `GlassEQ-alpha-0.8-macos26-arm64.zip` from the [alpha-0.8 release](https://github.com/juhokoskela/GlassEQ/releases/tag/alpha-0.8), then:
+Grab `GlassEQ-alpha-0.8.1-macos26-arm64.zip` from the [alpha-0.8.1 release](https://github.com/juhokoskela/GlassEQ/releases/tag/alpha-0.8.1), then:
 
 1. Unzip it.
 2. Move `GlassEQ.app` to `/Applications`.
@@ -37,7 +37,7 @@ On first run GlassEQ asks for **system audio capture permission** — that's wha
 
 ### About this alpha
 
-GlassEQ is an early alpha: Apple Silicon only, tested on macOS 26, with no automatic updates or crash reporting yet. Expect the occasional rough edge, and please report any hardware-specific audio issues you run into. See [Docs/AlphaTesting.md](Docs/AlphaTesting.md), [Docs/Distribution.md](Docs/Distribution.md), and [Docs/ReleaseNotes-alpha-0.8.md](Docs/ReleaseNotes-alpha-0.8.md) before installing a build.
+GlassEQ is an early alpha: Apple Silicon only, tested on macOS 26, with no automatic updates or crash reporting yet. Expect the occasional rough edge, and please report any hardware-specific audio issues you run into. See [Docs/AlphaTesting.md](Docs/AlphaTesting.md), [Docs/Distribution.md](Docs/Distribution.md), and [Docs/ReleaseNotes-alpha-0.8.1.md](Docs/ReleaseNotes-alpha-0.8.1.md) before installing a build.
 
 ## How it works
 

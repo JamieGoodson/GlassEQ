@@ -79,6 +79,34 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsRetryDisabledActiveProfileDoesNotStartEngine() async throws {
+        var disabled = makeProfile(name: "Disabled")
+        disabled.isBypassed = true
+        let output = makeOutput(uid: "retry-disabled-output", name: "Retry Disabled Output")
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(output))
+        let model = makeModel(
+            store: ProfileStore(profiles: [disabled], fallbackProfileID: disabled.id),
+            engine: engine,
+            lookup: lookup
+        )
+
+        let response = try await model.performSettingsCommand(.retryAudioEngine)
+        await settleAsyncWork()
+
+        let snapshot = try #require(response.snapshot)
+        #expect(snapshot.statusMessage == localized("Audio processing disabled"))
+        #expect(snapshot.activeProfileID == disabled.id)
+        #expect(engine.startCalls.isEmpty)
+        #expect(engine.updateCalls.isEmpty)
+        #expect(engine.updateDSPCalls.isEmpty)
+        #expect(engine.stopCallCount == 0)
+        #expect(lookup.defaultOutputCalls == 0)
+        #expect(!model.isRunning)
+        #expect(model.lifecycleState == .stopped)
+    }
+
+    @Test
     func outputChangeClearsPreviewAndStopPreviewIsNoOp() async {
         let fallback = makeProfile(name: "Fallback")
         let preview = makeProfile(name: "Preview")
@@ -121,6 +149,38 @@ struct GlassEQAppModelLifecycleTests {
 
         #expect(model.activeProfile.id == mapped.id)
         #expect(model.previewReturnProfile == nil)
+    }
+
+    @Test
+    func outputChangeToBypassedProfileDoesNotStartEngine() async {
+        let fallback = makeProfile(name: "Fallback")
+        var disabled = makeProfile(name: "Disabled")
+        disabled.isBypassed = true
+        let output = makeOutput(uid: "disabled-output", name: "Disabled Output")
+        let store = ProfileStore(
+            profiles: [fallback, disabled],
+            outputMappings: [
+                OutputDeviceProfileMapping(outputDeviceUID: output.uid, profileID: disabled.id)
+            ],
+            fallbackProfileID: fallback.id
+        )
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(output))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(store: store, engine: engine, lookup: lookup, observers: observers, outputDelay: .zero)
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.activeProfile.id == disabled.id
+                && model.lifecycleState == .stopped
+                && model.statusMessage == localized("Audio processing disabled for \(output.name)")
+        }
+
+        #expect(engine.startCalls.isEmpty)
+        #expect(engine.stopCallCount == 0)
+        #expect(!model.isRunning)
+        #expect(model.activeProfile.isBypassed)
     }
 
     @Test
@@ -760,9 +820,8 @@ struct GlassEQAppModelLifecycleTests {
         let fallback = makeProfile(name: "Fallback")
         let applied = makeProfile(name: "Applied During Wake")
         let mapped = makeProfile(name: "Mapped During Wake")
-        let preview = makeProfile(name: "Preview During Wake")
         let store = ProfileStore(
-            profiles: [fallback, applied, mapped, preview],
+            profiles: [fallback, applied, mapped],
             fallbackProfileID: fallback.id
         )
         let engine = FakeAudioEngine()
@@ -798,10 +857,8 @@ struct GlassEQAppModelLifecycleTests {
         try model.apply(profile: applied)
         try model.useForCurrentOutput(profile: mapped)
         model.setBypass(true)
-        model.preview(profile: preview)
-        model.stopPreview()
 
-        #expect(model.lifecycleState == .waking)
+        #expect(model.lifecycleState == .stopped)
         #expect(model.activeProfile.id == mapped.id)
         #expect(model.activeProfile.isBypassed)
         #expect(model.previewReturnProfile == nil)
@@ -812,13 +869,12 @@ struct GlassEQAppModelLifecycleTests {
 
         engine.unblockStart(for: output.uid)
         await waitUntil {
-            model.lifecycleState == .running
-                && engine.startCalls.last?.profile.id == mapped.id
-                && engine.startCalls.last?.profile.isBypassed == true
+            engine.stopCallCount == 1
         }
 
-        #expect(model.isRunning)
-        #expect(model.statusMessage == localized("Processing \(output.name) with \(mapped.name)"))
+        #expect(!model.isRunning)
+        #expect(model.lifecycleState == .stopped)
+        #expect(model.statusMessage == localized("Audio processing disabled for \(output.name)"))
     }
 
     @Test
@@ -976,7 +1032,7 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
-    func bypassAfterSelectingDifferentDraftOnlyTogglesActiveProfile() async {
+    func bypassAfterSelectingDifferentDraftOnlyTogglesActiveProfileAndStopsEngine() async {
         let active = makeProfile(name: "Active")
         let draft = makeProfile(name: "Draft")
         let output = makeOutput(uid: "bypass-output", name: "Bypass Output")
@@ -993,6 +1049,9 @@ struct GlassEQAppModelLifecycleTests {
         model.selectProfile(draft.id)
 
         model.setBypass(true)
+        await waitUntil {
+            engine.stopCallCount == 1
+        }
 
         #expect(model.activeProfile.id == active.id)
         #expect(model.activeProfile.isBypassed)
@@ -1002,11 +1061,14 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.profileStore.profiles.first { $0.id == active.id }?.isBypassed == true)
         #expect(model.profileStore.profiles.first { $0.id == draft.id }?.isBypassed == false)
         #expect(engine.updateDSPCalls.isEmpty)
-        #expect(engine.setBypassedCalls == [true])
+        #expect(engine.setBypassedCalls.isEmpty)
+        #expect(engine.stopCallCount == 1)
+        #expect(!model.isRunning)
+        #expect(model.lifecycleState == .stopped)
     }
 
     @Test
-    func bypassMirrorsDraftWhenSelectedProfileIsActiveProfile() async {
+    func bypassMirrorsDraftWhenSelectedProfileIsActiveProfileAndStopsEngine() async {
         let active = makeProfile(name: "Active")
         let output = makeOutput(uid: "active-bypass-output", name: "Active Bypass Output")
         let store = ProfileStore(profiles: [active], fallbackProfileID: active.id)
@@ -1021,6 +1083,9 @@ struct GlassEQAppModelLifecycleTests {
         }
 
         model.setBypass(true)
+        await waitUntil {
+            engine.stopCallCount == 1
+        }
 
         #expect(model.activeProfile.id == active.id)
         #expect(model.activeProfile.isBypassed)
@@ -1028,7 +1093,10 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.draftProfile.isBypassed)
         #expect(model.profileStore.profiles.first { $0.id == active.id }?.isBypassed == true)
         #expect(engine.updateDSPCalls.isEmpty)
-        #expect(engine.setBypassedCalls == [true])
+        #expect(engine.setBypassedCalls.isEmpty)
+        #expect(engine.stopCallCount == 1)
+        #expect(!model.isRunning)
+        #expect(model.lifecycleState == .stopped)
     }
 
     @Test
