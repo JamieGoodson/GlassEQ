@@ -60,7 +60,7 @@ public enum AudioDeviceAvailabilityError: Error, Equatable, LocalizedError, Cust
         case .outputDeviceHasNoOutputChannels(let id):
             "Output device \(id) has no output channels"
         case .unsupportedOutputChannelCount(let id, let channelCount):
-            "Output device \(id) has unsupported channel count \(channelCount); GlassEQ currently supports mono and stereo outputs only"
+            "Output device \(id) reports channel count \(channelCount); GlassEQ supports up to \(CoreAudioDeviceQuery.maxChannelCount) output channels"
         case .invalidDeviceMetadata(let id, let message):
             "Output device \(id) reported invalid Core Audio metadata: \(message)"
         }
@@ -166,8 +166,6 @@ public enum CoreAudioDeviceQuery {
             do {
                 return try outputDevice(id: deviceID)
             } catch AudioDeviceAvailabilityError.outputDeviceHasNoOutputChannels {
-                return nil
-            } catch AudioDeviceAvailabilityError.unsupportedOutputChannelCount {
                 return nil
             }
         }

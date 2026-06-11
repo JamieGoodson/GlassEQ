@@ -44,15 +44,30 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
-    func engineRuntimeChannelPolicyAcceptsMonoAndStereoOnly() throws {
+    func engineRuntimeChannelPolicyAcceptsUpToMaxChannelCount() throws {
         #expect(try SystemTapAudioEngine.supportedRuntimeChannelCount(for: output(channelCount: 1)) == 1)
         #expect(try SystemTapAudioEngine.supportedRuntimeChannelCount(for: output(channelCount: 2)) == 2)
+        #expect(try SystemTapAudioEngine.supportedRuntimeChannelCount(for: output(channelCount: 6)) == 6)
+        #expect(try SystemTapAudioEngine.supportedRuntimeChannelCount(
+            for: output(channelCount: CoreAudioDeviceQuery.maxChannelCount)
+        ) == CoreAudioDeviceQuery.maxChannelCount)
 
         do {
-            _ = try SystemTapAudioEngine.supportedRuntimeChannelCount(for: output(channelCount: 3))
-            Issue.record("Expected multichannel output to be rejected")
+            _ = try SystemTapAudioEngine.supportedRuntimeChannelCount(for: output(channelCount: 0))
+            Issue.record("Expected zero-channel output to be rejected")
         } catch let error as AudioDeviceAvailabilityError {
-            #expect(error == .unsupportedOutputChannelCount(42, 3))
+            #expect(error == .outputDeviceHasNoOutputChannels(42))
+        } catch {
+            Issue.record("Expected no-output-channels error, got \(error)")
+        }
+
+        do {
+            _ = try SystemTapAudioEngine.supportedRuntimeChannelCount(
+                for: output(channelCount: CoreAudioDeviceQuery.maxChannelCount + 1)
+            )
+            Issue.record("Expected out-of-range channel count to be rejected")
+        } catch let error as AudioDeviceAvailabilityError {
+            #expect(error == .unsupportedOutputChannelCount(42, CoreAudioDeviceQuery.maxChannelCount + 1))
         } catch {
             Issue.record("Expected unsupported channel count error, got \(error)")
         }
@@ -61,17 +76,18 @@ struct CoreAudioDeviceTests {
     @Test
     func unsupportedRuntimeChannelCountSkipsDevicePreparation() {
         var didPrepareDevice = false
+        let channelCount = CoreAudioDeviceQuery.maxChannelCount + 1
 
         do {
             _ = try SystemTapAudioEngine.performAfterRuntimeChannelValidation(
-                for: output(channelCount: 6, sampleRate: 44_100)
+                for: output(channelCount: channelCount, sampleRate: 44_100)
             ) {
                 didPrepareDevice = true
-                return output(channelCount: 6, sampleRate: 48_000)
+                return output(channelCount: channelCount, sampleRate: 48_000)
             }
-            Issue.record("Expected multichannel output to be rejected")
+            Issue.record("Expected out-of-range output to be rejected")
         } catch let error as AudioDeviceAvailabilityError {
-            #expect(error == .unsupportedOutputChannelCount(42, 6))
+            #expect(error == .unsupportedOutputChannelCount(42, channelCount))
         } catch {
             Issue.record("Expected unsupported channel count error, got \(error)")
         }

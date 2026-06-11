@@ -1406,7 +1406,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         guard output.outputChannelCount > 0 else {
             throw AudioDeviceAvailabilityError.outputDeviceHasNoOutputChannels(output.id)
         }
-        guard output.outputChannelCount <= 2 else {
+        // getChannelCount sums per-buffer mNumberChannels without bounding them, so a broken
+        // device can still report absurd counts; the playback mapper handles anything below this.
+        guard output.outputChannelCount <= CoreAudioDeviceQuery.maxChannelCount else {
             throw AudioDeviceAvailabilityError.unsupportedOutputChannelCount(output.id, output.outputChannelCount)
         }
         return output.outputChannelCount
