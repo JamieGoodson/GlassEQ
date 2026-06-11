@@ -404,6 +404,29 @@ public enum CoreAudioDeviceQuery {
         return value as String
     }
 
+    /// The device's preferred stereo pair as raw 1-based channel numbers; callers sanitize
+    /// (the HAL reports zeros when the pair was never configured).
+    static func preferredStereoChannels(objectID: AudioObjectID) throws -> (left: UInt32, right: UInt32) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyPreferredChannelsForStereo,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var channels: (UInt32, UInt32) = (0, 0)
+        var size = UInt32(MemoryLayout<(UInt32, UInt32)>.size)
+        try checkOSStatus(
+            AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &channels),
+            operation: "AudioObjectGetPropertyData(preferred stereo channels)"
+        )
+        try validatePropertySize(
+            actual: size,
+            expected: UInt32(MemoryLayout<(UInt32, UInt32)>.size),
+            operation: "AudioObjectGetPropertyData(preferred stereo channels)",
+            objectID: objectID
+        )
+        return (left: channels.0, right: channels.1)
+    }
+
     static func getChannelCount(
         objectID: AudioObjectID,
         scope: AudioObjectPropertyScope

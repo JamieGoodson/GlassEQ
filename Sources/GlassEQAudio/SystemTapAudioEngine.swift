@@ -204,6 +204,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         private let stopping = Atomic<Bool>(false)
         private let captureInCallback = Atomic<Bool>(false)
         private let playbackInCallback = Atomic<Bool>(false)
+        // Packed (left << 32 | right) so the playback callback can never observe a torn pair.
+        private let playbackChannelPair = Atomic<UInt64>(SystemTapAudioEngine.encodedPlaybackChannelPair(left: 0, right: 1))
 
         init(
             profile: EQProfile,
@@ -250,6 +252,15 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         func muteOutputForTransition() {
             outputMutedForTransition.store(true, ordering: .releasing)
             playbackPriming.store(true, ordering: .releasing)
+        }
+
+        // Stored by the control thread on every output rebuild, before the new output IOProc
+        // starts, so the first callback on the new device already maps to the right channels.
+        func setPlaybackChannelPair(left: Int, right: Int) {
+            playbackChannelPair.store(
+                SystemTapAudioEngine.encodedPlaybackChannelPair(left: left, right: right),
+                ordering: .releasing
+            )
         }
 
         // Called when a new output half is started. Clears any transition mute (the runtime
@@ -432,8 +443,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
             recordPlaybackBufferedFrames(ringBuffer.occupancyFrames())
 
+            let (destinationLeftChannel, destinationRightChannel) = SystemTapAudioEngine.decodedPlaybackChannelPair(
+                playbackChannelPair.load(ordering: .acquiring)
+            )
+
             var underrunFrames = 0
-            if let outputSamples = contiguousInterleavedOutputBuffer(
+            if destinationLeftChannel == 0,
+               destinationRightChannel == 1,
+               let outputSamples = contiguousInterleavedOutputBuffer(
                 outputBuffers,
                 frameCount: frameCount,
                 channelCount: channelCount
@@ -470,6 +487,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                             destinationFrameOffset: frameOffset,
                             frameCount: chunkFrames,
                             sourceChannelCount: channelCount,
+                            destinationLeftChannel: destinationLeftChannel,
+                            destinationRightChannel: destinationRightChannel,
                             to: outputBuffers
                         )
                         frameOffset += chunkFrames
@@ -773,6 +792,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             destinationFrameOffset: Int,
             frameCount: Int,
             sourceChannelCount: Int,
+            destinationLeftChannel: Int,
+            destinationRightChannel: Int,
             to buffers: UnsafeMutableAudioBufferListPointer
         ) {
             SystemTapAudioEngine.copyInterleavedSamples(
@@ -781,6 +802,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 destinationFrameOffset: destinationFrameOffset,
                 frameCount: frameCount,
                 sourceChannelCount: sourceChannelCount,
+                destinationLeftChannel: destinationLeftChannel,
+                destinationRightChannel: destinationRightChannel,
                 to: buffers
             )
         }
@@ -1139,6 +1162,16 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         // is ignored via CoreAudioSelfChangeGuard, so it no longer triggers a rebuild loop.
         runtime.muteOutputForTransition()
 
+        // Multi-channel devices play the stereo stream on their preferred stereo pair (the same
+        // channels macOS routes system audio to); every other channel receives silence. The pair
+        // must be stored before AudioDeviceStart so the first callback already maps correctly.
+        let preferredChannels = try? CoreAudioDeviceQuery.preferredStereoChannels(objectID: matchedOutput.id)
+        let channelPair = Self.playbackStereoPair(
+            preferredChannels: preferredChannels,
+            outputChannelCount: matchedOutput.outputChannelCount
+        )
+        runtime.setPlaybackChannelPair(left: channelPair.left, right: channelPair.right)
+
         guard let outputIOProcID = try createOutputIOProc(deviceID: matchedOutput.id, runtime: runtime) else {
             throw CoreAudioError(operation: "AudioDeviceCreateIOProcID(default output)", status: kAudioHardwareUnspecifiedError)
         }
@@ -1379,6 +1412,39 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         return output.outputChannelCount
     }
 
+    /// Normalizes a device-reported preferred stereo pair (1-based channel numbers; the HAL
+    /// reports zeros when the pair was never configured) into 0-based destination channel
+    /// indices. Falls back to the first two channels whenever the report is missing or
+    /// inconsistent; mono devices collapse to (0, 0).
+    static func playbackStereoPair(
+        preferredChannels: (left: UInt32, right: UInt32)?,
+        outputChannelCount: Int
+    ) -> (left: Int, right: Int) {
+        guard outputChannelCount > 1 else {
+            return outputChannelCount == 1 ? (0, 0) : (0, 1)
+        }
+        guard let preferredChannels,
+              preferredChannels.left >= 1,
+              preferredChannels.right >= 1,
+              preferredChannels.left != preferredChannels.right,
+              preferredChannels.left <= UInt32(outputChannelCount),
+              preferredChannels.right <= UInt32(outputChannelCount) else {
+            return (0, 1)
+        }
+        return (Int(preferredChannels.left) - 1, Int(preferredChannels.right) - 1)
+    }
+
+    static func encodedPlaybackChannelPair(left: Int, right: Int) -> UInt64 {
+        let maxChannelIndex = CoreAudioDeviceQuery.maxChannelCount - 1
+        let clampedLeft = UInt64(min(max(left, 0), maxChannelIndex))
+        let clampedRight = UInt64(min(max(right, 0), maxChannelIndex))
+        return (clampedLeft << 32) | clampedRight
+    }
+
+    static func decodedPlaybackChannelPair(_ encoded: UInt64) -> (left: Int, right: Int) {
+        (Int(encoded >> 32), Int(encoded & 0xFFFF_FFFF))
+    }
+
     static func performAfterRuntimeChannelValidation<T>(
         for output: AudioOutputDevice,
         _ operation: () throws -> T
@@ -1418,6 +1484,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         destinationFrameOffset: Int,
         frameCount: Int,
         sourceChannelCount: Int,
+        destinationLeftChannel: Int = 0,
+        destinationRightChannel: Int = 1,
         to buffers: UnsafeMutableAudioBufferListPointer
     ) {
         let sourceChannelCount = max(sourceChannelCount, 1)
@@ -1441,32 +1509,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
         if buffers.count == 1,
            let data = buffers[0].mData?.assumingMemoryBound(to: Float.self),
-           sourceChannelCount == 1,
-           Int(buffers[0].mNumberChannels) > 1,
-           frameCount > 0,
-           sourceFrameOffset >= 0,
-           destinationFrameOffset >= 0 {
-            let destinationChannelCount = Int(buffers[0].mNumberChannels)
-            let destinationSamples = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.stride
-            for frameIndex in 0..<frameCount {
-                let sourceIndex = sourceFrameOffset + frameIndex
-                guard sourceIndex < samples.count else {
-                    continue
-                }
-                let destinationBase = (destinationFrameOffset + frameIndex) * destinationChannelCount
-                guard destinationBase < destinationSamples else {
-                    continue
-                }
-                for channel in 0..<destinationChannelCount where destinationBase + channel < destinationSamples {
-                    data[destinationBase + channel] = samples[sourceIndex]
-                }
-            }
-            return
-        }
-
-        if buffers.count == 1,
-           let data = buffers[0].mData?.assumingMemoryBound(to: Float.self),
            Int(buffers[0].mNumberChannels) == sourceChannelCount,
+           destinationLeftChannel == 0,
+           destinationRightChannel == 1,
            frameCount > 0,
            sourceFrameOffset >= 0,
            destinationFrameOffset >= 0 {
@@ -1483,19 +1528,82 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             }
         }
 
+        // General mapped case: the destination pair channels receive source L/R (mono sources
+        // feed both); every other channel gets explicit zeros. Never trust HAL pre-zeroing —
+        // stray signal would leak into a multi-channel interface's DAW/loopback channels.
+        // Walks the AudioBufferList with a running global channel offset so interleaved,
+        // multi-stream, and per-channel-buffer layouts all map correctly.
+        guard frameCount > 0, sourceFrameOffset >= 0, destinationFrameOffset >= 0 else {
+            return
+        }
+        let sourceRightChannel = min(1, sourceChannelCount - 1)
+        var globalChannelOffset = 0
         for bufferIndex in buffers.indices {
-            guard let data = buffers[bufferIndex].mData?.assumingMemoryBound(to: Float.self) else {
+            let bufferChannels = Int(buffers[bufferIndex].mNumberChannels)
+            guard bufferChannels > 0,
+                  let data = buffers[bufferIndex].mData?.assumingMemoryBound(to: Float.self) else {
+                globalChannelOffset += max(bufferChannels, 0)
                 continue
             }
-            let sourceChannel = min(bufferIndex, sourceChannelCount - 1)
             let destinationSampleCount = Int(buffers[bufferIndex].mDataByteSize) / MemoryLayout<Float>.stride
-            for frameIndex in 0..<frameCount where destinationFrameOffset + frameIndex < destinationSampleCount {
-                let sourceIndex = (sourceFrameOffset + frameIndex) * sourceChannelCount + sourceChannel
-                guard sourceIndex < samples.count else {
-                    continue
-                }
-                data[destinationFrameOffset + frameIndex] = samples[sourceIndex]
+            let zeroStart = destinationFrameOffset * bufferChannels
+            let zeroEnd = min((destinationFrameOffset + frameCount) * bufferChannels, destinationSampleCount)
+            if zeroStart < zeroEnd {
+                data.advanced(by: zeroStart).update(repeating: 0, count: zeroEnd - zeroStart)
             }
+            scatterMappedChannel(
+                samples,
+                sourceChannel: 0,
+                sourceFrameOffset: sourceFrameOffset,
+                sourceChannelCount: sourceChannelCount,
+                localChannel: destinationLeftChannel - globalChannelOffset,
+                destinationFrameOffset: destinationFrameOffset,
+                frameCount: frameCount,
+                bufferChannels: bufferChannels,
+                destinationSampleCount: destinationSampleCount,
+                into: data
+            )
+            scatterMappedChannel(
+                samples,
+                sourceChannel: sourceRightChannel,
+                sourceFrameOffset: sourceFrameOffset,
+                sourceChannelCount: sourceChannelCount,
+                localChannel: destinationRightChannel - globalChannelOffset,
+                destinationFrameOffset: destinationFrameOffset,
+                frameCount: frameCount,
+                bufferChannels: bufferChannels,
+                destinationSampleCount: destinationSampleCount,
+                into: data
+            )
+            globalChannelOffset += bufferChannels
+        }
+    }
+
+    private static func scatterMappedChannel(
+        _ samples: UnsafeBufferPointer<Float>,
+        sourceChannel: Int,
+        sourceFrameOffset: Int,
+        sourceChannelCount: Int,
+        localChannel: Int,
+        destinationFrameOffset: Int,
+        frameCount: Int,
+        bufferChannels: Int,
+        destinationSampleCount: Int,
+        into data: UnsafeMutablePointer<Float>
+    ) {
+        guard localChannel >= 0, localChannel < bufferChannels else {
+            return
+        }
+        for frameIndex in 0..<frameCount {
+            let sourceIndex = (sourceFrameOffset + frameIndex) * sourceChannelCount + sourceChannel
+            guard sourceIndex < samples.count else {
+                continue
+            }
+            let destinationIndex = (destinationFrameOffset + frameIndex) * bufferChannels + localChannel
+            guard destinationIndex < destinationSampleCount else {
+                continue
+            }
+            data[destinationIndex] = samples[sourceIndex]
         }
     }
 
