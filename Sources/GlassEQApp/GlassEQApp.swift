@@ -1389,6 +1389,7 @@ final class GlassEQAppModel {
             return
         }
 
+        let rollback = isRunning ? profileRollback() : nil
         previewReturnProfile = nil
         switch result {
         case .success(let output):
@@ -1400,7 +1401,7 @@ final class GlassEQAppModel {
             if activeProfile.isBypassed {
                 disableActiveProfileProcessing(updateMetrics: false)
             } else {
-                scheduleEngineWork(.start(output: output, profile: activeProfile, rollback: nil))
+                scheduleEngineWork(.start(output: output, profile: activeProfile, rollback: rollback))
             }
         case .failure(let error):
             if lifecycleState == .waking {
