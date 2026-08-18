@@ -1121,7 +1121,7 @@ private struct EditorTab: View {
                     suffix: "dB"
                 )
 
-                    SettingRow(title: localized("Bypass")) {
+                SettingRow(title: localized("Bypass")) {
                     Toggle(localized("Bypass"), isOn: $draftProfile.isBypassed)
                         .labelsHidden()
                         .accessibilityLabel(Text(localized("Bypass")))
@@ -1511,14 +1511,25 @@ private struct GraphicFilterEditor: View {
                     Text(filter.frequency.frequencyLabel)
                         .font(.caption.monospacedDigit())
                         .frame(width: 64, alignment: .trailing)
-                    Slider(value: $filter.gainDB, in: -12...12, step: 0.1)
+                    Slider(
+                        value: Binding(
+                            get: { filter.gainDB },
+                            set: { filter.gainDB = quantized($0, step: 0.1) }
+                        ),
+                        in: -12...12
+                    )
                         .frame(maxWidth: 640)
                         .accessibilityLabel(Text(localized("Gain at \(filter.frequency.frequencyLabel)")))
                         .accessibilityValue(Text(filter.gainDB.dbLabel))
                         .accessibilityHint(Text(localized("Adjusts this graphic EQ band")))
-                    Text(filter.gainDB.dbLabel)
-                        .font(.caption.monospacedDigit())
-                        .frame(width: 56, alignment: .trailing)
+                    EditableValueText(
+                        title: localized("Gain"),
+                        value: $filter.gainDB,
+                        range: -12...12,
+                        step: 0.1,
+                        display: filter.gainDB.dbLabel,
+                        width: 56
+                    )
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(Text(localized("Graphic filter row")))
@@ -1735,12 +1746,26 @@ private struct ParametricFilterInspector: View {
                 .accessibilityHint(Text(localized("Changes the selected filter type")))
             }
 
-            SliderRow(title: localized("Frequency"), value: $filter.frequency, range: 20...20_000, step: 1, suffix: "Hz")
+            SliderRow(title: localized("Frequency"), value: $filter.frequency, range: 20...20_000, step: 1, suffix: "Hz", scale: .logarithmic)
             SliderRow(title: localized("Gain"), value: $filter.gainDB, range: -24...24, step: 0.1, suffix: "dB")
             SliderRow(title: localized("Q"), value: $filter.q, range: 0.1...10, step: 0.01, suffix: "")
         }
         .cardPanel(padding: 16)
     }
+}
+
+// Quantizes slider output in the binding instead of passing `step:` to Slider — stepped macOS
+// sliders render a tick mark per step, which draws a dense line of dots under the track.
+private func quantized(_ value: Double, step: Double) -> Double {
+    guard step > 0 else {
+        return value
+    }
+    return (value / step).rounded() * step
+}
+
+private enum SliderScale {
+    case linear
+    case logarithmic
 }
 
 private struct SliderRow: View {
@@ -1749,6 +1774,7 @@ private struct SliderRow: View {
     var range: ClosedRange<Double>
     var step: Double
     var suffix: String
+    var scale = SliderScale.linear
 
     var body: some View {
         HStack(spacing: 12) {
@@ -1756,15 +1782,46 @@ private struct SliderRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(width: 88, alignment: .leading)
-            Slider(value: $value, in: range, step: step)
+            Slider(value: sliderValue, in: sliderRange)
                 .frame(minWidth: 80)
                 .frame(maxWidth: 640)
                 .accessibilityLabel(Text(title))
                 .accessibilityValue(Text(label))
                 .accessibilityHint(Text(localized("Adjusts \(title.lowercased())")))
-            Text(label)
-                .font(.caption.monospacedDigit())
-                .frame(width: 64, alignment: .trailing)
+            EditableValueText(
+                title: title,
+                value: $value,
+                range: range,
+                step: step,
+                display: label
+            )
+        }
+    }
+
+    private var sliderValue: Binding<Double> {
+        switch scale {
+        case .linear:
+            Binding(
+                get: { value },
+                set: { value = quantized($0, step: step) }
+            )
+        case .logarithmic:
+            Binding(
+                get: { log10(min(max(value, range.lowerBound), range.upperBound)) },
+                set: {
+                    let restored = min(max(pow(10, $0), range.lowerBound), range.upperBound)
+                    value = quantized(restored, step: step)
+                }
+            )
+        }
+    }
+
+    private var sliderRange: ClosedRange<Double> {
+        switch scale {
+        case .linear:
+            range
+        case .logarithmic:
+            log10(range.lowerBound)...log10(range.upperBound)
         }
     }
 
@@ -1776,6 +1833,103 @@ private struct SliderRow: View {
             return value.dbLabel
         }
         return localizedDecimal(value, minimumFractionDigits: 2, maximumFractionDigits: 2)
+    }
+}
+
+// Value readout that becomes a text field on click, so exact values can be typed instead of
+// approximated by dragging the slider.
+private struct EditableValueText: View {
+    var title: String
+    @Binding var value: Double
+    var range: ClosedRange<Double>
+    var step: Double
+    var display: String
+    var width: CGFloat = 64
+
+    @State private var isEditing = false
+    @State private var editText = ""
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Group {
+            if isEditing {
+                TextField(title, text: $editText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption.monospacedDigit())
+                    .multilineTextAlignment(.trailing)
+                    .focused($isFocused)
+                    .onAppear {
+                        isFocused = true
+                    }
+                    .onSubmit(commit)
+                    .onExitCommand {
+                        isEditing = false
+                    }
+                    .onChange(of: isFocused) { _, focused in
+                        if !focused {
+                            commit()
+                        }
+                    }
+            } else {
+                Button {
+                    editText = editableText
+                    isEditing = true
+                } label: {
+                    Text(display)
+                        .font(.caption.monospacedDigit())
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .help(localized("Click to type a value"))
+            }
+        }
+        .frame(width: width)
+        .accessibilityLabel(Text(localized("\(title) value")))
+        .accessibilityValue(Text(display))
+        .accessibilityHint(Text(localized("Edits \(title.lowercased()) as text")))
+    }
+
+    private var editableText: String {
+        let formatter = NumberFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = false
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = editFractionDigits
+        return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+
+    private var editFractionDigits: Int {
+        guard step > 0, step < 1 else {
+            return 0
+        }
+        return step < 0.1 ? 2 : 1
+    }
+
+    private func commit() {
+        guard isEditing else {
+            return
+        }
+        isEditing = false
+        guard let parsed = parseNumber(editText) else {
+            return
+        }
+        value = min(max(parsed, range.lowerBound), range.upperBound)
+    }
+
+    private func parseNumber(_ text: String) -> Double? {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+        let formatter = NumberFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.numberStyle = .decimal
+        if let number = formatter.number(from: trimmed) {
+            return number.doubleValue
+        }
+        return Double(trimmed.replacingOccurrences(of: ",", with: "."))
     }
 }
 
