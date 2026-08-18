@@ -155,7 +155,8 @@ final class SettingsCoordinator: NSObject {
     }
 
     func metricsDidChange() {
-        guard let model else {
+        guard settingsConnected,
+              let model else {
             return
         }
         let metrics = SettingsAudioMetricsDTO(model.engineMetrics)
@@ -393,6 +394,11 @@ final class SettingsCoordinator: NSObject {
 
     private func handleReady(requestID: String) {
         settingsConnected = true
+        if let model {
+            let snapshot = model.settingsSnapshot()
+            lastSentSnapshot = snapshot
+            send(.snapshotChanged(snapshot))
+        }
         sendResponse(SettingsCommandResponse(), requestID: requestID)
         if pendingFocusRequest {
             pendingFocusRequest = false
@@ -937,6 +943,11 @@ extension GlassEQAppModel {
     }
 
     func performSettingsCommand(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
+        try beginSettingsCommand()
+        defer {
+            finishSettingsCommand()
+        }
+
         switch command {
         case .createProfile(let kind):
             try createProfile(kind: kind)
