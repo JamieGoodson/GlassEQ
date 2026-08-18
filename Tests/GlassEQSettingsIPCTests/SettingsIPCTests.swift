@@ -31,6 +31,13 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func playbackBufferCalibrationResetRequiresRunningOutput() {
+        #expect(canResetPlaybackBufferCalibration(isRunning: true, outputUID: "speakers"))
+        #expect(!canResetPlaybackBufferCalibration(isRunning: false, outputUID: "speakers"))
+        #expect(!canResetPlaybackBufferCalibration(isRunning: true, outputUID: ""))
+    }
+
+    @Test
     func editableNumberParsingRejectsLocaleGroupingSeparators() {
         #expect(parseEditableNumber("1.234", locale: Locale(identifier: "de_DE")) == nil)
         #expect(parseEditableNumber("1,234", locale: Locale(identifier: "de_DE")) == 1.234)

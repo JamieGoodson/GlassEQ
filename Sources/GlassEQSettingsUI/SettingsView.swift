@@ -166,6 +166,10 @@ private func localizedFrameCount(_ value: UInt32) -> String {
     return value == 1 ? localized("\(number) frame") : localized("\(number) frames")
 }
 
+func canResetPlaybackBufferCalibration(isRunning: Bool, outputUID: String) -> Bool {
+    isRunning && !outputUID.isEmpty
+}
+
 private func localizedLatency(milliseconds: Double) -> String {
     let number = localizedDecimal(milliseconds, minimumFractionDigits: 2, maximumFractionDigits: 2)
     return localized("\(number) ms")
@@ -2268,7 +2272,10 @@ private struct OutputTab: View {
                         Button(localized("Reset buffer calibration for this device")) {
                             onResetPlaybackBufferCalibration()
                         }
-                        .disabled(snapshot.currentOutputUID.isEmpty)
+                        .disabled(!canResetPlaybackBufferCalibration(
+                            isRunning: snapshot.isRunning,
+                            outputUID: snapshot.currentOutputUID
+                        ))
                         .controlSize(.large)
                         .help(localized("Forget the learned callback size for this output device and calibrate it again"))
                     }
