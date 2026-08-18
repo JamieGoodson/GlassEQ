@@ -79,6 +79,30 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func conversionCapacityStartFailureReportsUnsupportedOutputFormat() async {
+        let output = makeOutput(uid: "converted-output", name: "Converted Output")
+        let error = AudioDeviceAvailabilityError.unsupportedPlaybackConversionBuffer(
+            output.id,
+            requiredPrimeFrames: 50_176,
+            maximumPrimeFrames: 40_960
+        )
+        let engine = FakeAudioEngine()
+        engine.startError = error
+        let lookup = FakeDefaultOutputLookup(.success(output))
+        let model = makeModel(engine: engine, lookup: lookup)
+        let expectedStatus = localized("Output format unsupported: \(error.description)")
+
+        model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .stopped
+                && engine.startCalls.count == 1
+                && model.statusMessage == expectedStatus
+        }
+
+        #expect(model.statusMessage == expectedStatus)
+    }
+
+    @Test
     func runtimeEngineFailureStopsTheModelAndSurfacesItsStatus() async {
         let output = makeOutput(uid: "runtime-output", name: "Runtime Output")
         let engine = FakeAudioEngine()
