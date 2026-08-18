@@ -1257,6 +1257,11 @@ final class GlassEQAppModel {
             return
         }
 
+        if engineStartTask != nil {
+            reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
+            return
+        }
+
         if lifecycleState == .waking {
             reschedulePendingEngineStartWithActiveProfile()
             return
@@ -1472,12 +1477,15 @@ final class GlassEQAppModel {
         }
     }
 
-    private func reschedulePendingEngineStartWithActiveProfile() {
-        guard lifecycleState == .waking,
-              let output = pendingEngineStartOutput else {
+    private func reschedulePendingEngineStartWithActiveProfile(rollback: ProfileRollback? = nil) {
+        guard engineStartTask != nil else {
             return
         }
-        scheduleEngineWork(.start(output: output, profile: activeProfile))
+        if let output = pendingEngineStartOutput {
+            scheduleEngineWork(.start(output: output, profile: activeProfile))
+        } else {
+            scheduleEngineWork(.restart(profile: activeProfile, rollback: rollback))
+        }
     }
 
     private func scheduleWakeReconnectRetry(status: String) {

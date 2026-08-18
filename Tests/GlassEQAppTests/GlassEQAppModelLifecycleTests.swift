@@ -158,6 +158,57 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func profileAppliedDuringRouteStartIsRepublishedAfterTheRouteSettles() async throws {
+        let firstOutput = makeOutput(uid: "profile-first", name: "Profile First", id: 200)
+        let secondOutput = makeOutput(uid: "profile-second", name: "Profile Second", id: 300)
+        let initialProfile = makeProfile(name: "Initial")
+        let appliedProfile = makeProfile(name: "Applied During Route Start")
+        let store = ProfileStore(
+            profiles: [initialProfile, appliedProfile],
+            fallbackProfileID: initialProfile.id
+        )
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        engine.blockStart(for: secondOutput.uid)
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil {
+            engine.startCalls.count == 2
+        }
+        #expect(engine.waitUntilStartIsBlocked(for: secondOutput.uid, timeout: .now() + 1))
+
+        try model.apply(profile: appliedProfile)
+        #expect(engine.updateDSPCalls.isEmpty)
+
+        engine.unblockStart(for: secondOutput.uid)
+        await waitUntil {
+            model.lifecycleState == .running
+                && model.currentOutputUID == secondOutput.uid
+                && engine.startCalls.count == 3
+        }
+
+        #expect(engine.startCalls.last?.profile == appliedProfile)
+        #expect(model.activeProfile == appliedProfile)
+        #expect(model.statusMessage == localized("Processing \(secondOutput.name) with \(appliedProfile.name)"))
+    }
+
+    @Test
     func staleRuntimeFailureDoesNotStopCompletedNewerRoute() async {
         let firstOutput = makeOutput(uid: "stale-runtime-first", name: "Stale Runtime First", id: 200)
         let secondOutput = makeOutput(uid: "stale-runtime-second", name: "Stale Runtime Second", id: 300)
