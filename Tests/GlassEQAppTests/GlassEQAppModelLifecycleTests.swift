@@ -1389,7 +1389,7 @@ struct GlassEQAppModelLifecycleTests {
         let model = makeModel()
         let coordinator = SettingsCoordinator(
             model: model,
-            helperLauncher: ClosedInputSettingsHelperLauncher(),
+            helperLauncher: try ClosedInputSettingsHelperLauncher(),
             helperValidator: PermissiveSettingsHelperLaunchValidator(),
             settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
         )
@@ -1805,15 +1805,21 @@ private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching 
     }
 }
 
-private struct ClosedInputSettingsHelperLauncher: SettingsHelperLaunching {
+private final class ClosedInputSettingsHelperLauncher: SettingsHelperLaunching {
+    private let input = Pipe()
+    private let output = Pipe()
+    private let error = Pipe()
+
+    init() throws {
+        try input.fileHandleForReading.close()
+    }
+
     func launch(
         executableURL: URL,
         arguments: [String],
         terminationHandler: @escaping @Sendable (Process) -> Void
     ) throws -> SettingsHelperLaunch {
-        let input = Pipe()
-        try input.fileHandleForReading.close()
-        return SettingsHelperLaunch(process: Process(), input: input, output: Pipe(), error: Pipe())
+        SettingsHelperLaunch(process: Process(), input: input, output: output, error: error)
     }
 }
 
