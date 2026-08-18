@@ -52,7 +52,8 @@ let package = Package(
             dependencies: [
                 "GlassEQCore",
                 "GlassEQAudio",
-                "GlassEQSettingsIPC"
+                "GlassEQSettingsIPC",
+                "GlassEQSettingsUI"
             ],
             exclude: [
                 "Info.plist"
@@ -104,7 +105,8 @@ let package = Package(
                 "GlassEQApp",
                 "GlassEQAudio",
                 "GlassEQCore",
-                "GlassEQSettingsIPC"
+                "GlassEQSettingsIPC",
+                "GlassEQSettingsUI"
             ]
         ),
         .testTarget(

@@ -2,7 +2,12 @@ import AppKit
 import GlassEQAudio
 import GlassEQCore
 import GlassEQSettingsIPC
+import GlassEQSettingsUI
 import SwiftUI
+
+private enum GlassEQWindowID {
+    static let inProcessSettings = "in-process-settings"
+}
 
 @main
 struct GlassEQApp: App {
@@ -18,8 +23,44 @@ struct GlassEQApp: App {
                 .accessibilityLabel(Text(model.menuBarAccessibilityLabel))
                 .accessibilityValue(Text(model.statusMessage))
                 .accessibilityHint(Text(localized("Opens GlassEQ controls")))
+                .background {
+                    InProcessSettingsPresenter(model: model)
+                }
         }
         .menuBarExtraStyle(.window)
+
+        Window(localized("Configure GlassEQ"), id: GlassEQWindowID.inProcessSettings) {
+            SettingsView(model: model.inProcessSettingsViewModel())
+                .frame(minWidth: 760, minHeight: 500)
+                .onAppear {
+                    NSApplication.shared.setActivationPolicy(.regular)
+                    model.inProcessSettingsDidAppear()
+                }
+                .onDisappear {
+                    model.inProcessSettingsDidDisappear()
+                    NSApplication.shared.setActivationPolicy(.accessory)
+                }
+        }
+        .defaultSize(width: 1180, height: 720)
+        .windowResizability(.contentMinSize)
+        .windowStyle(.hiddenTitleBar)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+    }
+}
+
+private struct InProcessSettingsPresenter: View {
+    let model: GlassEQAppModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onChange(of: model.inProcessSettingsPresentationGeneration) {
+                NSApplication.shared.setActivationPolicy(.regular)
+                openWindow(id: GlassEQWindowID.inProcessSettings)
+                NSApplication.shared.activate(ignoringOtherApps: true)
+            }
     }
 }
 
@@ -42,9 +83,12 @@ final class GlassEQAppDelegate: NSObject, NSApplicationDelegate {
                 sender.reply(toApplicationShouldTerminate: true)
                 return
             }
+            await model.stopAcceptingSettingsCommandsAndWait()
             let shouldTerminate = await model.flushStoreBeforeQuit()
             if shouldTerminate {
                 await model.cleanupForTerminationAndWait()
+            } else {
+                model.resumeSettingsCommandsAfterCancelledQuit()
             }
             sender.reply(toApplicationShouldTerminate: shouldTerminate)
         }
@@ -358,6 +402,7 @@ final class GlassEQAppModel {
     private let defaultOutputLookup: any DefaultOutputLookingUp
     private let observerFactory: any DefaultOutputObservingMaking
     private let workspaceOpener: any WorkspaceOpening
+    private let profileImportOperation: @Sendable (ImportFormat, String, String) async -> Result<EQProfile, any Error>
     private let outputChangeSettlingDelayOverride: Duration?
     private let wakeReconnectDelayOverride: Duration?
     private let saveDebounceDelay: Duration
@@ -365,6 +410,9 @@ final class GlassEQAppModel {
     private var metricsTask: Task<Void, Never>?
     private var outputChangeTask: Task<Void, Never>?
     private var engineStartTask: Task<Void, Never>?
+    private var activeSettingsCommandCount = 0
+    private var acceptsSettingsCommands = true
+    private var settingsCommandDrainWaiters: [CheckedContinuation<Void, Never>] = []
     private var pendingSaveTask: Task<Void, Never>?
     private var lifecycleObserverTokens: [NSObjectProtocol] = []
     private var wasRunningBeforeSleep = false
@@ -377,6 +425,10 @@ final class GlassEQAppModel {
     private var profilePersistenceMode: ProfilePersistenceMode = .normal
     @ObservationIgnored private let engineWorkExecutor = EngineWorkExecutor()
     @ObservationIgnored lazy var settingsCoordinator = SettingsCoordinator(model: self)
+    @ObservationIgnored var inProcessSettingsViewModelStorage: GlassEQSettingsViewModel?
+    @ObservationIgnored var inProcessSettingsIsPresented = false
+    @ObservationIgnored var inProcessSettingsPresentationIsPending = false
+    var inProcessSettingsPresentationGeneration = 0
 
     private enum ProfilePersistenceMode: Equatable, Sendable {
         case normal
@@ -428,6 +480,7 @@ final class GlassEQAppModel {
         installLifecycleObservers shouldInstallLifecycleObservers: Bool = true,
         registerAppDelegate: Bool = true,
         workspaceOpener: any WorkspaceOpening = NSWorkspace.shared,
+        profileImportOperation: (@Sendable (ImportFormat, String, String) async -> Result<EQProfile, any Error>)? = nil,
         saveDebounceDelay: Duration = .milliseconds(250),
         outputChangeSettlingDelayOverride: Duration? = nil,
         wakeReconnectDelayOverride: Duration? = nil
@@ -457,6 +510,18 @@ final class GlassEQAppModel {
         self.defaultOutputLookup = defaultOutputLookup
         self.observerFactory = observerFactory
         self.workspaceOpener = workspaceOpener
+        self.profileImportOperation = profileImportOperation ?? { format, name, text in
+            await Task.detached(priority: .userInitiated) {
+                Result<EQProfile, Error> {
+                    switch format {
+                    case .autoEQ:
+                        try EQProfileTextImporter.importAutoEQ(text, profileName: name)
+                    case .rew:
+                        try EQProfileTextImporter.importREW(text, profileName: name)
+                    }
+                }
+            }.value
+        }
         self.saveDebounceDelay = saveDebounceDelay
         self.outputChangeSettlingDelayOverride = outputChangeSettlingDelayOverride
         self.wakeReconnectDelayOverride = wakeReconnectDelayOverride
@@ -788,18 +853,11 @@ final class GlassEQAppModel {
         statusMessage = localized("Importing \(format.title)...")
         notifyModelDidChange()
 
-        let result = await Task.detached(priority: .userInitiated) {
-            Result<EQProfile, Error> {
-                let imported: EQProfile
-            switch format {
-            case .autoEQ:
-                imported = try EQProfileTextImporter.importAutoEQ(text, profileName: name)
-            case .rew:
-                imported = try EQProfileTextImporter.importREW(text, profileName: name)
-            }
-                return imported
-            }
-        }.value
+        let result = await profileImportOperation(format, name, text)
+        try Task.checkCancellation()
+        guard lifecycleState != .terminating else {
+            throw CancellationError()
+        }
 
         switch result {
         case .success(let imported):
@@ -1494,6 +1552,41 @@ final class GlassEQAppModel {
         }
     }
 
+    func beginSettingsCommand() throws {
+        guard acceptsSettingsCommands,
+              lifecycleState != .terminating else {
+            throw SettingsCommandFailure(message: localized("GlassEQ is shutting down."))
+        }
+        activeSettingsCommandCount += 1
+    }
+
+    func finishSettingsCommand() {
+        activeSettingsCommandCount -= 1
+        guard activeSettingsCommandCount == 0 else {
+            return
+        }
+        let waiters = settingsCommandDrainWaiters
+        settingsCommandDrainWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func stopAcceptingSettingsCommandsAndWait() async {
+        acceptsSettingsCommands = false
+        guard activeSettingsCommandCount > 0 else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            settingsCommandDrainWaiters.append(continuation)
+        }
+    }
+
+    func resumeSettingsCommandsAfterCancelledQuit() {
+        guard lifecycleState != .terminating else {
+            return
+        }
+        acceptsSettingsCommands = true
+    }
+
     func resetUnsupportedProfileStore() async throws {
         guard profilePersistenceMode.isProtected else {
             throw SettingsCommandFailure(message: localized("Profile store reset is only available for stores written by a newer GlassEQ."))
@@ -1519,7 +1612,9 @@ final class GlassEQAppModel {
                 NSApplication.shared.terminate(nil)
                 return
             }
+            await self.stopAcceptingSettingsCommandsAndWait()
             guard await self.flushStoreBeforeQuit() else {
+                self.resumeSettingsCommandsAfterCancelledQuit()
                 return
             }
             await self.cleanupForTerminationAndWait()
@@ -1607,11 +1702,13 @@ final class GlassEQAppModel {
     func notifyModelDidChange() {
         NotificationCenter.default.post(name: .glassEQModelDidChange, object: self)
         settingsCoordinator.modelDidChange()
+        refreshInProcessSettingsSnapshot()
     }
 
     private func notifyMetricsDidChange() {
         NotificationCenter.default.post(name: .glassEQMetricsDidChange, object: self)
         settingsCoordinator.metricsDidChange()
+        refreshInProcessSettingsMetrics()
     }
 
     private func stopObserver() {
@@ -1770,6 +1867,7 @@ final class GlassEQAppModel {
     }
 
     func cleanupForTerminationAndWait() async {
+        await stopAcceptingSettingsCommandsAndWait()
         guard prepareForTermination(shutdownSettings: false) else {
             return
         }
@@ -1782,6 +1880,7 @@ final class GlassEQAppModel {
             return false
         }
         lifecycleState = .terminating
+        acceptsSettingsCommands = false
         wasRunningBeforeSleep = false
         invalidatePendingOutputChange()
         invalidatePendingEngineStart()

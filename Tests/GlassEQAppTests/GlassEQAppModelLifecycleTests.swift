@@ -364,7 +364,9 @@ struct GlassEQAppModelLifecycleTests {
         observers.observers.last?.emit(.success(output))
 
         await waitUntil {
-            engine.stopCallCount == 1 && engine.startCalls.count == 2
+            engine.stopCallCount == 1
+                && engine.startCalls.count == 2
+                && model.lifecycleState == .running
         }
 
         #expect(engine.events == ["start:\(output.uid)", "stop", "start:\(output.uid)"])
@@ -1289,6 +1291,46 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func quitWaitsForInFlightImportBeforeFlushingProfiles() async throws {
+        let storeURL = temporaryAppStoreURL()
+        defer { removeTemporaryStoreDirectory(for: storeURL) }
+        let importer = BlockingProfileImportOperation()
+        let importedProfile = makeProfile(name: "Imported Before Quit")
+        let model = makeModel(
+            storeURL: storeURL,
+            profileImportOperation: { format, name, text in
+                await importer.run(format: format, name: name, text: text)
+            }
+        )
+
+        let importTask = Task {
+            try await model.performSettingsCommand(.importProfile(
+                format: .autoEQ,
+                name: importedProfile.name,
+                text: "1 0"
+            ))
+        }
+        await waitUntil {
+            importer.hasEntered
+        }
+
+        let flushTask = Task {
+            await model.stopAcceptingSettingsCommandsAndWait()
+            return await model.flushStoreBeforeQuit()
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(!FileManager.default.fileExists(atPath: storeURL.path))
+
+        importer.complete(with: .success(importedProfile))
+        _ = try await importTask.value
+        #expect(await flushTask.value)
+
+        let loaded = ProfilePersistence.load(from: storeURL).store
+        #expect(loaded.profiles.contains { $0.name == importedProfile.name })
+        model.resumeSettingsCommandsAfterCancelledQuit()
+    }
+
+    @Test
     func settingsLaunchValidationFailureTerminatesPartiallyStartedHelper() async throws {
         let model = makeModel()
         let launcher = SleepingSettingsHelperLauncher()
@@ -1299,7 +1341,7 @@ struct GlassEQAppModelLifecycleTests {
             settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
         )
 
-        coordinator.openSettings()
+        let disposition = coordinator.openSettings()
 
         let process = try #require(launcher.launchedProcesses.first)
         defer {
@@ -1308,6 +1350,11 @@ struct GlassEQAppModelLifecycleTests {
             }
         }
         #expect(!coordinator.hasActiveSessionResourcesForTesting)
+        if case .inProcessFallback(let reason) = disposition {
+            #expect(reason.contains("Intentional post-launch validation failure"))
+        } else {
+            Issue.record("Expected in-process Settings fallback")
+        }
         for _ in 0..<250 {
             if !process.isRunning {
                 break
@@ -1315,7 +1362,336 @@ struct GlassEQAppModelLifecycleTests {
             try? await Task.sleep(for: .milliseconds(10))
         }
         #expect(!process.isRunning)
-        #expect(model.statusMessage.contains("Settings failed to open"))
+    }
+
+    @Test
+    func settingsLaunchPermissionFailureRequestsInProcessFallback() {
+        let model = makeModel()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: PermissionDeniedSettingsHelperLauncher(),
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        let disposition = coordinator.openSettings()
+
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+        if case .inProcessFallback(let reason) = disposition {
+            #expect(reason.contains("Operation not permitted"))
+        } else {
+            Issue.record("Expected in-process Settings fallback after EPERM")
+        }
+    }
+
+    @Test
+    func settingsHelperExitBeforeConnectingRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: ProcessSettingsHelperLauncher(),
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("exited before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
+    func settingsHelperExitAfterConnectBeforeReadyRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        try launcher.writeHelperOutput(try SettingsPipeCodec.encodeLine(
+            .request(sessionToken: token, id: "connect", kind: .connect, command: nil)
+        ))
+        try launcher.closeHelperOutput()
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("exited before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
+    func malformedSettingsIPCBeforeConnectingRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        try launcher.writeHelperOutput(Data("not-json\n".utf8))
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("IPC failed before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
+    func settingsModelNotificationPublishesMetricsOnlyChanges() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        let requests = try SettingsPipeCodec.encodeLine(
+            .request(sessionToken: token, id: "connect", kind: .connect, command: nil)
+        ) + SettingsPipeCodec.encodeLine(
+            .request(sessionToken: token, id: "ready", kind: .ready, command: nil)
+        )
+        try launcher.writeHelperOutput(requests)
+        for _ in 0..<100 where !coordinator.isHelperReadyForTesting {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(coordinator.isHelperReadyForTesting)
+        let baselineMessageCount = launcher.receivedAppMessages.count
+
+        model.engineMetrics = AudioEngineMetrics(capturedFrames: 42)
+        coordinator.modelDidChange()
+
+        let expectedMessage = SettingsPipeMessage.event(
+            sessionToken: token,
+            event: .metricsChanged(SettingsAudioMetricsDTO(capturedFrames: 42))
+        )
+        await waitUntil {
+            launcher.receivedAppMessages
+                .dropFirst(baselineMessageCount)
+                .contains(expectedMessage)
+        }
+        #expect(launcher.receivedAppMessages.contains(expectedMessage))
+        coordinator.shutdown()
+    }
+
+    @Test
+    func settingsReadyPublishesChangesThatOccurredAfterConnect() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "connect",
+            kind: .connect,
+            command: nil
+        ))
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .response(_, "connect", _, _) = message {
+                    return true
+                }
+                return false
+            }
+        }
+
+        model.statusMessage = "Changed before ready"
+        model.engineMetrics = AudioEngineMetrics(capturedFrames: 42)
+        coordinator.modelDidChange()
+        coordinator.metricsDidChange()
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "ready",
+            kind: .ready,
+            command: nil
+        ))
+
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                guard case .event(_, .snapshotChanged(let snapshot)) = message else {
+                    return false
+                }
+                return snapshot.statusMessage == "Changed before ready"
+                    && snapshot.metrics.capturedFrames == 42
+            }
+        }
+        #expect(coordinator.isHelperReadyForTesting)
+        coordinator.shutdown()
+    }
+
+    @Test
+    func settingsReadyAcknowledgmentFailureRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "connect",
+            kind: .connect,
+            command: nil
+        ))
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .response(_, "connect", _, _) = message {
+                    return true
+                }
+                return false
+            }
+        }
+
+        try launcher.closeHelperInput()
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "ready",
+            kind: .ready,
+            command: nil
+        ))
+
+        await waitUntil {
+            model.inProcessSettingsPresentationGeneration == 1
+        }
+        #expect(model.statusMessage.contains("IPC failed before connecting"))
+        #expect(!coordinator.isHelperReadyForTesting)
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
+    func settingsBootstrapWriteFailureRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: try ClosedInputSettingsHelperLauncher(),
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("IPC failed before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
+    func activeInProcessSettingsFallbackIsReusedWithoutLaunchingHelper() {
+        let model = makeModel()
+
+        model.inProcessSettingsDidAppear()
+        #expect(model.openSettings() == .activeInProcessFallback)
+
+        model.inProcessSettingsDidDisappear()
+    }
+
+    @Test
+    func pendingInProcessSettingsFallbackIsReusedWithoutLaunchingHelper() {
+        let model = makeModel()
+
+        model.requestInProcessSettingsPresentation()
+        let firstGeneration = model.inProcessSettingsPresentationGeneration
+
+        #expect(model.openSettings() == .activeInProcessFallback)
+        #expect(model.inProcessSettingsPresentationGeneration == firstGeneration + 1)
+    }
+
+    @Test
+    func inProcessSettingsFallbackPerformsCommandsAndTracksModelChanges() async throws {
+        let model = makeModel()
+        let settingsModel = model.inProcessSettingsViewModel()
+        let snapshotVersion = settingsModel.snapshotVersion
+
+        #expect(settingsModel.isConnected)
+        #expect(settingsModel.snapshot == model.settingsSnapshot())
+        #expect(model.inProcessSettingsViewModel() === settingsModel)
+        #expect(settingsModel.snapshotVersion == snapshotVersion)
+
+        let response = await settingsModel.perform(.createProfile(.parametric))
+        #expect(response?.snapshot?.profiles.count == 2)
+        #expect(settingsModel.snapshot == model.settingsSnapshot())
     }
 
     @Test
@@ -1482,6 +1858,7 @@ private func makeModel(
     lookup: FakeDefaultOutputLookup = FakeDefaultOutputLookup(.success(makeOutput())),
     observers: any DefaultOutputObservingMaking = FakeDefaultOutputObserverFactory(),
     workspaceOpener: any WorkspaceOpening = FakeWorkspaceOpener(results: []),
+    profileImportOperation: (@Sendable (ImportFormat, String, String) async -> Result<EQProfile, any Error>)? = nil,
     saveDelay: Duration = .zero,
     outputDelay: Duration? = nil,
     wakeDelay: Duration? = nil
@@ -1497,10 +1874,43 @@ private func makeModel(
         installLifecycleObservers: false,
         registerAppDelegate: false,
         workspaceOpener: workspaceOpener,
+        profileImportOperation: profileImportOperation,
         saveDebounceDelay: saveDelay,
         outputChangeSettlingDelayOverride: outputDelay,
         wakeReconnectDelayOverride: wakeDelay
     )
+}
+
+private final class BlockingProfileImportOperation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entered = false
+    private var continuation: CheckedContinuation<Result<EQProfile, any Error>, Never>?
+
+    var hasEntered: Bool {
+        lock.withLock { entered }
+    }
+
+    func run(
+        format: ImportFormat,
+        name: String,
+        text: String
+    ) async -> Result<EQProfile, any Error> {
+        await withCheckedContinuation { continuation in
+            lock.withLock {
+                self.continuation = continuation
+                entered = true
+            }
+        }
+    }
+
+    func complete(with result: Result<EQProfile, any Error>) {
+        let continuation = lock.withLock {
+            let continuation = self.continuation
+            self.continuation = nil
+            return continuation
+        }
+        continuation?.resume(returning: result)
+    }
 }
 
 private func normalizedStore(_ store: ProfileStore) -> ProfileStore {
@@ -1643,6 +2053,96 @@ private struct FailingSettingsHelperLaunchValidator: SettingsHelperLaunchValidat
 
     func validateRunningProcess(processIdentifier: pid_t, expectedHelperURL: URL) throws {
         throw SettingsCommandFailure(message: "Intentional post-launch validation failure")
+    }
+}
+
+private struct PermissiveSettingsHelperLaunchValidator: SettingsHelperLaunchValidating {
+    func validatedExecutableURL(for helperURL: URL) throws -> URL {
+        URL(fileURLWithPath: "/usr/bin/true")
+    }
+
+    func validateRunningProcess(processIdentifier: pid_t, expectedHelperURL: URL) throws {}
+}
+
+private struct PermissionDeniedSettingsHelperLauncher: SettingsHelperLaunching {
+    func launch(
+        executableURL: URL,
+        arguments: [String],
+        terminationHandler: @escaping @Sendable (Process) -> Void
+    ) throws -> SettingsHelperLaunch {
+        throw POSIXError(.EPERM)
+    }
+}
+
+private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching, @unchecked Sendable {
+    private let input = Pipe()
+    private let output = Pipe()
+    private let error = Pipe()
+    private let messagesLock = NSLock()
+    private var messages: [SettingsPipeMessage] = []
+    private var appReadPump: SettingsPipeReadPump?
+
+    var receivedAppMessages: [SettingsPipeMessage] {
+        messagesLock.withLock { messages }
+    }
+
+    func launch(
+        executableURL: URL,
+        arguments: [String],
+        terminationHandler: @escaping @Sendable (Process) -> Void
+    ) throws -> SettingsHelperLaunch {
+        let pump = SettingsPipeReadPump(
+            label: "com.glasseq.tests.settings-helper-input",
+            onMessages: { [weak self] result in
+                guard let self, case .success(let messages) = result else {
+                    return
+                }
+                messagesLock.withLock {
+                    self.messages.append(contentsOf: messages)
+                }
+            },
+            onEndOfFile: {}
+        )
+        appReadPump = pump
+        pump.install(on: input.fileHandleForReading)
+        return SettingsHelperLaunch(process: Process(), input: input, output: output, error: error)
+    }
+
+    func writeHelperOutput(_ data: Data) throws {
+        try output.fileHandleForWriting.write(contentsOf: data)
+    }
+
+    func writeHelperMessage(_ message: SettingsPipeMessage) throws {
+        try writeHelperOutput(SettingsPipeCodec.encodeLine(message))
+    }
+
+    func closeHelperOutput() throws {
+        try output.fileHandleForWriting.close()
+    }
+
+    func closeHelperInput() throws {
+        appReadPump?.invalidate(handle: input.fileHandleForReading)
+        appReadPump = nil
+        try input.fileHandleForReading.close()
+    }
+
+}
+
+private final class ClosedInputSettingsHelperLauncher: SettingsHelperLaunching {
+    private let input = Pipe()
+    private let output = Pipe()
+    private let error = Pipe()
+
+    init() throws {
+        try input.fileHandleForReading.close()
+    }
+
+    func launch(
+        executableURL: URL,
+        arguments: [String],
+        terminationHandler: @escaping @Sendable (Process) -> Void
+    ) throws -> SettingsHelperLaunch {
+        SettingsHelperLaunch(process: Process(), input: input, output: output, error: error)
     }
 }
 

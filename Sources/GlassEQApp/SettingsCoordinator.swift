@@ -3,11 +3,21 @@ import Darwin
 import Foundation
 import GlassEQCore
 import GlassEQSettingsIPC
+import GlassEQSettingsUI
+import OSLog
 import Security
 
 private struct UncheckedSendable<Value>: @unchecked Sendable {
     var value: Value
 }
+
+enum SettingsOpenDisposition: Equatable {
+    case helper
+    case inProcessFallback(reason: String)
+    case activeInProcessFallback
+}
+
+private let settingsLogger = Logger(subsystem: "com.glasseq.app", category: "Settings")
 
 struct SettingsHelperLaunch {
     var process: Process
@@ -84,6 +94,7 @@ final class SettingsCoordinator: NSObject {
     private var pipeReadDelivery: SettingsPipeOrderedMainActorDelivery?
     private var pipeWritePump: SettingsPipeWritePump?
     private var settingsConnected = false
+    private var readyAcknowledgmentPending = false
     private var pendingFocusRequest = false
     private var suppressedModelChangeDepth = 0
     private var lastSentSnapshot: SettingsSnapshot?
@@ -101,7 +112,8 @@ final class SettingsCoordinator: NSObject {
         super.init()
     }
 
-    func openSettings() {
+    @discardableResult
+    func openSettings() -> SettingsOpenDisposition {
         if let helperProcess, helperProcess.isRunning {
             if settingsConnected {
                 send(.focusRequested)
@@ -109,17 +121,19 @@ final class SettingsCoordinator: NSObject {
                 pendingFocusRequest = true
             }
             focusSettings()
-            return
+            return .helper
         }
 
         do {
             let token = try prepareSession()
             pendingFocusRequest = true
             try launchHelper(token: token)
+            return .helper
         } catch {
-            model?.statusMessage = localized("Settings failed to open: \(error.localizedDescription)")
-            model?.notifyModelDidChangeFromCoordinator()
+            let reason = error.localizedDescription
+            settingsLogger.error("Settings helper failed to launch; using in-process fallback: \(reason, privacy: .public)")
             cleanupSession(terminateHelper: true)
+            return .inProcessFallback(reason: reason)
         }
     }
 
@@ -142,7 +156,8 @@ final class SettingsCoordinator: NSObject {
     }
 
     func metricsDidChange() {
-        guard let model else {
+        guard settingsConnected,
+              let model else {
             return
         }
         let metrics = SettingsAudioMetricsDTO(model.engineMetrics)
@@ -160,6 +175,7 @@ final class SettingsCoordinator: NSObject {
         let token = try Self.makeSessionToken()
         launchToken = token
         settingsConnected = false
+        readyAcknowledgmentPending = false
         pendingFocusRequest = false
         suppressedModelChangeDepth = 0
         lastSentSnapshot = nil
@@ -187,9 +203,9 @@ final class SettingsCoordinator: NSObject {
             arguments: [
                 "--glasseq-main-pid", String(ProcessInfo.processInfo.processIdentifier)
             ],
-            terminationHandler: { [weak self] _ in
+            terminationHandler: { [weak self] process in
                 Task { @MainActor in
-                    self?.cleanupSession(terminateHelper: false)
+                    self?.handleHelperTermination(process)
                 }
             }
         )
@@ -205,7 +221,7 @@ final class SettingsCoordinator: NSObject {
         )
         pipeReader = helperOutput.fileHandleForReading
         pipeErrorReader = helperError.fileHandleForReading
-        installPipeReader(helperOutput.fileHandleForReading)
+        installPipeReader(helperOutput.fileHandleForReading, sessionToken: token)
         pipeErrorReader?.readabilityHandler = { handle in
             _ = handle.availableData
         }
@@ -253,6 +269,10 @@ final class SettingsCoordinator: NSObject {
             launchToken != nil ||
             runningApplication != nil
     }
+
+    var isHelperReadyForTesting: Bool {
+        settingsConnected
+    }
     #endif
 
     private func perform(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
@@ -276,7 +296,7 @@ final class SettingsCoordinator: NSObject {
         writePipeMessage(.event(sessionToken: launchToken, event: event))
     }
 
-    private func installPipeReader(_ readHandle: FileHandle) {
+    private func installPipeReader(_ readHandle: FileHandle, sessionToken: String) {
         let delivery = SettingsPipeOrderedMainActorDelivery(
             label: "com.glasseq.settings-coordinator.pipe-read.delivery"
         )
@@ -294,13 +314,38 @@ final class SettingsCoordinator: NSObject {
             },
             onEndOfFile: { [weak self, delivery] in
                 delivery.enqueue {
-                    self?.cleanupSession(terminateHelper: false)
+                    self?.handlePipeEndOfFile(sessionToken: sessionToken)
                 }
             }
         )
         pipeReadDelivery = delivery
         pipeReadPump = pump
         pump.install(on: readHandle)
+    }
+
+    private func handleHelperTermination(_ process: Process) {
+        guard helperProcess === process else {
+            return
+        }
+        handleHelperExitBeforeConnectionIfNeeded()
+    }
+
+    private func handlePipeEndOfFile(sessionToken: String) {
+        guard launchToken == sessionToken else {
+            return
+        }
+        handleHelperExitBeforeConnectionIfNeeded()
+    }
+
+    private func handleHelperExitBeforeConnectionIfNeeded() {
+        let shouldUseFallback = !settingsConnected
+        cleanupSession(terminateHelper: false)
+        guard shouldUseFallback else {
+            return
+        }
+        model?.requestInProcessSettingsPresentation(
+            statusMessage: localized("Settings helper exited before connecting. Opened Settings in GlassEQ instead.")
+        )
     }
 
     private func handlePipeMessages(_ messages: [SettingsPipeMessage]) {
@@ -324,6 +369,8 @@ final class SettingsCoordinator: NSObject {
             break
         case let .request(_, id, .connect, _):
             handleConnect(requestID: id)
+        case let .request(_, id, .ready, _):
+            handleReady(requestID: id)
         case let .request(_, id, .command, command):
             guard let command else {
                 sendError("Settings IPC command payload was missing.", requestID: id)
@@ -342,13 +389,33 @@ final class SettingsCoordinator: NSObject {
             sendError("GlassEQ is shutting down.", requestID: requestID)
             return
         }
-        settingsConnected = true
         let snapshot = model.settingsSnapshot()
         lastSentSnapshot = snapshot
         sendResponse(SettingsCommandResponse(snapshot: snapshot), requestID: requestID)
-        if pendingFocusRequest {
-            pendingFocusRequest = false
-            send(.focusRequested)
+    }
+
+    private func handleReady(requestID: String) {
+        guard !settingsConnected,
+              !readyAcknowledgmentPending else {
+            return
+        }
+        readyAcknowledgmentPending = true
+        sendResponse(SettingsCommandResponse(), requestID: requestID) { [weak self] in
+            guard let self,
+                  readyAcknowledgmentPending else {
+                return
+            }
+            readyAcknowledgmentPending = false
+            settingsConnected = true
+            if let model {
+                let snapshot = model.settingsSnapshot()
+                lastSentSnapshot = snapshot
+                send(.snapshotChanged(snapshot))
+            }
+            if pendingFocusRequest {
+                pendingFocusRequest = false
+                send(.focusRequested)
+            }
         }
     }
 
@@ -388,6 +455,8 @@ final class SettingsCoordinator: NSObject {
             send(.snapshotChanged(snapshot))
             return
         }
+
+        let metricsChanged = previous.metrics != snapshot.metrics
 
         var patch = SettingsSnapshotPatchDTO()
         var didPatch = false
@@ -449,18 +518,31 @@ final class SettingsCoordinator: NSObject {
 
         guard didPatch else {
             lastSentSnapshot = snapshot
+            if metricsChanged {
+                send(.metricsChanged(snapshot.metrics))
+            }
             return
         }
 
         lastSentSnapshot = snapshot
         send(.snapshotPatched(patch))
+        if metricsChanged {
+            send(.metricsChanged(snapshot.metrics))
+        }
     }
 
-    private func sendResponse(_ response: SettingsCommandResponse, requestID: String) {
+    private func sendResponse(
+        _ response: SettingsCommandResponse,
+        requestID: String,
+        onSuccess: (@MainActor @Sendable () -> Void)? = nil
+    ) {
         guard let launchToken else {
             return
         }
-        writePipeMessage(.response(sessionToken: launchToken, id: requestID, response: response, error: nil))
+        writePipeMessage(
+            .response(sessionToken: launchToken, id: requestID, response: response, error: nil),
+            onSuccess: onSuccess
+        )
     }
 
     private func sendError(_ message: String, requestID: String) {
@@ -470,7 +552,10 @@ final class SettingsCoordinator: NSObject {
         writePipeMessage(.response(sessionToken: launchToken, id: requestID, response: nil, error: message))
     }
 
-    private func writePipeMessage(_ message: SettingsPipeMessage) {
+    private func writePipeMessage(
+        _ message: SettingsPipeMessage,
+        onSuccess: (@MainActor @Sendable () -> Void)? = nil
+    ) {
         guard let pipeWritePump else {
             failPipeSession(SettingsCommandFailure(message: localized("Settings IPC pipe is not connected.")))
             return
@@ -478,25 +563,34 @@ final class SettingsCoordinator: NSObject {
         let expectedToken = message.sessionToken
         let expectedPump = pipeWritePump
         pipeWritePump.enqueue(message) { [weak self] result in
-            guard case .failure(let error) = result else {
-                return
-            }
             Task { @MainActor in
                 guard let self,
                       self.launchToken == expectedToken,
                       self.pipeWritePump === expectedPump else {
                     return
                 }
-                self.failPipeSession(SettingsCommandFailure(
-                    message: localized("Settings IPC write failed: \(error.localizedDescription)")
-                ))
+                switch result {
+                case .success:
+                    onSuccess?()
+                case .failure(let error):
+                    self.failPipeSession(SettingsCommandFailure(
+                        message: localized("Settings IPC write failed: \(error.localizedDescription)")
+                    ))
+                }
             }
         }
     }
 
     private func failPipeSession(_ error: Error) {
-        statusMessageForIPCFailure(error)
+        let shouldUseFallback = launchToken != nil && !settingsConnected
         cleanupSession(terminateHelper: true)
+        if shouldUseFallback {
+            model?.requestInProcessSettingsPresentation(
+                statusMessage: localized("Settings IPC failed before connecting: \(error.localizedDescription). Opened Settings in GlassEQ instead.")
+            )
+        } else {
+            statusMessageForIPCFailure(error)
+        }
     }
 
     private func statusMessageForIPCFailure(_ error: Error) {
@@ -506,7 +600,9 @@ final class SettingsCoordinator: NSObject {
 
     @discardableResult
     private func cleanupSession(terminateHelper: Bool) -> Task<Void, Never>? {
-        model?.stopMetricsPolling()
+        if settingsConnected {
+            model?.stopMetricsPolling()
+        }
         let processToTerminate = terminateHelper ? helperProcess : nil
         let writePumpToDrain = pipeWritePump
         let writerToCloseDirectly = writePumpToDrain == nil ? pipeWriter : nil
@@ -531,6 +627,7 @@ final class SettingsCoordinator: NSObject {
         runningApplication = nil
         helperProcess = nil
         settingsConnected = false
+        readyAcknowledgmentPending = false
         if writePumpToDrain != nil || processToTerminate != nil {
             return Task {
                 if let writePumpToDrain {
@@ -810,8 +907,61 @@ struct SecuritySettingsCodeSigningValidator: SettingsCodeSigningValidating {
 }
 
 extension GlassEQAppModel {
-    func openSettings() {
-        settingsCoordinator.openSettings()
+    @discardableResult
+    func openSettings() -> SettingsOpenDisposition {
+        guard !inProcessSettingsIsPresented,
+              !inProcessSettingsPresentationIsPending else {
+            requestInProcessSettingsPresentation()
+            return .activeInProcessFallback
+        }
+        let disposition = settingsCoordinator.openSettings()
+        if case .inProcessFallback(let reason) = disposition {
+            requestInProcessSettingsPresentation(
+                statusMessage: localized("Settings helper unavailable: \(reason). Opened Settings in GlassEQ instead.")
+            )
+        }
+        return disposition
+    }
+
+    func requestInProcessSettingsPresentation(statusMessage: String? = nil) {
+        if let statusMessage {
+            self.statusMessage = statusMessage
+            notifyModelDidChange()
+        }
+        inProcessSettingsPresentationIsPending = true
+        inProcessSettingsPresentationGeneration &+= 1
+    }
+
+    func inProcessSettingsDidAppear() {
+        inProcessSettingsPresentationIsPending = false
+        inProcessSettingsIsPresented = true
+    }
+
+    func inProcessSettingsDidDisappear() {
+        inProcessSettingsPresentationIsPending = false
+        inProcessSettingsIsPresented = false
+    }
+
+    func inProcessSettingsViewModel() -> GlassEQSettingsViewModel {
+        if let inProcessSettingsViewModelStorage {
+            return inProcessSettingsViewModelStorage
+        }
+
+        let settingsModel = GlassEQSettingsViewModel()
+        settingsModel.attach(
+            client: InProcessSettingsClient(model: self),
+            snapshot: settingsSnapshot()
+        )
+        inProcessSettingsViewModelStorage = settingsModel
+        return settingsModel
+    }
+
+    func refreshInProcessSettingsSnapshot() {
+        inProcessSettingsViewModelStorage?.accept(snapshot: settingsSnapshot())
+    }
+
+    func refreshInProcessSettingsMetrics() {
+        inProcessSettingsViewModelStorage?.accept(metrics: SettingsAudioMetricsDTO(engineMetrics))
     }
 
     func notifyModelDidChangeFromCoordinator() {
@@ -819,6 +969,11 @@ extension GlassEQAppModel {
     }
 
     func performSettingsCommand(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
+        try beginSettingsCommand()
+        defer {
+            finishSettingsCommand()
+        }
+
         switch command {
         case .createProfile(let kind):
             try createProfile(kind: kind)
@@ -895,5 +1050,21 @@ extension GlassEQAppModel {
             store.profiles.append(profile)
         }
         try ProfilePersistence.validateForCommit(store)
+    }
+}
+
+@MainActor
+private final class InProcessSettingsClient: SettingsCommanding {
+    private weak var model: GlassEQAppModel?
+
+    init(model: GlassEQAppModel) {
+        self.model = model
+    }
+
+    func perform(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
+        guard let model else {
+            throw SettingsCommandFailure(message: "GlassEQ is shutting down.")
+        }
+        return try await model.performSettingsCommand(command)
     }
 }
