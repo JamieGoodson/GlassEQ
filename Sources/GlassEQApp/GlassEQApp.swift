@@ -2058,7 +2058,9 @@ final class GlassEQAppModel {
         }
         if let availabilityError = error as? AudioDeviceAvailabilityError {
             switch availabilityError {
-            case .unsupportedOutputChannelCount, .unsupportedOutputBufferFrameSize:
+            case .unsupportedOutputChannelCount,
+                 .unsupportedOutputBufferFrameSize,
+                 .unsupportedPlaybackConversionBuffer:
                 return localized("Output format unsupported: \(availabilityError.description)")
             default:
                 return localized("Default output unavailable: \(availabilityError.description)")
