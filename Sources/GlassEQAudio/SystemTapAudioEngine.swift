@@ -29,8 +29,8 @@ public struct AudioEngineMetrics: Equatable, Sendable {
     public var playbackTimestampDiscontinuities: UInt64
     public var playbackBufferRenegotiations: UInt64
     public var adaptivePlaybackRenderFailures: UInt64
-    public var ringGateContentionFailures: UInt64
     public var playbackRateCorrectionPPM: Double
+    public var playbackRateCorrectionSaturated: Bool
     public var playbackOccupancyTargetFrames: Int
     public var filteredPlaybackOccupancyFrames: Double
     public var playbackBufferSampleRate: Double
@@ -55,8 +55,8 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         playbackTimestampDiscontinuities: UInt64 = 0,
         playbackBufferRenegotiations: UInt64 = 0,
         adaptivePlaybackRenderFailures: UInt64 = 0,
-        ringGateContentionFailures: UInt64 = 0,
         playbackRateCorrectionPPM: Double = 0,
+        playbackRateCorrectionSaturated: Bool = false,
         playbackOccupancyTargetFrames: Int = 0,
         filteredPlaybackOccupancyFrames: Double = 0,
         playbackBufferSampleRate: Double = 0,
@@ -80,8 +80,8 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         self.playbackTimestampDiscontinuities = playbackTimestampDiscontinuities
         self.playbackBufferRenegotiations = playbackBufferRenegotiations
         self.adaptivePlaybackRenderFailures = adaptivePlaybackRenderFailures
-        self.ringGateContentionFailures = ringGateContentionFailures
         self.playbackRateCorrectionPPM = playbackRateCorrectionPPM
+        self.playbackRateCorrectionSaturated = playbackRateCorrectionSaturated
         self.playbackOccupancyTargetFrames = playbackOccupancyTargetFrames
         self.filteredPlaybackOccupancyFrames = filteredPlaybackOccupancyFrames
         self.playbackBufferSampleRate = playbackBufferSampleRate
@@ -308,6 +308,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         private let pendingPlaybackClockReset = Atomic<Bool>(true)
         private let pendingPlaybackTargetRetarget = Atomic<Bool>(false)
         private let playbackRateCorrectionPartsPerBillion = Atomic<Int64>(0)
+        private let playbackRateCorrectionSaturated = Atomic<Bool>(false)
         private let filteredPlaybackOccupancyMilliFrames = Atomic<Int64>(0)
         private let sampleRateConversionActive = Atomic<Bool>(false)
         private let bypassEnabled: Atomic<Bool>
@@ -492,6 +493,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             playbackTimestampDiscontinuities.store(0, ordering: .relaxed)
             playbackBufferRenegotiations.store(0, ordering: .relaxed)
             adaptivePlaybackRenderFailures.store(0, ordering: .relaxed)
+            playbackRateCorrectionSaturated.store(false, ordering: .relaxed)
             ringBuffer.resetOverwriteGateContentionFailureCount()
             playbackPriming.store(true, ordering: .releasing)
         }
@@ -520,10 +522,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 playbackTimestampDiscontinuities: playbackTimestampDiscontinuities.load(ordering: .relaxed),
                 playbackBufferRenegotiations: playbackBufferRenegotiations.load(ordering: .relaxed),
                 adaptivePlaybackRenderFailures: adaptivePlaybackRenderFailures.load(ordering: .relaxed),
-                ringGateContentionFailures: ringBuffer.overwriteGateContentionFailureCount(),
                 playbackRateCorrectionPPM: Double(
                     playbackRateCorrectionPartsPerBillion.load(ordering: .relaxed)
                 ) / 1_000,
+                playbackRateCorrectionSaturated: playbackRateCorrectionSaturated.load(ordering: .relaxed),
                 playbackOccupancyTargetFrames: adaptivePlaybackTargetFrames.load(ordering: .relaxed),
                 filteredPlaybackOccupancyFrames: Double(
                     filteredPlaybackOccupancyMilliFrames.load(ordering: .relaxed)
@@ -1014,6 +1016,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         private func publishAdaptivePlaybackMetrics() {
             playbackRateCorrectionPartsPerBillion.store(
                 Int64((playbackRateServo.correctionPartsPerMillion * 1_000).rounded()),
+                ordering: .relaxed
+            )
+            playbackRateCorrectionSaturated.store(
+                playbackRateServo.correctionIsSaturated,
                 ordering: .relaxed
             )
             filteredPlaybackOccupancyMilliFrames.store(

@@ -861,6 +861,26 @@ struct AdaptivePlaybackRateTests {
     }
 
     @Test
+    func servoLearnsNegativeClockDriftFromOccupancy() {
+        var servo = PlaybackRateServo(sampleRate: 48_000, targetFrames: 1_024)
+        servo.didPrime(occupancyFrames: 1_024)
+        var occupancy = 1_024.0
+        let producerRatio = 0.999_960
+
+        for _ in 0..<Int(180 * 48_000 / 512) {
+            let ratio = servo.update(
+                occupancyFrames: Int(occupancy.rounded()),
+                outputFrames: 512
+            )
+            occupancy += 512 * (producerRatio - ratio)
+        }
+
+        #expect(abs(servo.correctionPartsPerMillion + 40) < 3)
+        #expect(abs(occupancy - 1_024) < 50)
+        #expect(!servo.correctionIsSaturated)
+    }
+
+    @Test
     func servoClampsExtremeCorrectionsAndPreservesLearningAcrossReprime() {
         var servo = PlaybackRateServo(sampleRate: 48_000, targetFrames: 1_024)
         servo.didPrime(occupancyFrames: 1_024)
@@ -869,7 +889,8 @@ struct AdaptivePlaybackRateTests {
             _ = servo.update(occupancyFrames: 20_000, outputFrames: 512)
         }
 
-        #expect(abs(servo.correctionPartsPerMillion - 100) < 0.001)
+        #expect(abs(servo.correctionPartsPerMillion - 500) < 0.001)
+        #expect(servo.correctionIsSaturated)
         let learnedCorrection = servo.correctionPartsPerMillion
         servo.beginPriming()
 
@@ -877,6 +898,7 @@ struct AdaptivePlaybackRateTests {
 
         servo.reset(targetFrames: 1_024)
         #expect(servo.correctionPartsPerMillion == 0)
+        #expect(!servo.correctionIsSaturated)
     }
 
     @Test
