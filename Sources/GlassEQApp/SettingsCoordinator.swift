@@ -533,8 +533,15 @@ final class SettingsCoordinator: NSObject {
     }
 
     private func failPipeSession(_ error: Error) {
-        statusMessageForIPCFailure(error)
+        let shouldUseFallback = launchToken != nil && !settingsConnected
         cleanupSession(terminateHelper: true)
+        if shouldUseFallback {
+            model?.requestInProcessSettingsPresentation(
+                statusMessage: localized("Settings IPC failed before connecting: \(error.localizedDescription). Opened Settings in GlassEQ instead.")
+            )
+        } else {
+            statusMessageForIPCFailure(error)
+        }
     }
 
     private func statusMessageForIPCFailure(_ error: Error) {

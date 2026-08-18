@@ -97,7 +97,17 @@ func parseEditableNumber(_ text: String, locale: Locale = .autoupdatingCurrent) 
        plusSign != "+" {
         normalized = normalized.replacingOccurrences(of: plusSign, with: "+")
     }
-    let parsed = Double(normalized)
+    var asciiNormalized = ""
+    for scalar in normalized.unicodeScalars {
+        if scalar.properties.numericType == .decimal,
+           let numericValue = scalar.properties.numericValue,
+           let asciiDigit = UnicodeScalar(Int(numericValue) + 48) {
+            asciiNormalized.unicodeScalars.append(asciiDigit)
+        } else {
+            asciiNormalized.unicodeScalars.append(scalar)
+        }
+    }
+    let parsed = Double(asciiNormalized)
     guard let parsed, parsed.isFinite else {
         return nil
     }
@@ -1178,6 +1188,7 @@ private struct EditorTab: View {
                     step: 0.1,
                     suffix: "dB"
                 )
+                .id("preamp:\(activeEditContextID)")
 
                 SettingRow(title: localized("Bypass")) {
                     Toggle(localized("Bypass"), isOn: $draftProfile.isBypassed)
@@ -1211,8 +1222,10 @@ private struct EditorTab: View {
 
             if draftProfile.mode == .parametric {
                 ParametricFilterEditor(filters: activeFiltersBinding)
+                    .id("parametric:\(activeEditContextID)")
             } else {
                 GraphicFilterEditor(filters: activeFiltersBinding)
+                    .id("graphic:\(activeEditContextID)")
                     .cardPanel(padding: 16)
             }
 
@@ -1303,6 +1316,11 @@ private struct EditorTab: View {
         default:
             $draftProfile.filters
         }
+    }
+
+    private var activeEditContextID: String {
+        let channel = draftProfile.channelMode == .stereo ? editChannel.rawValue : "linked"
+        return "\(draftProfile.id.uuidString):\(channel)"
     }
 
     private func setChannelMode(_ mode: EQChannelMode) {
@@ -1647,6 +1665,7 @@ private struct ParametricFilterEditor: View {
                         selectedFilterID = filters.first?.id
                     }
                 )
+                .id(binding.wrappedValue.id)
                 .frame(minWidth: 260, maxWidth: .infinity, alignment: .topLeading)
             } else {
                 ContentUnavailableView(localized("No Filter Selected"), systemImage: "slider.horizontal.3")
