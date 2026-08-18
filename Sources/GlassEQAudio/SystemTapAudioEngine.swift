@@ -182,6 +182,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         var playbackBufferInstabilityPersistenceGate = PlaybackBufferInstabilityPersistenceGate()
         var attemptedPlaybackTargetDownProbes: Set<PlaybackBufferOperatingPointKey> = []
         var attemptedPlaybackFrameSizeDownProbes: Set<PlaybackBufferRouteKey> = []
+        var adaptivePlaybackRenderRecoveryAttempts = 0
+        var adaptivePlaybackRenderRecoveryHealthGeneration: UInt64?
     }
 
     private struct OutputRebuildPreparation {
@@ -210,6 +212,11 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     private enum PlaybackBufferAdaptationAction {
         case stabilize(PlaybackBufferCalibrationProbe)
         case renegotiate(PlaybackBufferRenegotiationPreparation)
+    }
+
+    private enum AdaptivePlaybackRenderRecoveryAction {
+        case restart(output: AudioOutputDevice, profile: EQProfile)
+        case fail(AudioEngineFailure)
     }
 
     private struct StaleOutputRebuild: Error {}
@@ -316,6 +323,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         private let playbackTimestampDiscontinuities = Atomic<UInt64>(0)
         private let playbackBufferRenegotiations = Atomic<UInt64>(0)
         private let adaptivePlaybackRenderFailures = Atomic<UInt64>(0)
+        private let adaptivePlaybackRenderFailureActive = Atomic<Bool>(false)
+        private let adaptivePlaybackRenderHealthGeneration = Atomic<UInt64>(0)
         private let playbackInstabilityGeneration = Atomic<UInt64>(0)
         private let latestPlaybackInstabilityReason = Atomic<UInt8>(PlaybackBufferInstabilityReason.underrun.rawValue)
         private let adaptivePlaybackTargetFrames: Atomic<Int>
@@ -449,6 +458,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             playbackSampleRateConverter = sampleRateConverter
             playbackSampleRatePlan = sampleRatePlan
             sampleRateConversionActive.store(sampleRateConverter != nil, ordering: .releasing)
+            adaptivePlaybackRenderFailureActive.store(false, ordering: .releasing)
             playbackPrimeFrames.store(targetFrames, ordering: .releasing)
             adaptivePlaybackTargetFrames.store(targetFrames, ordering: .releasing)
             pendingPlaybackTargetRetarget.store(false, ordering: .releasing)
@@ -470,6 +480,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
         func maximumObservedCaptureCallbackFrames() -> Int {
             maxCaptureCallbackFrames.load(ordering: .relaxed)
+        }
+
+        func hasActiveAdaptivePlaybackRenderFailure() -> Bool {
+            adaptivePlaybackRenderFailureActive.load(ordering: .acquiring)
+        }
+
+        func playbackRenderHealthGeneration() -> UInt64 {
+            adaptivePlaybackRenderHealthGeneration.load(ordering: .acquiring)
         }
 
         // Called when a new output half is started. Clears any transition mute (the runtime
@@ -766,8 +784,11 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             var adaptiveRenderFailed = false
             switch result {
             case .rendered:
-                break
+                adaptivePlaybackRenderFailureActive.store(false, ordering: .releasing)
+                adaptivePlaybackRenderHealthGeneration.wrappingAdd(1, ordering: .releasing)
             case .underrun(let frames):
+                adaptivePlaybackRenderFailureActive.store(false, ordering: .releasing)
+                adaptivePlaybackRenderHealthGeneration.wrappingAdd(1, ordering: .releasing)
                 underrunFrames = frames
             case .failed:
                 adaptiveRenderFailed = true
@@ -778,6 +799,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 signalPlaybackInstability(.underrun)
             } else if adaptiveRenderFailed {
                 adaptivePlaybackRenderFailures.wrappingAdd(1, ordering: .relaxed)
+                if !adaptivePlaybackRenderFailureActive.exchange(true, ordering: .acquiringAndReleasing) {
+                    signalPlaybackInstability(.adaptiveRenderFailure)
+                }
             }
             if underrunFrames > 0 || adaptiveRenderFailed {
                 beginPlaybackReprime()
@@ -1360,6 +1384,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     private let control = Mutex(ControlState())
     private let playbackBufferRenegotiationHandler = Mutex<(@Sendable (PlaybackBufferRenegotiation) -> Void)?>(nil)
+    private let runtimeFailureHandler = Mutex<(@Sendable (AudioEngineFailure) -> Void)?>(nil)
     private let restorationStoreURL: URL
     private let playbackBufferCalibrationStoreURL: URL
     private let playbackBufferAdaptationQueue = DispatchQueue(
@@ -1648,14 +1673,25 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
     }
 
+    public func setRuntimeFailureHandler(
+        _ handler: (@Sendable (AudioEngineFailure) -> Void)?
+    ) {
+        runtimeFailureHandler.withLock { currentHandler in
+            currentHandler = handler
+        }
+    }
+
     private func stopLocked(_ state: inout ControlState) {
         state.runtime?.markStopping()
         stopOutputHalfLocked(&state)
         stopCaptureHalfLocked(&state)
         state.activeProfile = nil
         state.handledPlaybackInstabilityGeneration = 0
+        state.adaptivePlaybackRenderRecoveryAttempts = 0
+        state.adaptivePlaybackRenderRecoveryHealthGeneration = nil
         state.playbackBufferInstabilityPersistenceGate.reset()
         state.attemptedPlaybackTargetDownProbes.removeAll()
+        state.attemptedPlaybackFrameSizeDownProbes.removeAll()
         state.state = .stopped
         state.status = .stopped
     }
@@ -2453,6 +2489,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 return nil
             }
 
+            if let recoveryGeneration = state.adaptivePlaybackRenderRecoveryHealthGeneration,
+               runtime.playbackRenderHealthGeneration() != recoveryGeneration {
+                state.adaptivePlaybackRenderRecoveryAttempts = 0
+                state.adaptivePlaybackRenderRecoveryHealthGeneration = nil
+            }
+
             let instability = runtime.playbackInstabilitySnapshot()
             if instability.generation == state.handledPlaybackInstabilityGeneration {
                 guard let probe = state.playbackBufferCalibrationProbe,
@@ -2495,6 +2537,11 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             return
         case .renegotiate(let pendingRenegotiation):
             preparation = pendingRenegotiation
+        }
+
+        if preparation.reason == .adaptiveRenderFailure {
+            recoverAdaptivePlaybackRenderFailure(preparation)
+            return
         }
 
         if increasePlaybackTargetIfPossible(preparation) {
@@ -2732,6 +2779,59 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 return
             }
             preparation.runtime.reprimePlayback()
+        }
+    }
+
+    private func recoverAdaptivePlaybackRenderFailure(
+        _ preparation: PlaybackBufferRenegotiationPreparation
+    ) {
+        let action = control.withLock { state -> AdaptivePlaybackRenderRecoveryAction? in
+            guard state.outputRebuildGeneration == preparation.outputRebuildGeneration,
+                  state.runtime === preparation.runtime,
+                  state.activeOutput == preparation.output,
+                  preparation.runtime.hasActiveAdaptivePlaybackRenderFailure(),
+                  let profile = state.activeProfile else {
+                return nil
+            }
+            if AdaptivePlaybackRenderRecoveryPolicy.shouldRestart(
+                afterCompletedAttempts: state.adaptivePlaybackRenderRecoveryAttempts
+            ) {
+                state.adaptivePlaybackRenderRecoveryAttempts += 1
+                state.adaptivePlaybackRenderRecoveryHealthGeneration = preparation.runtime
+                    .playbackRenderHealthGeneration()
+                return .restart(output: preparation.output, profile: profile)
+            }
+
+            let failure = AudioEngineFailure(
+                category: .coreAudioOperationFailed,
+                userMessage: "Adaptive playback rendering repeatedly failed, so GlassEQ stopped processing audio.",
+                operation: "AdaptivePlaybackRender"
+            )
+            stopLocked(&state)
+            state.state = .failed(failure.description)
+            state.status = .failed(failure)
+            return .fail(failure)
+        }
+        guard let action else {
+            return
+        }
+
+        switch action {
+        case .restart(let output, let profile):
+            do {
+                try start(output: output, profile: profile)
+            } catch {
+                let failure = control.withLock { state in
+                    if case .failed(let failure) = state.status {
+                        return failure
+                    }
+                    return audioEngineFailure(from: error)
+                }
+                runtimeFailureHandler.withLock { $0 }?(failure)
+            }
+        case .fail(let failure):
+            updatePlaybackBufferAdaptationTimer()
+            runtimeFailureHandler.withLock { $0 }?(failure)
         }
     }
 

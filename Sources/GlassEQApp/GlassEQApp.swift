@@ -255,6 +255,11 @@ protocol AudioEngineControlling: AnyObject, Sendable {
     func stop()
     func snapshotMetrics() -> AudioEngineMetrics
     func resetDiagnostics()
+    func setRuntimeFailureHandler(_ handler: (@Sendable (AudioEngineFailure) -> Void)?)
+}
+
+extension AudioEngineControlling {
+    func setRuntimeFailureHandler(_ handler: (@Sendable (AudioEngineFailure) -> Void)?) {}
 }
 
 extension SystemTapAudioEngine: AudioEngineControlling {}
@@ -510,6 +515,11 @@ final class GlassEQAppModel {
         self.wakeReconnectDelayOverride = wakeReconnectDelayOverride
         self.storeWriter = ProfileStoreWriter(url: storeURL)
         self.profilePersistenceMode = persistenceMode
+        engine.setRuntimeFailureHandler { [weak self] failure in
+            Task { @MainActor in
+                self?.handleRuntimeAudioEngineFailure(failure)
+            }
+        }
         if registerAppDelegate {
             GlassEQAppDelegate.model = self
         }
@@ -1874,6 +1884,18 @@ final class GlassEQAppModel {
             }
             return localized("Audio engine failed: \(failure.userMessage)")
         }
+    }
+
+    private func handleRuntimeAudioEngineFailure(_ failure: AudioEngineFailure) {
+        guard lifecycleState != .terminating,
+              lifecycleState != .sleeping else {
+            return
+        }
+        invalidatePendingEngineStart()
+        lifecycleState = .stopped
+        isRunning = false
+        statusMessage = audioEngineStatusMessage(failure)
+        notifyModelDidChange()
     }
 
     private static func profileStoreLoadStatusMessage(_ status: ProfileStoreLoadStatus) -> String? {

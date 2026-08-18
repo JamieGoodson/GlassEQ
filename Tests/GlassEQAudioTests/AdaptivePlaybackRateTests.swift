@@ -702,6 +702,12 @@ struct AdaptivePlaybackRateTests {
     }
 
     @Test
+    func adaptiveRenderRecoveryAllowsOneRestartBeforeFailing() {
+        #expect(AdaptivePlaybackRenderRecoveryPolicy.shouldRestart(afterCompletedAttempts: 0))
+        #expect(!AdaptivePlaybackRenderRecoveryPolicy.shouldRestart(afterCompletedAttempts: 1))
+    }
+
+    @Test
     func playbackBufferCalibrationKeepsServoTargetsPerCallbackSize() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("GlassEQPlaybackBufferCalibration-\(UUID().uuidString)", isDirectory: true)

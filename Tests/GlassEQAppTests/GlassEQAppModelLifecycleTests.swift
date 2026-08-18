@@ -79,6 +79,31 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func runtimeEngineFailureStopsTheModelAndSurfacesItsStatus() async {
+        let output = makeOutput(uid: "runtime-output", name: "Runtime Output")
+        let engine = FakeAudioEngine()
+        engine.state = .running(output: output)
+        let model = makeModel(engine: engine)
+        model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running
+        }
+        let failure = AudioEngineFailure(
+            category: .coreAudioOperationFailed,
+            userMessage: "Adaptive playback rendering repeatedly failed.",
+            operation: "AdaptivePlaybackRender"
+        )
+
+        engine.emitRuntimeFailure(failure)
+        await waitUntil {
+            model.lifecycleState == .stopped
+        }
+
+        #expect(!model.isRunning)
+        #expect(model.statusMessage == localized("Audio engine failed: \(failure.userMessage)"))
+    }
+
+    @Test
     func settingsRetryDisabledActiveProfileDoesNotStartEngine() async throws {
         var disabled = makeProfile(name: "Disabled")
         disabled.isBypassed = true
@@ -1973,6 +1998,7 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
     private var _setBypassedCalls: [Bool] = []
     private var _metrics = AudioEngineMetrics()
     private var _events: [String] = []
+    private var _runtimeFailureHandler: (@Sendable (AudioEngineFailure) -> Void)?
 
     var state: AudioEngineState {
         get { withLock { _state } }
@@ -2067,6 +2093,10 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         blocker?.unblock()
     }
 
+    func emitRuntimeFailure(_ failure: AudioEngineFailure) {
+        withLock { _runtimeFailureHandler }?(failure)
+    }
+
     func start(output: AudioOutputDevice, profile: EQProfile) throws {
         let startControl = withLock {
             _events.append("start:\(output.uid)")
@@ -2131,6 +2161,14 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         withLock {
             _events.append("mute")
             _muteOutputCallCount += 1
+        }
+    }
+
+    func setRuntimeFailureHandler(
+        _ handler: (@Sendable (AudioEngineFailure) -> Void)?
+    ) {
+        withLock {
+            _runtimeFailureHandler = handler
         }
     }
 

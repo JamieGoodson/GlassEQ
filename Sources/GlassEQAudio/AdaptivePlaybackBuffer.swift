@@ -5,6 +5,7 @@ public enum PlaybackBufferInstabilityReason: UInt8, Codable, Equatable, Sendable
     case underrun = 1
     case outputTimestampDiscontinuity = 2
     case excessiveBacklog = 3
+    case adaptiveRenderFailure = 4
 }
 
 public struct PlaybackBufferRenegotiation: Equatable, Sendable {
@@ -176,6 +177,14 @@ struct PlaybackBufferInstabilityPersistenceGate: Sendable {
             return
         }
         lastInstability = nil
+    }
+}
+
+struct AdaptivePlaybackRenderRecoveryPolicy {
+    static let maximumRestartAttempts = 1
+
+    static func shouldRestart(afterCompletedAttempts attempts: Int) -> Bool {
+        attempts < maximumRestartAttempts
     }
 }
 
