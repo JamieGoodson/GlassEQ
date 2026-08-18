@@ -186,6 +186,10 @@ func sampleRateConversionIsActive(isRunning: Bool, metricsActive: Bool) -> Bool 
     isRunning && metricsActive
 }
 
+func clockCorrectionLimitIsReached(isRunning: Bool, metricsSaturated: Bool) -> Bool {
+    isRunning && metricsSaturated
+}
+
 private func localizedLatency(milliseconds: Double) -> String {
     let number = localizedDecimal(milliseconds, minimumFractionDigits: 2, maximumFractionDigits: 2)
     return localized("\(number) ms")
@@ -2362,7 +2366,10 @@ private struct OutputTab: View {
                     LabeledContent(localized("Clock Correction"), value: playbackRateCorrectionLabel)
                     LabeledContent(
                         localized("Clock Correction Limit"),
-                        value: snapshot.metrics.playbackRateCorrectionSaturated
+                        value: clockCorrectionLimitIsReached(
+                            isRunning: snapshot.isRunning,
+                            metricsSaturated: snapshot.metrics.playbackRateCorrectionSaturated
+                        )
                             ? localized("Reached")
                             : localized("Not reached")
                     )

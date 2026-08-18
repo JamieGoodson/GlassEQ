@@ -45,6 +45,13 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func clockCorrectionLimitRequiresARunningEngineAndSaturatedMetrics() {
+        #expect(clockCorrectionLimitIsReached(isRunning: true, metricsSaturated: true))
+        #expect(!clockCorrectionLimitIsReached(isRunning: false, metricsSaturated: true))
+        #expect(!clockCorrectionLimitIsReached(isRunning: true, metricsSaturated: false))
+    }
+
+    @Test
     func editableNumberParsingRejectsLocaleGroupingSeparators() {
         #expect(parseEditableNumber("1.234", locale: Locale(identifier: "de_DE")) == nil)
         #expect(parseEditableNumber("1,234", locale: Locale(identifier: "de_DE")) == 1.234)
