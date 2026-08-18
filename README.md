@@ -7,6 +7,8 @@ A native macOS equalizer that processes your **entire system audio** in real tim
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-ea4aaa?logo=githubsponsors)](https://github.com/sponsors/juhokoskela)
 
+**[Download the latest GlassEQ alpha](https://github.com/juhokoskela/GlassEQ/releases/latest)** for macOS 26 and Apple Silicon. See the installation notes below.
+
 ## What makes GlassEQ different
 
 Most system-wide equalizers on macOS work by installing a **virtual output device** that you have to select and manage yourself, e.g. eqMac, or loopback drivers in the Soundflower / BlackHole family. Your real output gets hidden behind a fake one, and routing breaks every time you switch headphones or unplug.
