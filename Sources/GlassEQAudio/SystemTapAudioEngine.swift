@@ -140,11 +140,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     private struct PlaybackBufferOperatingPointKey: Hashable {
         var outputUID: String
         var sampleRate: Int
+        var tapSampleRate: Int
         var frameSize: UInt32
 
-        init(output: AudioOutputDevice) {
+        init(output: AudioOutputDevice, tapSampleRate: Double) {
             self.outputUID = output.uid
             self.sampleRate = Int(output.nominalSampleRate.rounded())
+            self.tapSampleRate = Int(tapSampleRate.rounded())
             self.frameSize = output.bufferFrameSize
         }
     }
@@ -204,6 +206,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     private struct PlaybackBufferTargetAdjustment {
         var output: AudioOutputDevice
+        var tapSampleRate: Double
         var previousTargetFrames: Int
         var targetFrames: Int
         var reason: PlaybackBufferInstabilityReason
@@ -1470,6 +1473,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 try? PersistedPlaybackBufferCalibrationStore.beginProbe(
                     outputUID: calibrationProbe.outputUID,
                     sampleRate: calibrationProbe.sampleRate,
+                    tapSampleRate: calibrationProbe.tapSampleRate,
                     frameSize: calibrationProbe.frameSize,
                     targetFrames: calibrationProbe.targetFrames,
                     at: playbackBufferCalibrationStoreURL
@@ -1890,6 +1894,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         ).inserted
         let tunedOutput = tuneBufferFrameSize(
             for: matchedOutput,
+            tapSampleRate: runtime.sampleRate,
             allowsDownwardProbe: allowsFrameSizeDownwardProbe
         )
         try Self.validatePlaybackCallbackCapacity(for: tunedOutput)
@@ -1898,7 +1903,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             tapSampleRate: runtime.sampleRate
         )
         state.activeOutput = tunedOutput
-        let operatingPointKey = PlaybackBufferOperatingPointKey(output: tunedOutput)
+        let operatingPointKey = PlaybackBufferOperatingPointKey(
+            output: tunedOutput,
+            tapSampleRate: runtime.sampleRate
+        )
         let allowsDownwardProbe = state.attemptedPlaybackTargetDownProbes.insert(
             operatingPointKey
         ).inserted
@@ -1928,6 +1936,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         state.handledPlaybackInstabilityGeneration = runtime.playbackInstabilitySnapshot().generation
         state.playbackBufferCalibrationProbe = playbackBufferCalibrationProbe(
             for: tunedOutput,
+            tapSampleRate: runtime.sampleRate,
             targetFrames: targetFrames
         )
 
@@ -2413,6 +2422,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     private func tuneBufferFrameSize(
         for output: AudioOutputDevice,
+        tapSampleRate: Double,
         allowsDownwardProbe: Bool
     ) -> AudioOutputDevice {
         do {
@@ -2420,6 +2430,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             let calibration = PersistedPlaybackBufferCalibrationStore.calibration(
                 outputUID: output.uid,
                 sampleRate: output.nominalSampleRate,
+                tapSampleRate: tapSampleRate,
                 from: playbackBufferCalibrationStoreURL
             )
             let requested = AdaptivePlaybackBufferPolicy.startupFrameSize(
@@ -2440,6 +2451,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     private func playbackBufferCalibrationProbe(
         for output: AudioOutputDevice,
+        tapSampleRate: Double,
         targetFrames: Int,
         startedAt: ContinuousClock.Instant = ContinuousClock().now
     ) -> PlaybackBufferCalibrationProbe? {
@@ -2449,6 +2461,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         let calibration = PersistedPlaybackBufferCalibrationStore.calibration(
             outputUID: output.uid,
             sampleRate: output.nominalSampleRate,
+            tapSampleRate: tapSampleRate,
             from: playbackBufferCalibrationStoreURL
         )
         guard PlaybackBufferCalibrationPolicy.shouldProbe(
@@ -2461,6 +2474,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         return PlaybackBufferCalibrationProbe(
             outputUID: output.uid,
             sampleRate: output.nominalSampleRate,
+            tapSampleRate: tapSampleRate,
             frameSize: output.bufferFrameSize,
             targetFrames: targetFrames,
             startedAt: startedAt
@@ -2482,6 +2496,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         let calibration = PersistedPlaybackBufferCalibrationStore.calibration(
             outputUID: output.uid,
             sampleRate: output.nominalSampleRate,
+            tapSampleRate: tapSampleRate,
             from: playbackBufferCalibrationStoreURL
         )
         let targetFrames = AdaptivePlaybackBufferPolicy.startupTargetFrames(
@@ -2569,6 +2584,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 try PersistedPlaybackBufferCalibrationStore.recordStable(
                     outputUID: probe.outputUID,
                     sampleRate: probe.sampleRate,
+                    tapSampleRate: probe.tapSampleRate,
                     frameSize: probe.frameSize,
                     targetFrames: probe.targetFrames,
                     at: playbackBufferCalibrationStoreURL
@@ -2680,11 +2696,15 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             state.status = .running(output: updatedOutput)
             state.handledPlaybackInstabilityGeneration = preparation.runtime.playbackInstabilitySnapshot().generation
             state.attemptedPlaybackTargetDownProbes.insert(
-                PlaybackBufferOperatingPointKey(output: updatedOutput)
+                PlaybackBufferOperatingPointKey(
+                    output: updatedOutput,
+                    tapSampleRate: preparation.runtime.sampleRate
+                )
             )
             state.playbackBufferCalibrationProbe = PlaybackBufferCalibrationProbe(
                 outputUID: updatedOutput.uid,
                 sampleRate: updatedOutput.nominalSampleRate,
+                tapSampleRate: preparation.runtime.sampleRate,
                 frameSize: updatedOutput.bufferFrameSize,
                 targetFrames: targetFrames,
                 startedAt: ContinuousClock().now
@@ -2706,6 +2726,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         try? PersistedPlaybackBufferCalibrationStore.recordInstability(
             outputUID: completedRenegotiation.outputUID,
             sampleRate: completedRenegotiation.sampleRate,
+            tapSampleRate: preparation.runtime.sampleRate,
             previousFrameSize: completedRenegotiation.previousFrameSize,
             resultingFrameSize: completedRenegotiation.frameSize,
             previousTargetFrames: completedRenegotiation.previousPlaybackTargetFrames,
@@ -2753,12 +2774,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             state.playbackBufferCalibrationProbe = PlaybackBufferCalibrationProbe(
                 outputUID: preparation.output.uid,
                 sampleRate: preparation.output.nominalSampleRate,
+                tapSampleRate: preparation.runtime.sampleRate,
                 frameSize: preparation.output.bufferFrameSize,
                 targetFrames: targetFrames,
                 startedAt: ContinuousClock().now
             )
             return PlaybackBufferTargetAdjustment(
                 output: preparation.output,
+                tapSampleRate: preparation.runtime.sampleRate,
                 previousTargetFrames: previousTargetFrames,
                 targetFrames: targetFrames,
                 reason: preparation.reason
@@ -2771,6 +2794,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         try? PersistedPlaybackBufferCalibrationStore.recordInstability(
             outputUID: adjustment.output.uid,
             sampleRate: adjustment.output.nominalSampleRate,
+            tapSampleRate: adjustment.tapSampleRate,
             previousFrameSize: adjustment.output.bufferFrameSize,
             resultingFrameSize: adjustment.output.bufferFrameSize,
             previousTargetFrames: adjustment.previousTargetFrames,
@@ -2788,6 +2812,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         let instability = UnresolvedPlaybackBufferInstability(
             outputUID: preparation.output.uid,
             sampleRate: preparation.output.nominalSampleRate,
+            tapSampleRate: preparation.runtime.sampleRate,
             frameSize: preparation.output.bufferFrameSize,
             targetFrames: targetFrames,
             reason: preparation.reason
@@ -2801,6 +2826,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             state.playbackBufferCalibrationProbe = PlaybackBufferCalibrationProbe(
                 outputUID: preparation.output.uid,
                 sampleRate: preparation.output.nominalSampleRate,
+                tapSampleRate: preparation.runtime.sampleRate,
                 frameSize: preparation.output.bufferFrameSize,
                 targetFrames: targetFrames,
                 startedAt: ContinuousClock().now
@@ -2814,6 +2840,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             try PersistedPlaybackBufferCalibrationStore.recordInstability(
                 outputUID: preparation.output.uid,
                 sampleRate: preparation.output.nominalSampleRate,
+                tapSampleRate: preparation.runtime.sampleRate,
                 previousFrameSize: preparation.output.bufferFrameSize,
                 resultingFrameSize: preparation.output.bufferFrameSize,
                 previousTargetFrames: targetFrames,

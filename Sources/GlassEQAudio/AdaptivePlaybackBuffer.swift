@@ -68,6 +68,7 @@ struct PersistedPlaybackBufferOperatingPoint: Codable, Equatable, Sendable {
 struct PersistedPlaybackBufferCalibration: Codable, Equatable, Sendable {
     var outputUID: String
     var sampleRate: Double
+    var tapSampleRate: Double? = nil
     var stableFrameSize: UInt32?
     var probingFrameSize: UInt32?
     var operatingPoints: [PersistedPlaybackBufferOperatingPoint]
@@ -135,6 +136,7 @@ private struct PersistedPlaybackBufferCalibrationDocumentV1: Codable {
 struct PlaybackBufferCalibrationProbe: Equatable, Sendable {
     var outputUID: String
     var sampleRate: Double
+    var tapSampleRate: Double? = nil
     var frameSize: UInt32
     var targetFrames: Int
     var startedAt: ContinuousClock.Instant
@@ -150,6 +152,7 @@ struct PlaybackBufferCalibrationProbe: Equatable, Sendable {
 struct UnresolvedPlaybackBufferInstability: Equatable, Sendable {
     var outputUID: String
     var sampleRate: Double
+    var tapSampleRate: Double? = nil
     var frameSize: UInt32
     var targetFrames: Int
     var reason: PlaybackBufferInstabilityReason
@@ -246,15 +249,30 @@ enum PersistedPlaybackBufferCalibrationStore {
     static func calibration(
         outputUID: String,
         sampleRate: Double,
+        tapSampleRate: Double? = nil,
         from url: URL
     ) -> PersistedPlaybackBufferCalibration? {
-        load(from: url).first {
-            $0.outputUID == outputUID && normalizedSampleRate($0.sampleRate) == normalizedSampleRate(sampleRate)
+        let tapSampleRate = tapSampleRate ?? sampleRate
+        return load(from: url).first {
+            $0.outputUID == outputUID
+                && normalizedSampleRate($0.sampleRate) == normalizedSampleRate(sampleRate)
+                && normalizedSampleRate($0.tapSampleRate ?? $0.sampleRate)
+                    == normalizedSampleRate(tapSampleRate)
         }
     }
 
-    static func preferredFrameSize(outputUID: String, sampleRate: Double, from url: URL) -> UInt32? {
-        calibration(outputUID: outputUID, sampleRate: sampleRate, from: url)?.preferredFrameSize
+    static func preferredFrameSize(
+        outputUID: String,
+        sampleRate: Double,
+        tapSampleRate: Double? = nil,
+        from url: URL
+    ) -> UInt32? {
+        calibration(
+            outputUID: outputUID,
+            sampleRate: sampleRate,
+            tapSampleRate: tapSampleRate,
+            from: url
+        )?.preferredFrameSize
     }
 
     static func removeCalibrations(outputUID: String, at url: URL) throws {
@@ -272,6 +290,7 @@ enum PersistedPlaybackBufferCalibrationStore {
     static func beginProbe(
         outputUID: String,
         sampleRate: Double,
+        tapSampleRate: Double? = nil,
         frameSize: UInt32,
         targetFrames: Int,
         at url: URL
@@ -279,7 +298,12 @@ enum PersistedPlaybackBufferCalibrationStore {
         guard frameSize > 0, targetFrames > 0 else {
             return
         }
-        try updateCalibration(outputUID: outputUID, sampleRate: sampleRate, at: url) { calibration in
+        try updateCalibration(
+            outputUID: outputUID,
+            sampleRate: sampleRate,
+            tapSampleRate: tapSampleRate,
+            at: url
+        ) { calibration in
             calibration.probingFrameSize = frameSize
             calibration.updateOperatingPoint(for: frameSize) { operatingPoint in
                 operatingPoint.probingTargetFrames = UInt32(clamping: targetFrames)
@@ -290,6 +314,7 @@ enum PersistedPlaybackBufferCalibrationStore {
     static func recordInstability(
         outputUID: String,
         sampleRate: Double,
+        tapSampleRate: Double? = nil,
         previousFrameSize: UInt32,
         resultingFrameSize: UInt32,
         previousTargetFrames: Int,
@@ -307,7 +332,12 @@ enum PersistedPlaybackBufferCalibrationStore {
                 || previousTargetFrames != resultingTargetFrames else {
             return
         }
-        try updateCalibration(outputUID: outputUID, sampleRate: sampleRate, at: url) { calibration in
+        try updateCalibration(
+            outputUID: outputUID,
+            sampleRate: sampleRate,
+            tapSampleRate: tapSampleRate,
+            at: url
+        ) { calibration in
             let previousCalibration = calibration
             let previousTarget = UInt32(clamping: previousTargetFrames)
             if resultingFrameSize != previousFrameSize,
@@ -354,6 +384,7 @@ enum PersistedPlaybackBufferCalibrationStore {
     static func recordStable(
         outputUID: String,
         sampleRate: Double,
+        tapSampleRate: Double? = nil,
         frameSize: UInt32,
         targetFrames: Int,
         timestamp: Date = Date(),
@@ -362,7 +393,12 @@ enum PersistedPlaybackBufferCalibrationStore {
         guard frameSize > 0, targetFrames > 0 else {
             return
         }
-        try updateCalibration(outputUID: outputUID, sampleRate: sampleRate, at: url) { calibration in
+        try updateCalibration(
+            outputUID: outputUID,
+            sampleRate: sampleRate,
+            tapSampleRate: tapSampleRate,
+            at: url
+        ) { calibration in
             calibration.stableFrameSize = frameSize
             calibration.probingFrameSize = nil
             calibration.updateOperatingPoint(for: frameSize) { operatingPoint in
@@ -384,23 +420,29 @@ enum PersistedPlaybackBufferCalibrationStore {
     private static func updateCalibration(
         outputUID: String,
         sampleRate: Double,
+        tapSampleRate: Double?,
         at url: URL,
         update: (inout PersistedPlaybackBufferCalibration) -> Void
     ) throws {
-        guard !outputUID.isEmpty, sampleRate > 0 else {
+        let tapSampleRate = tapSampleRate ?? sampleRate
+        guard !outputUID.isEmpty, sampleRate > 0, tapSampleRate > 0 else {
             return
         }
 
         var calibrations = load(from: url)
         let index: Int
         if let existingIndex = calibrations.firstIndex(where: {
-            $0.outputUID == outputUID && normalizedSampleRate($0.sampleRate) == normalizedSampleRate(sampleRate)
+            $0.outputUID == outputUID
+                && normalizedSampleRate($0.sampleRate) == normalizedSampleRate(sampleRate)
+                && normalizedSampleRate($0.tapSampleRate ?? $0.sampleRate)
+                    == normalizedSampleRate(tapSampleRate)
         }) {
             index = existingIndex
         } else {
             calibrations.append(PersistedPlaybackBufferCalibration(
                 outputUID: outputUID,
                 sampleRate: sampleRate,
+                tapSampleRate: tapSampleRate,
                 stableFrameSize: nil,
                 probingFrameSize: nil,
                 operatingPoints: [],
@@ -450,7 +492,11 @@ enum PersistedPlaybackBufferCalibrationStore {
                     .sorted { $0.timestamp < $1.timestamp }
                     .suffix(PlaybackBufferCalibrationPolicy.maximumEventCount)
             )
-            let key = recordKey(outputUID: calibration.outputUID, sampleRate: calibration.sampleRate)
+            let key = recordKey(
+                outputUID: calibration.outputUID,
+                sampleRate: calibration.sampleRate,
+                tapSampleRate: calibration.tapSampleRate ?? calibration.sampleRate
+            )
             if var existing = uniqueRecords[key] {
                 existing.stableFrameSize = maximum(existing.stableFrameSize, calibration.stableFrameSize)
                 existing.probingFrameSize = maximum(existing.probingFrameSize, calibration.probingFrameSize)
@@ -543,8 +589,12 @@ enum PersistedPlaybackBufferCalibrationStore {
         }
     }
 
-    private static func recordKey(outputUID: String, sampleRate: Double) -> String {
-        "\(outputUID)\u{0}\(normalizedSampleRate(sampleRate))"
+    private static func recordKey(
+        outputUID: String,
+        sampleRate: Double,
+        tapSampleRate: Double
+    ) -> String {
+        "\(outputUID)\u{0}\(normalizedSampleRate(sampleRate))\u{0}\(normalizedSampleRate(tapSampleRate))"
     }
 
     private static func areInAscendingOrder(
@@ -552,6 +602,9 @@ enum PersistedPlaybackBufferCalibrationStore {
         _ rhs: PersistedPlaybackBufferCalibration
     ) -> Bool {
         if lhs.outputUID == rhs.outputUID {
+            if lhs.sampleRate == rhs.sampleRate {
+                return (lhs.tapSampleRate ?? lhs.sampleRate) < (rhs.tapSampleRate ?? rhs.sampleRate)
+            }
             return lhs.sampleRate < rhs.sampleRate
         }
         return lhs.outputUID < rhs.outputUID
