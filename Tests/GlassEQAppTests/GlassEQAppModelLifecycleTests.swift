@@ -79,6 +79,172 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func conversionCapacityStartFailureReportsUnsupportedOutputFormat() async {
+        let output = makeOutput(uid: "converted-output", name: "Converted Output")
+        let error = AudioDeviceAvailabilityError.unsupportedPlaybackConversionBuffer(
+            output.id,
+            requiredPrimeFrames: 50_176,
+            maximumPrimeFrames: 40_960
+        )
+        let engine = FakeAudioEngine()
+        engine.startError = error
+        let lookup = FakeDefaultOutputLookup(.success(output))
+        let model = makeModel(engine: engine, lookup: lookup)
+        let expectedStatus = localized("Output format unsupported: \(error.description)")
+
+        model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .stopped
+                && engine.startCalls.count == 1
+                && model.statusMessage == expectedStatus
+        }
+
+        #expect(model.statusMessage == expectedStatus)
+    }
+
+    @Test
+    func runtimeEngineFailureStopsTheModelAndSurfacesItsStatus() async {
+        let output = makeOutput(uid: "runtime-output", name: "Runtime Output")
+        let engine = FakeAudioEngine()
+        engine.state = .running(output: output)
+        let model = makeModel(engine: engine)
+        model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running
+        }
+        engine.emitRuntimeFailure(adaptiveRenderFailure)
+        await waitUntil {
+            model.lifecycleState == .stopped
+        }
+
+        #expect(!model.isRunning)
+        #expect(model.statusMessage == localized("Audio engine failed: \(adaptiveRenderFailure.userMessage)"))
+    }
+
+    @Test
+    func runtimeFailureDoesNotCancelNewerPendingRouteStart() async {
+        let firstOutput = makeOutput(uid: "runtime-first", name: "Runtime First", id: 200)
+        let secondOutput = makeOutput(uid: "runtime-second", name: "Runtime Second", id: 300)
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(engine: engine, lookup: lookup, observers: observers, outputDelay: .zero)
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        engine.blockStart(for: secondOutput.uid)
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil {
+            engine.startCalls.contains { $0.output == secondOutput }
+        }
+        #expect(engine.waitUntilStartIsBlocked(for: secondOutput.uid, timeout: .now() + 1))
+
+        engine.emitRuntimeFailure(adaptiveRenderFailure)
+        await settleAsyncWork()
+        #expect(model.lifecycleState == .running)
+
+        engine.unblockStart(for: secondOutput.uid)
+        await waitUntil {
+            model.lifecycleState == .running
+                && model.currentOutputUID == secondOutput.uid
+                && engine.state == .running(output: secondOutput)
+        }
+    }
+
+    @Test
+    func profileAppliedDuringRouteStartIsRepublishedAfterTheRouteSettles() async throws {
+        let firstOutput = makeOutput(uid: "profile-first", name: "Profile First", id: 200)
+        let secondOutput = makeOutput(uid: "profile-second", name: "Profile Second", id: 300)
+        let initialProfile = makeProfile(name: "Initial")
+        let appliedProfile = makeProfile(name: "Applied During Route Start")
+        let store = ProfileStore(
+            profiles: [initialProfile, appliedProfile],
+            fallbackProfileID: initialProfile.id
+        )
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        engine.blockStart(for: secondOutput.uid)
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil {
+            engine.startCalls.count == 2
+        }
+        #expect(engine.waitUntilStartIsBlocked(for: secondOutput.uid, timeout: .now() + 1))
+
+        try model.apply(profile: appliedProfile)
+        #expect(engine.updateDSPCalls.isEmpty)
+
+        engine.unblockStart(for: secondOutput.uid)
+        await waitUntil {
+            model.lifecycleState == .running
+                && model.currentOutputUID == secondOutput.uid
+                && engine.startCalls.count == 3
+                && engine.startCalls.last?.profile == appliedProfile
+                && model.activeProfile == appliedProfile
+                && model.statusMessage
+                    == localized("Processing \(secondOutput.name) with \(appliedProfile.name)")
+        }
+
+        #expect(engine.startCalls.last?.profile == appliedProfile)
+        #expect(model.activeProfile == appliedProfile)
+        #expect(model.statusMessage == localized("Processing \(secondOutput.name) with \(appliedProfile.name)"))
+    }
+
+    @Test
+    func staleRuntimeFailureDoesNotStopCompletedNewerRoute() async {
+        let firstOutput = makeOutput(uid: "stale-runtime-first", name: "Stale Runtime First", id: 200)
+        let secondOutput = makeOutput(uid: "stale-runtime-second", name: "Stale Runtime Second", id: 300)
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(engine: engine, lookup: lookup, observers: observers, outputDelay: .zero)
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil {
+            model.lifecycleState == .running
+                && model.currentOutputUID == secondOutput.uid
+                && engine.state == .running(output: secondOutput)
+        }
+
+        engine.emitRuntimeFailure(adaptiveRenderFailure, markEngineFailed: false)
+        await settleAsyncWork()
+
+        #expect(model.lifecycleState == .running)
+        #expect(model.isRunning)
+        #expect(model.currentOutputUID == secondOutput.uid)
+        #expect(engine.state == .running(output: secondOutput))
+    }
+
+    @Test
     func settingsRetryDisabledActiveProfileDoesNotStartEngine() async throws {
         var disabled = makeProfile(name: "Disabled")
         disabled.isBypassed = true
@@ -1241,7 +1407,8 @@ struct GlassEQAppModelLifecycleTests {
         engine.metrics = AudioEngineMetrics(
             capturedFrames: 123,
             playedFrames: 100,
-            ringGateContentionFailures: 2
+            ringGateContentionFailures: 2,
+            playbackBufferSampleRate: 48_000
         )
         let model = makeModel(engine: engine)
 
@@ -1251,6 +1418,7 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.engineMetrics.capturedFrames == 123)
         #expect(model.engineMetrics.playedFrames == 100)
         #expect(model.engineMetrics.ringGateContentionFailures == 2)
+        #expect(model.settingsSnapshot().metrics.playbackBufferSampleRate == 48_000)
         model.stopMetricsPolling()
     }
 
@@ -2015,6 +2183,12 @@ private enum TestAudioError: Error {
     case defaultOutputUnavailable
 }
 
+private let adaptiveRenderFailure = AudioEngineFailure(
+    category: .coreAudioOperationFailed,
+    userMessage: "Adaptive playback rendering repeatedly failed.",
+    operation: "AdaptivePlaybackRender"
+)
+
 @MainActor
 private final class FakeWorkspaceOpener: WorkspaceOpening {
     private var results: [Bool]
@@ -2374,6 +2548,7 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
     private var _setBypassedCalls: [Bool] = []
     private var _metrics = AudioEngineMetrics()
     private var _events: [String] = []
+    private var _runtimeFailureHandler: (@Sendable (AudioEngineFailure) -> Void)?
 
     var state: AudioEngineState {
         get { withLock { _state } }
@@ -2468,6 +2643,16 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         blocker?.unblock()
     }
 
+    func emitRuntimeFailure(_ failure: AudioEngineFailure, markEngineFailed: Bool = true) {
+        let handler = withLock {
+            if markEngineFailed {
+                _state = .failed(failure.description)
+            }
+            return _runtimeFailureHandler
+        }
+        handler?(failure)
+    }
+
     func start(output: AudioOutputDevice, profile: EQProfile) throws {
         let startControl = withLock {
             _events.append("start:\(output.uid)")
@@ -2532,6 +2717,14 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         withLock {
             _events.append("mute")
             _muteOutputCallCount += 1
+        }
+    }
+
+    func setRuntimeFailureHandler(
+        _ handler: (@Sendable (AudioEngineFailure) -> Void)?
+    ) {
+        withLock {
+            _runtimeFailureHandler = handler
         }
     }
 

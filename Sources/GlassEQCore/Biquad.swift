@@ -1,5 +1,35 @@
 import Foundation
 
+public enum EQRouteFrequencyPolicy {
+    public static let maximumProfileFrequency = 20_000.0
+    public static let maximumSampleRateFraction = 0.45
+
+    public static func maximumUsableFrequency(sampleRate: Double) -> Double {
+        guard sampleRate.isFinite, sampleRate > 0 else {
+            return maximumProfileFrequency
+        }
+        return min(maximumProfileFrequency, sampleRate * maximumSampleRateFraction)
+    }
+
+    public static func supports(_ filter: EQFilter, sampleRate: Double) -> Bool {
+        sampleRate.isFinite
+            && sampleRate > 0
+            && filter.frequency.isFinite
+            && filter.frequency <= maximumUsableFrequency(sampleRate: sampleRate)
+    }
+
+    public static func inactiveEnabledFilterCount(profile: EQProfile, sampleRate: Double) -> Int {
+        let filters: [EQFilter]
+        switch profile.channelMode {
+        case .linked:
+            filters = profile.filters
+        case .stereo:
+            filters = profile.leftFilters + profile.rightFilters
+        }
+        return filters.count { $0.isEnabled && !supports($0, sampleRate: sampleRate) }
+    }
+}
+
 public struct BiquadCoefficients: Equatable, Sendable {
     public var b0: Double
     public var b1: Double
@@ -17,13 +47,24 @@ public struct BiquadCoefficients: Equatable, Sendable {
 
     public static let identity = BiquadCoefficients(b0: 1, b1: 0, b2: 0, a1: 0, a2: 0)
 
-    public static func make(filter: EQFilter, sampleRate: Double) -> BiquadCoefficients {
-        guard filter.isEnabled else {
+    public static func make(
+        filter: EQFilter,
+        sampleRate: Double,
+        maximumUsableFrequency: Double? = nil
+    ) -> BiquadCoefficients {
+        let processingCeiling = EQRouteFrequencyPolicy.maximumUsableFrequency(sampleRate: sampleRate)
+        let routeCeiling = maximumUsableFrequency ?? processingCeiling
+        guard filter.isEnabled,
+              sampleRate.isFinite,
+              sampleRate > 0,
+              routeCeiling.isFinite,
+              routeCeiling > 0,
+              filter.frequency.isFinite,
+              filter.frequency <= min(processingCeiling, routeCeiling) else {
             return .identity
         }
 
-        let nyquist = sampleRate / 2
-        let frequency = min(max(filter.frequency, 1), nyquist * 0.999)
+        let frequency = max(filter.frequency, 1)
         let q = max(filter.q, 0.000_1)
         let omega = 2 * Double.pi * frequency / sampleRate
         let sinOmega = sin(omega)
@@ -239,7 +280,11 @@ public enum FrequencyResponse {
         count: Int
     ) -> [FrequencyResponsePoint] {
         let lower = log10(20.0)
-        let upper = log10(20_000.0)
+        let upperFrequency = max(
+            20,
+            EQRouteFrequencyPolicy.maximumUsableFrequency(sampleRate: sampleRate)
+        )
+        let upper = log10(upperFrequency)
         return (0..<max(count, 2)).map { index in
             let fraction = Double(index) / Double(max(count - 1, 1))
             let frequency = pow(10, lower + (upper - lower) * fraction)

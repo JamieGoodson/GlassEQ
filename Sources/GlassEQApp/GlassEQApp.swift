@@ -258,6 +258,11 @@ protocol AudioEngineControlling: AnyObject, Sendable {
     func stop()
     func snapshotMetrics() -> AudioEngineMetrics
     func resetDiagnostics()
+    func setRuntimeFailureHandler(_ handler: (@Sendable (AudioEngineFailure) -> Void)?)
+}
+
+extension AudioEngineControlling {
+    func setRuntimeFailureHandler(_ handler: (@Sendable (AudioEngineFailure) -> Void)?) {}
 }
 
 extension SystemTapAudioEngine: AudioEngineControlling {}
@@ -327,7 +332,8 @@ extension SettingsAudioMetricsDTO {
             averagePlaybackBufferedFrames: metrics.averagePlaybackBufferedFrames,
             playbackBufferObservations: metrics.playbackBufferObservations,
             maximumCaptureCallbackFrames: metrics.maximumCaptureCallbackFrames,
-            maximumPlaybackCallbackFrames: metrics.maximumPlaybackCallbackFrames
+            maximumPlaybackCallbackFrames: metrics.maximumPlaybackCallbackFrames,
+            playbackBufferSampleRate: metrics.playbackBufferSampleRate
         )
     }
 }
@@ -530,6 +536,11 @@ final class GlassEQAppModel {
         self.wakeReconnectDelayOverride = wakeReconnectDelayOverride
         self.storeWriter = ProfileStoreWriter(url: storeURL)
         self.profilePersistenceMode = persistenceMode
+        engine.setRuntimeFailureHandler { [weak self] failure in
+            Task { @MainActor in
+                self?.handleRuntimeAudioEngineFailure(failure)
+            }
+        }
         if registerAppDelegate {
             GlassEQAppDelegate.model = self
         }
@@ -1259,6 +1270,11 @@ final class GlassEQAppModel {
             return
         }
 
+        if engineStartTask != nil {
+            reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
+            return
+        }
+
         if lifecycleState == .waking {
             reschedulePendingEngineStartWithActiveProfile()
             return
@@ -1474,12 +1490,15 @@ final class GlassEQAppModel {
         }
     }
 
-    private func reschedulePendingEngineStartWithActiveProfile() {
-        guard lifecycleState == .waking,
-              let output = pendingEngineStartOutput else {
+    private func reschedulePendingEngineStartWithActiveProfile(rollback: ProfileRollback? = nil) {
+        guard engineStartTask != nil else {
             return
         }
-        scheduleEngineWork(.start(output: output, profile: activeProfile))
+        if let output = pendingEngineStartOutput {
+            scheduleEngineWork(.start(output: output, profile: activeProfile))
+        } else {
+            scheduleEngineWork(.restart(profile: activeProfile, rollback: rollback))
+        }
     }
 
     private func scheduleWakeReconnectRetry(status: String) {
@@ -1904,10 +1923,14 @@ final class GlassEQAppModel {
             return audioEngineStatusMessage(classifyCoreAudioError(coreAudioError))
         }
         if let availabilityError = error as? AudioDeviceAvailabilityError {
-            if case .unsupportedOutputChannelCount = availabilityError {
+            switch availabilityError {
+            case .unsupportedOutputChannelCount,
+                 .unsupportedOutputBufferFrameSize,
+                 .unsupportedPlaybackConversionBuffer:
                 return localized("Output format unsupported: \(availabilityError.description)")
+            default:
+                return localized("Default output unavailable: \(availabilityError.description)")
             }
-            return localized("Default output unavailable: \(availabilityError.description)")
         }
         return localized("Audio engine failed: \(error.localizedDescription)")
     }
@@ -1926,6 +1949,19 @@ final class GlassEQAppModel {
             }
             return localized("Audio engine failed: \(failure.userMessage)")
         }
+    }
+
+    private func handleRuntimeAudioEngineFailure(_ failure: AudioEngineFailure) {
+        guard lifecycleState == .running,
+              engineStartTask == nil,
+              case .failed = engine.state else {
+            return
+        }
+        invalidatePendingEngineStart()
+        lifecycleState = .stopped
+        isRunning = false
+        statusMessage = audioEngineStatusMessage(failure)
+        notifyModelDidChange()
     }
 
     private static func profileStoreLoadStatusMessage(_ status: ProfileStoreLoadStatus) -> String? {

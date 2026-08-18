@@ -43,7 +43,7 @@ GlassEQ is an early alpha: Apple Silicon only, tested on macOS 26, with no autom
 
 1. GlassEQ opens a **private, muted global process tap** that excludes itself, pulling the dry system mix out of the output without creating a feedback loop.
 2. Tapped audio runs through the active EQ profile in real time.
-3. The processed audio is replayed to the current default output device, which GlassEQ pins to the tap's sample rate so nothing has to be resampled.
+3. The processed audio is replayed to the current default output device with a tiny occupancy-driven asynchronous rate correction to absorb clock drift. Bidirectional Bluetooth headset modes are converted to their lower device-owned sample rate with realtime-safe anti-alias filtering.
 4. When you change outputs, the tap stays alive and only the output stage is rebuilt, so dry audio never leaks to the new device during the handoff.
 
 The result is low, predictable latency. The built-in diagnostics report it directly (about **11 ms added latency** on a 48 kHz / 512-frame route, with no underruns or clipped samples):

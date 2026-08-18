@@ -1,3 +1,4 @@
+import AudioToolbox
 import CoreAudio
 import Foundation
 import GlassEQCore
@@ -25,6 +26,15 @@ public struct AudioEngineMetrics: Equatable, Sendable {
     public var playbackBufferObservations: UInt64
     public var maximumCaptureCallbackFrames: Int
     public var maximumPlaybackCallbackFrames: Int
+    public var playbackTimestampDiscontinuities: UInt64
+    public var playbackBufferRenegotiations: UInt64
+    public var adaptivePlaybackRenderFailures: UInt64
+    public var playbackRateCorrectionPPM: Double
+    public var playbackRateCorrectionSaturated: Bool
+    public var playbackOccupancyTargetFrames: Int
+    public var filteredPlaybackOccupancyFrames: Double
+    public var playbackBufferSampleRate: Double
+    public var playbackSampleRateConversionActive: Bool
 
     public init(
         capturedFrames: UInt64 = 0,
@@ -41,7 +51,16 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         averagePlaybackBufferedFrames: Double = 0,
         playbackBufferObservations: UInt64 = 0,
         maximumCaptureCallbackFrames: Int = 0,
-        maximumPlaybackCallbackFrames: Int = 0
+        maximumPlaybackCallbackFrames: Int = 0,
+        playbackTimestampDiscontinuities: UInt64 = 0,
+        playbackBufferRenegotiations: UInt64 = 0,
+        adaptivePlaybackRenderFailures: UInt64 = 0,
+        playbackRateCorrectionPPM: Double = 0,
+        playbackRateCorrectionSaturated: Bool = false,
+        playbackOccupancyTargetFrames: Int = 0,
+        filteredPlaybackOccupancyFrames: Double = 0,
+        playbackBufferSampleRate: Double = 0,
+        playbackSampleRateConversionActive: Bool = false
     ) {
         self.capturedFrames = capturedFrames
         self.playedFrames = playedFrames
@@ -58,6 +77,15 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         self.playbackBufferObservations = playbackBufferObservations
         self.maximumCaptureCallbackFrames = maximumCaptureCallbackFrames
         self.maximumPlaybackCallbackFrames = maximumPlaybackCallbackFrames
+        self.playbackTimestampDiscontinuities = playbackTimestampDiscontinuities
+        self.playbackBufferRenegotiations = playbackBufferRenegotiations
+        self.adaptivePlaybackRenderFailures = adaptivePlaybackRenderFailures
+        self.playbackRateCorrectionPPM = playbackRateCorrectionPPM
+        self.playbackRateCorrectionSaturated = playbackRateCorrectionSaturated
+        self.playbackOccupancyTargetFrames = playbackOccupancyTargetFrames
+        self.filteredPlaybackOccupancyFrames = filteredPlaybackOccupancyFrames
+        self.playbackBufferSampleRate = playbackBufferSampleRate
+        self.playbackSampleRateConversionActive = playbackSampleRateConversionActive
     }
 }
 
@@ -81,15 +109,63 @@ private struct AudioEngineInternalError: Error, LocalizedError {
     }
 }
 
+struct AudioEngineProfileUpdateUnavailable: Error, LocalizedError {
+    var errorDescription: String? {
+        "The audio output is being rebuilt; the profile change was not applied."
+    }
+}
+
 public final class SystemTapAudioEngine: @unchecked Sendable {
-    private static let preferredBufferFrameSize: UInt32 = 256
-    private static let preferredBluetoothBufferFrameSize: UInt32 = 512
+    private static let preferredBufferFrameSize: UInt32 = 64
+    private static let preferredBluetoothBufferFrameSize: UInt32 = 64
+    private static let preferredBluetoothPlaybackTargetFrames = 128
+    // Leaves one preferred 64-frame capture callback after servicing a 64-frame output pull.
+    private static let preferredBluetoothPlaybackReservoirFrames = 64
     private static let preferredLowSampleRateBufferFrameSize: UInt32 = 1024
-    private static let preferredCaptureBufferFrameSize: UInt32 = 256
+    // Low-rate routes keep at least one normal runtime callback in reserve. The configured
+    // capture callback expands this at startup when the aggregate ignores the 64-frame request.
+    private static let preferredLowSampleRatePlaybackReservoirFrames = Int(maximumRuntimeBufferFrameSize)
+    private static let preferredCaptureBufferFrameSize: UInt32 = 64
     private static let minimumRingBufferFrames = 2048
     private static let maximumRuntimeBufferFrameSize: UInt32 = 1024
-    private static let preferredPlaybackPrimeFrames = 512
+    private static let maximumSupportedCallbackFrames = 8192
+    // Capacity planning allows a 4:1 input/output rate ratio (above the current 48→16 kHz case)
+    // and retains one additional full converted pull as drift headroom.
+    private static let maximumPlannedPlaybackRateRatio = 4
+    private static let playbackRingPullCount = 2
+    private static let preferredPlaybackPrimeFrames = 128
     private static let lowSampleRateThreshold = 24_000.0
+    private static let maximumPlannedPlaybackPrimeFrames =
+        maximumSupportedCallbackFrames * maximumPlannedPlaybackRateRatio
+            + maximumSupportedCallbackFrames
+    static let runtimeRingCapacityFrames = max(
+        minimumRingBufferFrames,
+        maximumPlannedPlaybackPrimeFrames * playbackRingPullCount
+    )
+
+    private struct PlaybackBufferOperatingPointKey: Hashable {
+        var outputUID: String
+        var sampleRate: Int
+        var tapSampleRate: Int
+        var frameSize: UInt32
+
+        init(output: AudioOutputDevice, tapSampleRate: Double) {
+            self.outputUID = output.uid
+            self.sampleRate = Int(output.nominalSampleRate.rounded())
+            self.tapSampleRate = Int(tapSampleRate.rounded())
+            self.frameSize = output.bufferFrameSize
+        }
+    }
+
+    private struct PlaybackBufferRouteKey: Hashable {
+        var outputUID: String
+        var sampleRate: Int
+
+        init(output: AudioOutputDevice) {
+            self.outputUID = output.uid
+            self.sampleRate = Int(output.nominalSampleRate.rounded())
+        }
+    }
 
     private struct ControlState {
         var state: AudioEngineState = .stopped
@@ -102,13 +178,21 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         var tapSampleRate: Double = 0
         var tapChannelCount: Int = 0
         var captureRunning = false
-        // Swappable output half (rebuilt per output device; device forced to the tap rate).
+        // Swappable output half (rebuilt per output device; low-rate headset modes are converted).
         var outputIOProcID: AudioDeviceIOProcID?
         var activeOutput: AudioOutputDevice?
         var activeProfile: EQProfile?
+        var profileRevision: UInt64 = 0
         var bufferFrameSizeRestorations: [String: BufferFrameSizeRestoration] = [:]
         var sampleRateRestorations: [String: SampleRateRestoration] = [:]
         var outputRebuildGeneration = 0
+        var handledPlaybackInstabilityGeneration: UInt64 = 0
+        var playbackBufferCalibrationProbe: PlaybackBufferCalibrationProbe?
+        var playbackBufferInstabilityPersistenceGate = PlaybackBufferInstabilityPersistenceGate()
+        var attemptedPlaybackTargetDownProbes: Set<PlaybackBufferOperatingPointKey> = []
+        var attemptedPlaybackFrameSizeDownProbes: Set<PlaybackBufferRouteKey> = []
+        var adaptivePlaybackRenderRecoveryAttempts = 0
+        var adaptivePlaybackRenderRecoveryHealthGeneration: UInt64?
     }
 
     private struct OutputRebuildPreparation {
@@ -118,9 +202,42 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         var runtime: AudioRuntime
         var tapSampleRate: Double
         var originalBufferFrameSize: UInt32
+        var profileRevision: UInt64
+    }
+
+    private struct PlaybackBufferRenegotiationPreparation {
+        var outputRebuildGeneration: Int
+        var reason: PlaybackBufferInstabilityReason
+        var output: AudioOutputDevice
+        var runtime: AudioRuntime
+    }
+
+    private struct OutputRebuildExpectation {
+        var generation: Int
+        var runtime: AudioRuntime
+        var profileRevision: UInt64
+    }
+
+    private struct PlaybackBufferTargetAdjustment {
+        var output: AudioOutputDevice
+        var tapSampleRate: Double
+        var previousTargetFrames: Int
+        var targetFrames: Int
+        var reason: PlaybackBufferInstabilityReason
+    }
+
+    private enum PlaybackBufferAdaptationAction {
+        case stabilize(PlaybackBufferCalibrationProbe)
+        case renegotiate(PlaybackBufferRenegotiationPreparation)
+    }
+
+    private enum AdaptivePlaybackRenderRecoveryAction {
+        case restart(output: AudioOutputDevice, profile: EQProfile, expectation: OutputRebuildExpectation)
+        case fail(AudioEngineFailure)
     }
 
     private struct StaleOutputRebuild: Error {}
+    private struct StaleProfileRequest: Error {}
 
     struct BufferFrameSizeRestoration: Equatable, Sendable {
         var uid: String
@@ -183,15 +300,31 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
     }
 
+    private enum AdaptivePlaybackRenderResult {
+        case rendered
+        case underrun(frames: Int)
+        case failed
+    }
+
     private final class AudioRuntime: @unchecked Sendable {
         let ringBuffer: RealtimeAudioRingBuffer
         let channelCount: Int
         let sampleRate: Double
-        private let playbackPrimeFrames: Int
+        private let configuredCaptureCallbackFrames: Int
+        private let playbackPrimeFrames: Atomic<Int>
         private let maxCallbackFrames: Int
         private var processor: EQProcessor
         private var captureScratchSamples: [Float]
-        private var playbackScratchSamples: [Float]
+        private var adaptiveInputSamples: [Float]
+        private var sampleRateConverterInputSamples: UnsafeMutableBufferPointer<Float>
+        private let adaptiveOutputSamples: UnsafeMutableBufferPointer<Float>
+        private var playbackRateServo: PlaybackRateServo
+        private var playbackResampler: HermitePlaybackResampler
+        private var playbackSampleRatePlan: PlaybackSampleRatePlan
+        private var playbackSampleRateConverter: RealtimePCMRateConverter?
+        private var sampleRateConverterInputRatio = 1.0
+        private var sampleRateConverterInputResult = AdaptivePlaybackRenderResult.rendered
+        private var outputTimestampTracker = OutputCallbackTimestampTracker()
 
         private let capturedFrames = Atomic<UInt64>(0)
         private let playedFrames = Atomic<UInt64>(0)
@@ -206,10 +339,25 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         private let playbackBufferObservations = Atomic<UInt64>(0)
         private let maxCaptureCallbackFrames = Atomic<Int>(0)
         private let maxPlaybackCallbackFrames = Atomic<Int>(0)
+        private let playbackTimestampDiscontinuities = Atomic<UInt64>(0)
+        private let playbackBufferRenegotiations = Atomic<UInt64>(0)
+        private let adaptivePlaybackRenderFailures = Atomic<UInt64>(0)
+        private let adaptivePlaybackRenderFailureActive = Atomic<Bool>(false)
+        private let adaptivePlaybackRenderHealthGeneration = Atomic<UInt64>(0)
+        private let playbackInstabilityGeneration = Atomic<UInt64>(0)
+        private let latestPlaybackInstabilityReason = Atomic<UInt8>(PlaybackBufferInstabilityReason.underrun.rawValue)
+        private let adaptivePlaybackTargetFrames: Atomic<Int>
+        private let pendingPlaybackClockReset = Atomic<Bool>(true)
+        private let pendingPlaybackTargetRetarget = Atomic<Bool>(false)
+        private let playbackRateCorrectionPartsPerBillion = Atomic<Int64>(0)
+        private let playbackRateCorrectionSaturated = Atomic<Bool>(false)
+        private let filteredPlaybackOccupancyMilliFrames = Atomic<Int64>(0)
+        private let sampleRateConversionActive = Atomic<Bool>(false)
         private let bypassEnabled: Atomic<Bool>
         private let playbackPriming = Atomic<Bool>(true)
         private let outputMutedForTransition = Atomic<Bool>(false)
         private let pendingPlaybackReset = Atomic<Bool>(false)
+        private let pendingOutputTimestampReset = Atomic<Bool>(true)
         private let pendingDSPConfigPointer = Atomic<UInt>(0)
         private let retiredDSPConfigHeadPointer = Atomic<UInt>(0)
         private let stopping = Atomic<Bool>(false)
@@ -224,18 +372,38 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             channelCount: Int,
             ringCapacityFrames: Int,
             scratchFrames: Int,
+            captureCallbackFrames: Int,
             playbackPrimeFrames: Int
         ) {
             self.channelCount = max(channelCount, 1)
             self.sampleRate = sampleRate
+            self.configuredCaptureCallbackFrames = max(captureCallbackFrames, 1)
             self.ringBuffer = RealtimeAudioRingBuffer(
                 channelCount: self.channelCount,
                 capacityFrames: ringCapacityFrames
             )
             self.captureScratchSamples = Array(repeating: 0, count: scratchFrames * self.channelCount)
-            self.playbackScratchSamples = Array(repeating: 0, count: scratchFrames * self.channelCount)
-            self.playbackPrimeFrames = playbackPrimeFrames
-            self.maxCallbackFrames = max(8_192, max(scratchFrames * 4, ringCapacityFrames * 2))
+            self.adaptiveInputSamples = Array(repeating: 0, count: (scratchFrames + 8) * self.channelCount)
+            self.sampleRateConverterInputSamples = UnsafeMutableBufferPointer<Float>.allocate(
+                capacity: self.channelCount
+            )
+            self.sampleRateConverterInputSamples.initialize(repeating: 0)
+            self.adaptiveOutputSamples = UnsafeMutableBufferPointer<Float>.allocate(
+                capacity: SystemTapAudioEngine.maximumSupportedCallbackFrames * self.channelCount
+            )
+            self.adaptiveOutputSamples.initialize(repeating: 0)
+            self.playbackPrimeFrames = Atomic(max(playbackPrimeFrames, 1))
+            self.adaptivePlaybackTargetFrames = Atomic(max(playbackPrimeFrames, 1))
+            self.maxCallbackFrames = SystemTapAudioEngine.maximumSupportedCallbackFrames
+            self.playbackRateServo = PlaybackRateServo(
+                sampleRate: sampleRate,
+                targetFrames: playbackPrimeFrames
+            )
+            self.playbackResampler = HermitePlaybackResampler(channelCount: self.channelCount)
+            self.playbackSampleRatePlan = PlaybackSampleRatePlan(
+                inputSampleRate: sampleRate,
+                outputSampleRate: sampleRate
+            )
             self.processor = EQProcessor(
                 renderConfiguration: EQRenderConfiguration(
                     profile: SystemTapAudioEngine.dspProfile(from: profile),
@@ -248,6 +416,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
         deinit {
             drainDSPConfigBoxes()
+            sampleRateConverterInputSamples.deinitialize()
+            sampleRateConverterInputSamples.deallocate()
+            adaptiveOutputSamples.deinitialize()
+            adaptiveOutputSamples.deallocate()
         }
 
         func markStopping() {
@@ -263,6 +435,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         func muteOutputForTransition() {
             outputMutedForTransition.store(true, ordering: .releasing)
             playbackPriming.store(true, ordering: .releasing)
+            pendingOutputTimestampReset.store(true, ordering: .releasing)
         }
 
         // Stored by the control thread on every output rebuild, before the new output IOProc
@@ -274,13 +447,97 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             )
         }
 
+        func configurePlayback(
+            primeFrames: Int,
+            outputSampleRate: Double
+        ) throws {
+            let targetFrames = min(max(primeFrames, 1), ringBuffer.capacityFrames)
+            let sampleRatePlan = PlaybackSampleRatePlan(
+                inputSampleRate: sampleRate,
+                outputSampleRate: outputSampleRate
+            )
+            let sampleRateConverter: RealtimePCMRateConverter? = if sampleRatePlan.requiresConversion {
+                try RealtimePCMRateConverter(
+                    inputSampleRate: sampleRatePlan.inputSampleRate,
+                    outputSampleRate: sampleRatePlan.outputSampleRate,
+                    channelCount: channelCount
+                )
+            } else {
+                nil
+            }
+            let inputCapacityFrames = try sampleRateConverter?.inputFrameCapacity(
+                forOutputFrames: maxCallbackFrames
+            ) ?? 1
+            let inputSamples = UnsafeMutableBufferPointer<Float>.allocate(
+                capacity: inputCapacityFrames * channelCount
+            )
+            inputSamples.initialize(repeating: 0)
+
+            sampleRateConverterInputSamples.deinitialize()
+            sampleRateConverterInputSamples.deallocate()
+            sampleRateConverterInputSamples = inputSamples
+            playbackSampleRateConverter = sampleRateConverter
+            playbackSampleRatePlan = sampleRatePlan
+            sampleRateConversionActive.store(sampleRateConverter != nil, ordering: .releasing)
+            adaptivePlaybackRenderFailureActive.store(false, ordering: .releasing)
+            playbackPrimeFrames.store(targetFrames, ordering: .releasing)
+            adaptivePlaybackTargetFrames.store(targetFrames, ordering: .releasing)
+            pendingPlaybackTargetRetarget.store(false, ordering: .releasing)
+            pendingPlaybackClockReset.store(true, ordering: .releasing)
+            pendingOutputTimestampReset.store(true, ordering: .releasing)
+        }
+
+        func retargetPlayback(primeFrames: Int) {
+            let targetFrames = min(max(primeFrames, 1), ringBuffer.capacityFrames)
+            playbackPrimeFrames.store(targetFrames, ordering: .releasing)
+            adaptivePlaybackTargetFrames.store(targetFrames, ordering: .releasing)
+            pendingPlaybackTargetRetarget.store(true, ordering: .releasing)
+            pendingOutputTimestampReset.store(true, ordering: .releasing)
+        }
+
+        func playbackTargetFrames() -> Int {
+            adaptivePlaybackTargetFrames.load(ordering: .acquiring)
+        }
+
+        func maximumKnownCaptureCallbackFrames() -> Int {
+            max(
+                configuredCaptureCallbackFrames,
+                maxCaptureCallbackFrames.load(ordering: .relaxed)
+            )
+        }
+
+        func hasActiveAdaptivePlaybackRenderFailure() -> Bool {
+            adaptivePlaybackRenderFailureActive.load(ordering: .acquiring)
+        }
+
+        func playbackRenderHealthGeneration() -> UInt64 {
+            adaptivePlaybackRenderHealthGeneration.load(ordering: .acquiring)
+        }
+
         // Called when a new output half is started. Clears any transition mute (the runtime
         // persists across output switches now, so the mute flag would otherwise stick on and
         // silence everything) and re-primes so playback re-anchors to the freshest audio.
         func reprimePlayback() {
             pendingPlaybackReset.store(true, ordering: .releasing)
             playbackPriming.store(true, ordering: .releasing)
+            pendingOutputTimestampReset.store(true, ordering: .releasing)
             outputMutedForTransition.store(false, ordering: .releasing)
+        }
+
+        func playbackInstabilitySnapshot() -> (generation: UInt64, reason: PlaybackBufferInstabilityReason) {
+            let generation = playbackInstabilityGeneration.load(ordering: .acquiring)
+            let latestReason = PlaybackBufferInstabilityReason(
+                rawValue: latestPlaybackInstabilityReason.load(ordering: .relaxed)
+            ) ?? .underrun
+            let reason = AdaptivePlaybackRenderRecoveryPolicy.effectiveInstabilityReason(
+                latest: latestReason,
+                renderFailureActive: adaptivePlaybackRenderFailureActive.load(ordering: .acquiring)
+            )
+            return (generation, reason)
+        }
+
+        func recordPlaybackBufferRenegotiation() {
+            playbackBufferRenegotiations.wrappingAdd(1, ordering: .relaxed)
         }
 
         func resetMetrics() {
@@ -297,6 +554,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             playbackBufferObservations.store(0, ordering: .relaxed)
             maxCaptureCallbackFrames.store(0, ordering: .relaxed)
             maxPlaybackCallbackFrames.store(0, ordering: .relaxed)
+            playbackTimestampDiscontinuities.store(0, ordering: .relaxed)
+            playbackBufferRenegotiations.store(0, ordering: .relaxed)
+            adaptivePlaybackRenderFailures.store(0, ordering: .relaxed)
+            playbackRateCorrectionSaturated.store(false, ordering: .relaxed)
             ringBuffer.resetOverwriteGateContentionFailureCount()
             playbackPriming.store(true, ordering: .releasing)
         }
@@ -321,7 +582,20 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                     : Double(totalPlaybackBufferedFrames.load(ordering: .relaxed)) / Double(observations),
                 playbackBufferObservations: observations,
                 maximumCaptureCallbackFrames: maxCaptureCallbackFrames.load(ordering: .relaxed),
-                maximumPlaybackCallbackFrames: maxPlaybackCallbackFrames.load(ordering: .relaxed)
+                maximumPlaybackCallbackFrames: maxPlaybackCallbackFrames.load(ordering: .relaxed),
+                playbackTimestampDiscontinuities: playbackTimestampDiscontinuities.load(ordering: .relaxed),
+                playbackBufferRenegotiations: playbackBufferRenegotiations.load(ordering: .relaxed),
+                adaptivePlaybackRenderFailures: adaptivePlaybackRenderFailures.load(ordering: .relaxed),
+                playbackRateCorrectionPPM: Double(
+                    playbackRateCorrectionPartsPerBillion.load(ordering: .relaxed)
+                ) / 1_000,
+                playbackRateCorrectionSaturated: playbackRateCorrectionSaturated.load(ordering: .relaxed),
+                playbackOccupancyTargetFrames: adaptivePlaybackTargetFrames.load(ordering: .relaxed),
+                filteredPlaybackOccupancyFrames: Double(
+                    filteredPlaybackOccupancyMilliFrames.load(ordering: .relaxed)
+                ) / 1_000,
+                playbackBufferSampleRate: sampleRate,
+                playbackSampleRateConversionActive: sampleRateConversionActive.load(ordering: .acquiring)
             )
         }
 
@@ -414,7 +688,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             capturedFrames.wrappingAdd(UInt64(frameCount), ordering: .relaxed)
         }
 
-        func playback(outputData: UnsafeMutablePointer<AudioBufferList>) {
+        func playback(
+            outputData: UnsafeMutablePointer<AudioBufferList>,
+            outputSampleTime: Double?
+        ) {
             guard !stopping.load(ordering: .acquiring) else {
                 clear(outputData: outputData)
                 return
@@ -437,8 +714,26 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             }
             updateMax(maxPlaybackCallbackFrames, frameCount)
 
+            if pendingOutputTimestampReset.exchange(false, ordering: .acquiringAndReleasing) {
+                outputTimestampTracker.reset()
+            }
+
             if pendingPlaybackReset.exchange(false, ordering: .acquiringAndReleasing) {
                 _ = ringBuffer.reset()
+            }
+            if pendingPlaybackClockReset.exchange(false, ordering: .acquiringAndReleasing) {
+                pendingPlaybackTargetRetarget.store(false, ordering: .releasing)
+                playbackRateServo.reset(
+                    targetFrames: adaptivePlaybackTargetFrames.load(ordering: .acquiring)
+                )
+                playbackResampler.reset()
+                publishAdaptivePlaybackMetrics()
+            } else if pendingPlaybackTargetRetarget.exchange(false, ordering: .acquiringAndReleasing) {
+                playbackRateServo.retarget(
+                    adaptivePlaybackTargetFrames.load(ordering: .acquiring)
+                )
+                playbackResampler.reset()
+                publishAdaptivePlaybackMetrics()
             }
 
             if outputMutedForTransition.load(ordering: .acquiring) {
@@ -446,85 +741,369 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 return
             }
 
+            let inputDurationFrames = playbackSampleRatePlan.inputFrames(
+                forOutputFrames: frameCount
+            )
+
+            if outputTimestampTracker.observe(sampleTime: outputSampleTime, frameCount: frameCount) {
+                playbackTimestampDiscontinuities.wrappingAdd(1, ordering: .relaxed)
+                signalPlaybackInstability(.outputTimestampDiscontinuity)
+                beginPlaybackReprime()
+            } else if !playbackPriming.load(ordering: .acquiring),
+                      PlaybackOccupancyRecoveryPolicy.shouldReprime(
+                          occupancyFrames: ringBuffer.occupancyFrames(),
+                          targetFrames: adaptivePlaybackTargetFrames.load(ordering: .acquiring),
+                          outputFrames: inputDurationFrames
+                      ) {
+                signalPlaybackInstability(.excessiveBacklog)
+                beginPlaybackReprime()
+            }
+
             if playbackPriming.load(ordering: .acquiring) {
+                playbackRateServo.beginPriming()
+                playbackResampler.reset()
+                publishAdaptivePlaybackMetrics()
                 let bufferedFrames = ringBuffer.occupancyFrames()
+                let primeFrames = playbackPrimeFrames.load(ordering: .acquiring)
                 updateMaxBufferedFrames(bufferedFrames)
-                guard bufferedFrames >= playbackPrimeFrames else {
+                guard bufferedFrames >= primeFrames else {
                     clear(outputData: outputData)
                     return
                 }
-                guard ringBuffer.trimToLatestFrames(playbackPrimeFrames) else {
+                guard ringBuffer.trimToLatestFrames(primeFrames) else {
                     clear(outputData: outputData)
                     return
                 }
+                playbackRateServo.didPrime(occupancyFrames: primeFrames)
+                publishAdaptivePlaybackMetrics()
                 playbackPriming.store(false, ordering: .releasing)
             }
 
-            recordPlaybackBufferedFrames(ringBuffer.occupancyFrames())
+            let bufferedFrames = ringBuffer.occupancyFrames()
+            recordPlaybackBufferedFrames(bufferedFrames)
 
             let (destinationLeftChannel, destinationRightChannel) = SystemTapAudioEngine.decodedPlaybackChannelPair(
                 playbackChannelPair.load(ordering: .acquiring)
             )
 
-            var underrunFrames = 0
-            if destinationLeftChannel == 0,
-               destinationRightChannel == 1,
-               let outputSamples = contiguousInterleavedOutputBuffer(
-                outputBuffers,
-                frameCount: frameCount,
-                channelCount: channelCount
-            ) {
-                let readFrames = ringBuffer.readInterleaved(
-                    into: outputSamples,
+            let ratio = playbackRateServo.update(
+                occupancyFrames: bufferedFrames,
+                outputFrames: inputDurationFrames
+            )
+            publishAdaptivePlaybackMetrics()
+            let result = if playbackSampleRateConverter != nil {
+                renderSampleRateConvertedPlayback(
+                    outputBuffers: outputBuffers,
                     frameCount: frameCount,
-                    destinationChannelCount: channelCount
+                    ratio: ratio,
+                    destinationLeftChannel: destinationLeftChannel,
+                    destinationRightChannel: destinationRightChannel
                 )
-                if readFrames < frameCount {
-                    underrunFrames += frameCount - readFrames
-                }
             } else {
-                playbackScratchSamples.withUnsafeMutableBufferPointer { scratch in
-                    let scratchFrames = max(scratch.count / channelCount, 1)
-                    var frameOffset = 0
-                    while frameOffset < frameCount {
-                        let chunkFrames = min(frameCount - frameOffset, scratchFrames)
-                        let chunkSamples = UnsafeMutableBufferPointer(
-                            start: scratch.baseAddress,
-                            count: chunkFrames * channelCount
-                        )
-                        let readFrames = ringBuffer.readInterleaved(
-                            into: chunkSamples,
-                            frameCount: chunkFrames,
-                            destinationChannelCount: channelCount
-                        )
-                        if readFrames < chunkFrames {
-                            underrunFrames += chunkFrames - readFrames
-                        }
-                        writeInterleaved(
-                            UnsafeBufferPointer(chunkSamples),
-                            sourceFrameOffset: 0,
-                            destinationFrameOffset: frameOffset,
-                            frameCount: chunkFrames,
-                            sourceChannelCount: channelCount,
-                            destinationLeftChannel: destinationLeftChannel,
-                            destinationRightChannel: destinationRightChannel,
-                            to: outputBuffers
-                        )
-                        frameOffset += chunkFrames
-                    }
-                }
+                renderAdaptivePlayback(
+                    outputBuffers: outputBuffers,
+                    frameCount: frameCount,
+                    ratio: ratio,
+                    destinationLeftChannel: destinationLeftChannel,
+                    destinationRightChannel: destinationRightChannel
+                )
+            }
+            var underrunFrames = 0
+            var adaptiveRenderFailed = false
+            switch result {
+            case .rendered:
+                adaptivePlaybackRenderFailureActive.store(false, ordering: .releasing)
+                adaptivePlaybackRenderHealthGeneration.wrappingAdd(1, ordering: .releasing)
+            case .underrun(let frames):
+                adaptivePlaybackRenderFailureActive.store(false, ordering: .releasing)
+                adaptivePlaybackRenderHealthGeneration.wrappingAdd(1, ordering: .releasing)
+                underrunFrames = frames
+            case .failed:
+                adaptiveRenderFailed = true
             }
 
             if underrunFrames > 0 {
                 playbackUnderrunFrames.wrappingAdd(UInt64(underrunFrames), ordering: .relaxed)
-                playbackPriming.store(true, ordering: .releasing)
+                signalPlaybackInstability(.underrun)
+            } else if adaptiveRenderFailed {
+                adaptivePlaybackRenderFailures.wrappingAdd(1, ordering: .relaxed)
+                if !adaptivePlaybackRenderFailureActive.exchange(true, ordering: .acquiringAndReleasing) {
+                    signalPlaybackInstability(.adaptiveRenderFailure)
+                }
+            }
+            if underrunFrames > 0 || adaptiveRenderFailed {
+                beginPlaybackReprime()
             }
             updateMaxBufferedFrames(ringBuffer.occupancyFrames())
             playedFrames.wrappingAdd(UInt64(frameCount), ordering: .relaxed)
         }
 
+        private func beginPlaybackReprime() {
+            playbackRateServo.beginPriming()
+            playbackResampler.reset()
+            publishAdaptivePlaybackMetrics()
+            playbackPriming.store(true, ordering: .releasing)
+        }
+
+        private func signalPlaybackInstability(_ reason: PlaybackBufferInstabilityReason) {
+            latestPlaybackInstabilityReason.store(reason.rawValue, ordering: .relaxed)
+            playbackInstabilityGeneration.wrappingAdd(1, ordering: .releasing)
+        }
+
+        private func renderAdaptivePlayback(
+            outputBuffers: UnsafeMutableAudioBufferListPointer,
+            frameCount: Int,
+            ratio: Double,
+            destinationLeftChannel: Int,
+            destinationRightChannel: Int
+        ) -> AdaptivePlaybackRenderResult {
+            guard frameCount <= adaptiveOutputSamples.count / channelCount else {
+                clear(outputBuffers: outputBuffers)
+                return .failed
+            }
+            let outputSamples = UnsafeMutableBufferPointer(
+                start: adaptiveOutputSamples.baseAddress,
+                count: frameCount * channelCount
+            )
+            let result = renderAdaptiveFrames(
+                into: outputSamples,
+                frameCount: frameCount,
+                ratio: ratio
+            )
+            guard case .rendered = result else {
+                clear(outputBuffers: outputBuffers)
+                return result
+            }
+            writeInterleaved(
+                UnsafeBufferPointer(outputSamples),
+                sourceFrameOffset: 0,
+                destinationFrameOffset: 0,
+                frameCount: frameCount,
+                sourceChannelCount: channelCount,
+                destinationLeftChannel: destinationLeftChannel,
+                destinationRightChannel: destinationRightChannel,
+                to: outputBuffers
+            )
+            return .rendered
+        }
+
+        private func renderAdaptiveFrames(
+            into outputSamples: UnsafeMutableBufferPointer<Float>,
+            frameCount: Int,
+            ratio: Double
+        ) -> AdaptivePlaybackRenderResult {
+            let inputFrameCapacity = adaptiveInputSamples.count / channelCount
+            let outputFrameCapacity = outputSamples.count / channelCount
+            let chunkFrameCapacity = max(inputFrameCapacity - 8, 1)
+            guard inputFrameCapacity > 8, outputFrameCapacity >= frameCount else {
+                return .failed
+            }
+
+            var outputFrameOffset = 0
+            while outputFrameOffset < frameCount {
+                let chunkFrames = min(frameCount - outputFrameOffset, chunkFrameCapacity)
+                let plan = playbackResampler.inputPlan(outputFrames: chunkFrames, ratio: ratio)
+                guard plan.combinedFrames <= inputFrameCapacity else {
+                    playbackResampler.reset()
+                    return .failed
+                }
+
+                var readFrames = 0
+                var copiedRetainedSamples = false
+                var rendered = false
+                adaptiveInputSamples.withUnsafeMutableBufferPointer { inputSamples in
+                    copiedRetainedSamples = playbackResampler.copyRetainedSamples(into: inputSamples, plan: plan)
+                    guard copiedRetainedSamples, let inputBase = inputSamples.baseAddress else {
+                        return
+                    }
+                    let newInputSamples = UnsafeMutableBufferPointer(
+                        start: inputBase.advanced(by: plan.prefixFrames * channelCount),
+                        count: plan.newFrames * channelCount
+                    )
+                    readFrames = ringBuffer.readInterleaved(
+                        into: newInputSamples,
+                        frameCount: plan.newFrames,
+                        destinationChannelCount: channelCount
+                    )
+                    guard readFrames == plan.newFrames else {
+                        return
+                    }
+
+                    let outputChunk = UnsafeMutableBufferPointer(
+                        start: outputSamples.baseAddress?.advanced(
+                            by: outputFrameOffset * channelCount
+                        ),
+                        count: chunkFrames * channelCount
+                    )
+                    rendered = playbackResampler.render(
+                        input: inputSamples,
+                        plan: plan,
+                        output: outputChunk,
+                        outputFrames: chunkFrames,
+                        ratio: ratio
+                    )
+                }
+
+                guard copiedRetainedSamples else {
+                    playbackResampler.reset()
+                    return .failed
+                }
+                guard readFrames == plan.newFrames else {
+                    playbackResampler.reset()
+                    return .underrun(frames: max(plan.newFrames - readFrames, 1))
+                }
+                guard rendered else {
+                    playbackResampler.reset()
+                    return .failed
+                }
+                outputFrameOffset += chunkFrames
+            }
+
+            return .rendered
+        }
+
+        private func renderSampleRateConvertedPlayback(
+            outputBuffers: UnsafeMutableAudioBufferListPointer,
+            frameCount: Int,
+            ratio: Double,
+            destinationLeftChannel: Int,
+            destinationRightChannel: Int
+        ) -> AdaptivePlaybackRenderResult {
+            guard let sampleRateConverter = playbackSampleRateConverter,
+                  frameCount <= adaptiveOutputSamples.count / channelCount,
+                  let outputBase = adaptiveOutputSamples.baseAddress else {
+                clear(outputBuffers: outputBuffers)
+                return .failed
+            }
+
+            sampleRateConverterInputRatio = ratio
+            sampleRateConverterInputResult = .rendered
+            var convertedFrameCount = UInt32(frameCount)
+            var convertedData = AudioBufferList(
+                mNumberBuffers: 1,
+                mBuffers: AudioBuffer(
+                    mNumberChannels: UInt32(channelCount),
+                    mDataByteSize: UInt32(frameCount * channelCount * MemoryLayout<Float>.size),
+                    mData: outputBase
+                )
+            )
+            let status = withUnsafeMutablePointer(to: &convertedData) { outputData in
+                sampleRateConverter.fill(
+                    inputProc: Self.sampleRateConverterInputProc,
+                    inputContext: Unmanaged.passUnretained(self).toOpaque(),
+                    outputFrames: &convertedFrameCount,
+                    outputData: outputData
+                )
+            }
+            guard status == noErr else {
+                clear(outputBuffers: outputBuffers)
+                return switch sampleRateConverterInputResult {
+                case .rendered:
+                    .failed
+                case .underrun(let frames):
+                    .underrun(frames: frames)
+                case .failed:
+                    .failed
+                }
+            }
+            guard convertedFrameCount == frameCount else {
+                clear(outputBuffers: outputBuffers)
+                return .failed
+            }
+
+            let outputSamples = UnsafeBufferPointer(
+                start: outputBase,
+                count: frameCount * channelCount
+            )
+            writeInterleaved(
+                outputSamples,
+                sourceFrameOffset: 0,
+                destinationFrameOffset: 0,
+                frameCount: frameCount,
+                sourceChannelCount: channelCount,
+                destinationLeftChannel: destinationLeftChannel,
+                destinationRightChannel: destinationRightChannel,
+                to: outputBuffers
+            )
+            return .rendered
+        }
+
+        private static let sampleRateConverterInputProc: AudioConverterComplexInputDataProcRealtimeSafe = {
+            _, requestedFrames, inputData, packetDescriptions, context in
+            guard let context else {
+                requestedFrames.pointee = 0
+                return kAudioConverterErr_UnspecifiedError
+            }
+            packetDescriptions?.pointee = nil
+            return Unmanaged<AudioRuntime>
+                .fromOpaque(context)
+                .takeUnretainedValue()
+                .provideSampleRateConverterInput(
+                    requestedFrames: requestedFrames,
+                    inputData: inputData
+                )
+        }
+
+        private func provideSampleRateConverterInput(
+            requestedFrames: UnsafeMutablePointer<UInt32>,
+            inputData: UnsafeMutablePointer<AudioBufferList>
+        ) -> OSStatus {
+            let frameCount = Int(requestedFrames.pointee)
+            guard frameCount > 0,
+                  frameCount <= sampleRateConverterInputSamples.count / channelCount,
+                  let inputBase = sampleRateConverterInputSamples.baseAddress else {
+                requestedFrames.pointee = 0
+                sampleRateConverterInputResult = .failed
+                return kAudioConverterErr_InvalidInputSize
+            }
+
+            let inputSamples = UnsafeMutableBufferPointer(
+                start: inputBase,
+                count: frameCount * channelCount
+            )
+            let result = renderAdaptiveFrames(
+                into: inputSamples,
+                frameCount: frameCount,
+                ratio: sampleRateConverterInputRatio
+            )
+            sampleRateConverterInputResult = result
+            guard case .rendered = result else {
+                requestedFrames.pointee = 0
+                return kAudioConverterErr_UnspecifiedError
+            }
+
+            inputData.pointee = AudioBufferList(
+                mNumberBuffers: 1,
+                mBuffers: AudioBuffer(
+                    mNumberChannels: UInt32(channelCount),
+                    mDataByteSize: UInt32(frameCount * channelCount * MemoryLayout<Float>.size),
+                    mData: inputBase
+                )
+            )
+            return noErr
+        }
+
+        private func publishAdaptivePlaybackMetrics() {
+            playbackRateCorrectionPartsPerBillion.store(
+                Int64((playbackRateServo.correctionPartsPerMillion * 1_000).rounded()),
+                ordering: .relaxed
+            )
+            playbackRateCorrectionSaturated.store(
+                playbackRateServo.correctionIsSaturated,
+                ordering: .relaxed
+            )
+            filteredPlaybackOccupancyMilliFrames.store(
+                Int64((playbackRateServo.filteredOccupancyFrames * 1_000).rounded()),
+                ordering: .relaxed
+            )
+        }
+
         func clear(outputData: UnsafeMutablePointer<AudioBufferList>) {
-            for buffer in UnsafeMutableAudioBufferListPointer(outputData) {
+            clear(outputBuffers: UnsafeMutableAudioBufferListPointer(outputData))
+        }
+
+        private func clear(outputBuffers: UnsafeMutableAudioBufferListPointer) {
+            for buffer in outputBuffers {
                 guard let data = buffer.mData,
                       let byteCount = validatedClearByteCount(for: buffer) else {
                     continue
@@ -774,24 +1353,6 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             return UnsafeBufferPointer(start: data, count: sampleCount)
         }
 
-        private func contiguousInterleavedOutputBuffer(
-            _ buffers: UnsafeMutableAudioBufferListPointer,
-            frameCount: Int,
-            channelCount: Int
-        ) -> UnsafeMutableBufferPointer<Float>? {
-            guard buffers.count == 1,
-                  frameCount > 0,
-                  Int(buffers[0].mNumberChannels) == channelCount,
-                  let data = buffers[0].mData?.assumingMemoryBound(to: Float.self) else {
-                return nil
-            }
-            let sampleCount = frameCount * channelCount
-            guard sampleCount <= Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.stride else {
-                return nil
-            }
-            return UnsafeMutableBufferPointer(start: data, count: sampleCount)
-        }
-
         private func sample(
             from buffers: UnsafeMutableAudioBufferListPointer,
             frame: Int,
@@ -850,7 +1411,17 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     }
 
     private let control = Mutex(ControlState())
+    private let playbackBufferRenegotiationHandler = Mutex<(@Sendable (PlaybackBufferRenegotiation) -> Void)?>(nil)
+    private let runtimeFailureHandler = Mutex<(@Sendable (AudioEngineFailure) -> Void)?>(nil)
     private let restorationStoreURL: URL
+    private let playbackBufferCalibrationStoreURL: URL
+    private let playbackBufferAdaptationQueue = DispatchQueue(
+        label: "com.glasseq.playback-buffer-adaptation",
+        qos: .userInitiated
+    )
+    private let playbackBufferAdaptationQueueKey = DispatchSpecificKey<Void>()
+    private let playbackBufferAdaptationTimer: DispatchSourceTimer
+    private let playbackBufferAdaptationTimerRunning = Mutex(false)
 
     public var state: AudioEngineState {
         control.withLock { $0.state }
@@ -863,38 +1434,121 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     public init(restorationStoreURL: URL? = nil) {
         let restorationStoreURL = restorationStoreURL ?? PersistedAudioDeviceRestorationStore.defaultURL()
         self.restorationStoreURL = restorationStoreURL
+        self.playbackBufferCalibrationStoreURL = PersistedPlaybackBufferCalibrationStore.defaultURL(
+            nextTo: restorationStoreURL
+        )
+        let timer = DispatchSource.makeTimerSource(queue: playbackBufferAdaptationQueue)
+        self.playbackBufferAdaptationTimer = timer
+        playbackBufferAdaptationQueue.setSpecific(key: playbackBufferAdaptationQueueKey, value: ())
         Self.restorePersistedDeviceSettings(at: restorationStoreURL)
+        timer.setEventHandler { [weak self] in
+            self?.serviceAdaptivePlaybackBuffering()
+        }
+        timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250), leeway: .milliseconds(50))
     }
 
     deinit {
         stop()
+        playbackBufferAdaptationTimer.setEventHandler {}
+        playbackBufferAdaptationTimerRunning.withLock { isRunning in
+            if !isRunning {
+                playbackBufferAdaptationTimer.resume()
+            }
+            isRunning = false
+        }
+        playbackBufferAdaptationTimer.cancel()
     }
 
     public func start(output: AudioOutputDevice, profile: EQProfile) throws {
+        try start(output: output, profile: profile, expectation: nil)
+    }
+
+    private func start(
+        output: AudioOutputDevice,
+        profile: EQProfile,
+        expectation: OutputRebuildExpectation?
+    ) throws {
+        pausePlaybackBufferAdaptation()
+        defer {
+            updatePlaybackBufferAdaptationTimer()
+        }
         var previousState = AudioEngineState.stopped
         var previousStatus = AudioEngineStatus.stopped
         var activePreparation: OutputRebuildPreparation?
 
         do {
-            let preparation = try control.withLock { state in
+            var preparation = try control.withLock { state in
+                if let expectation {
+                    guard state.outputRebuildGeneration == expectation.generation,
+                          state.runtime === expectation.runtime,
+                          state.activeOutput?.uid == output.uid else {
+                        throw StaleOutputRebuild()
+                    }
+                }
+                guard let requestedProfile = Self.requestedOutputRebuildProfile(
+                    requestedProfile: profile,
+                    expectedProfileRevision: expectation?.profileRevision,
+                    activeProfile: state.activeProfile,
+                    activeProfileRevision: state.profileRevision
+                ) else {
+                    throw StaleProfileRequest()
+                }
                 previousState = state.state
                 previousStatus = state.status
                 state.status = .starting
-                // The capture half (one global muted tap @ the tap rate) is created once and
-                // kept alive across output switches, so dry audio never leaks to a newly
-                // selected device. Only the output half is (re)built for `output`.
-                try ensureCaptureHalfLocked(&state, profile: profile)
-                return try prepareOutputRebuildLocked(&state, output: output, profile: profile)
+                // Keep capture alive across ordinary output switches. Leaving a low-rate route
+                // refreshes it under the same mute guard used for topology changes so normal
+                // outputs regain their full capture bandwidth without leaking dry audio.
+                try ensureCaptureHalfLocked(&state, output: output, profile: requestedProfile)
+                state.profileRevision &+= 1
+                return try prepareOutputRebuildLocked(
+                    &state,
+                    output: output,
+                    profile: requestedProfile,
+                    profileRevision: state.profileRevision
+                )
             }
+            let refreshedOutput = try CoreAudioDeviceQuery.outputDevice(id: preparation.output.id)
+            preparation.output = refreshedOutput
+            preparation.originalBufferFrameSize = refreshedOutput.bufferFrameSize
             activePreparation = preparation
-            let matchedOutput = try forceSampleRate(preparation.tapSampleRate, on: preparation.output)
             try control.withLock { state in
+                guard state.outputRebuildGeneration == preparation.generation,
+                      state.runtime === preparation.runtime,
+                      state.captureRunning else {
+                    throw StaleOutputRebuild()
+                }
+                if Self.shouldRecordSampleRateRestoration(
+                    tapSampleRate: preparation.tapSampleRate,
+                    output: refreshedOutput
+                ) {
+                    try recordSampleRateRestorationIfNeeded(for: refreshedOutput, state: &state)
+                }
+            }
+            let matchedOutput = try preparePlaybackOutput(
+                tapSampleRate: preparation.tapSampleRate,
+                output: preparation.output
+            )
+            let calibrationProbe = try control.withLock { state -> PlaybackBufferCalibrationProbe? in
                 try finishOutputRebuildLocked(&state, preparation: preparation, matchedOutput: matchedOutput)
                 let active = state.activeOutput ?? output
                 state.state = .running(output: active)
                 state.status = .running(output: active)
+                return state.playbackBufferCalibrationProbe
+            }
+            if let calibrationProbe {
+                try? PersistedPlaybackBufferCalibrationStore.beginProbe(
+                    outputUID: calibrationProbe.outputUID,
+                    sampleRate: calibrationProbe.sampleRate,
+                    tapSampleRate: calibrationProbe.tapSampleRate,
+                    frameSize: calibrationProbe.frameSize,
+                    targetFrames: calibrationProbe.targetFrames,
+                    at: playbackBufferCalibrationStoreURL
+                )
             }
         } catch is StaleOutputRebuild {
+            return
+        } catch is StaleProfileRequest {
             return
         } catch {
             var shouldRethrow = true
@@ -907,9 +1561,6 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 if error is TopologyRebuildMuteGuardUnavailable {
                     state.state = previousState
                     state.status = previousStatus
-                    if case .running = previousState {
-                        shouldRethrow = false
-                    }
                     return
                 }
                 let failure = audioEngineFailure(from: error)
@@ -936,9 +1587,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
         // Topology-incompatible change: rebuild around the persistent tap (the tap rate is
         // constant, so start() keeps the capture half and only swaps the DSP graph + output).
-        guard let output = control.withLock({ $0.activeOutput }) else {
-            return
-        }
+        let output = try Self.profileUpdateOutput(control.withLock { $0.activeOutput })
         let freshOutput = try CoreAudioDeviceQuery.outputDevice(id: output.id)
         try start(output: freshOutput, profile: profile)
         let didApplyProfile = control.withLock { state in
@@ -958,17 +1607,25 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
     }
 
-    private func updateDSPLocked(_ state: inout ControlState, profile: EQProfile) -> Bool {
+    private func updateDSPLocked(
+        _ state: inout ControlState,
+        profile: EQProfile,
+        incrementsProfileRevision: Bool = true
+    ) -> Bool {
         guard let runtime = state.runtime,
               let activeProfile = state.activeProfile else {
             return false
         }
+        let maximumUsableFrequency = EQRouteFrequencyPolicy.maximumUsableFrequency(
+            sampleRate: state.activeOutput?.nominalSampleRate ?? runtime.sampleRate
+        )
 
         guard Self.canHotSwapDSP(
             from: activeProfile,
             to: profile,
             sampleRate: runtime.sampleRate,
-            channelCount: runtime.channelCount
+            channelCount: runtime.channelCount,
+            maximumUsableFrequency: maximumUsableFrequency
         ) else {
             return false
         }
@@ -976,12 +1633,16 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         let preparedConfig = EQRenderConfiguration(
             profile: Self.dspProfile(from: profile),
             sampleRate: runtime.sampleRate,
-            channelCount: runtime.channelCount
+            channelCount: runtime.channelCount,
+            maximumUsableFrequency: maximumUsableFrequency
         )
         runtime.drainDSPConfigBoxes()
         runtime.publishPendingDSPConfig(preparedConfig)
         runtime.setBypassed(profile.isBypassed)
         state.activeProfile = profile
+        if incrementsProfileRevision {
+            state.profileRevision &+= 1
+        }
         return true
     }
 
@@ -989,7 +1650,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         from activeProfile: EQProfile,
         to nextProfile: EQProfile,
         sampleRate: Double,
-        channelCount: Int
+        channelCount: Int,
+        maximumUsableFrequency: Double? = nil
     ) -> Bool {
         guard activeProfile.mode == nextProfile.mode,
               activeProfile.channelMode == nextProfile.channelMode else {
@@ -999,12 +1661,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         return EQRenderConfiguration(
             profile: Self.dspProfile(from: nextProfile),
             sampleRate: sampleRate,
-            channelCount: channelCount
+            channelCount: channelCount,
+            maximumUsableFrequency: maximumUsableFrequency
         ).hasRealtimeCompatibleTopology(
             with: EQRenderConfiguration(
                 profile: Self.dspProfile(from: activeProfile),
                 sampleRate: sampleRate,
-                channelCount: channelCount
+                channelCount: channelCount,
+                maximumUsableFrequency: maximumUsableFrequency
             )
         )
     }
@@ -1013,6 +1677,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         control.withLock { state in
             state.runtime?.setBypassed(isBypassed)
             state.activeProfile?.isBypassed = isBypassed
+            state.profileRevision &+= 1
         }
     }
 
@@ -1023,9 +1688,11 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     }
 
     public func stop() {
+        pausePlaybackBufferAdaptation()
         control.withLock { state in
             stopLocked(&state)
         }
+        updatePlaybackBufferAdaptationTimer()
     }
 
     public func snapshotMetrics() -> AudioEngineMetrics {
@@ -1038,24 +1705,108 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         runtime?.resetMetrics()
     }
 
+    public func resetPlaybackBufferCalibration(forOutputUID outputUID: String) throws {
+        guard !outputUID.isEmpty else {
+            return
+        }
+        pausePlaybackBufferAdaptation()
+        defer {
+            updatePlaybackBufferAdaptationTimer()
+        }
+        try PersistedPlaybackBufferCalibrationStore.removeCalibrations(
+            outputUID: outputUID,
+            at: playbackBufferCalibrationStoreURL
+        )
+        let activeOutputAndProfile = control.withLock {
+            state -> (AudioOutputDevice, EQProfile, OutputRebuildExpectation)? in
+            if state.playbackBufferCalibrationProbe?.outputUID == outputUID {
+                state.playbackBufferCalibrationProbe = nil
+            }
+            state.playbackBufferInstabilityPersistenceGate.reset(outputUID: outputUID)
+            state.attemptedPlaybackTargetDownProbes = Set(
+                state.attemptedPlaybackTargetDownProbes.filter { $0.outputUID != outputUID }
+            )
+            state.attemptedPlaybackFrameSizeDownProbes = Set(
+                state.attemptedPlaybackFrameSizeDownProbes.filter { $0.outputUID != outputUID }
+            )
+            guard let output = state.activeOutput,
+                  output.uid == outputUID,
+                  let profile = state.activeProfile else {
+                return nil
+            }
+            guard let runtime = state.runtime else {
+                return nil
+            }
+            return (
+                output,
+                profile,
+                OutputRebuildExpectation(
+                    generation: state.outputRebuildGeneration,
+                    runtime: runtime,
+                    profileRevision: state.profileRevision
+                )
+            )
+        }
+        if let (activeOutput, activeProfile, expectation) = activeOutputAndProfile {
+            let freshOutput = try CoreAudioDeviceQuery.outputDevice(id: activeOutput.id)
+            try start(
+                output: freshOutput,
+                profile: activeProfile,
+                expectation: expectation
+            )
+        }
+    }
+
+    public func setPlaybackBufferRenegotiationHandler(
+        _ handler: (@Sendable (PlaybackBufferRenegotiation) -> Void)?
+    ) {
+        playbackBufferRenegotiationHandler.withLock { currentHandler in
+            currentHandler = handler
+        }
+    }
+
+    public func setRuntimeFailureHandler(
+        _ handler: (@Sendable (AudioEngineFailure) -> Void)?
+    ) {
+        runtimeFailureHandler.withLock { currentHandler in
+            currentHandler = handler
+        }
+    }
+
     private func stopLocked(_ state: inout ControlState) {
         state.runtime?.markStopping()
         stopOutputHalfLocked(&state)
         stopCaptureHalfLocked(&state)
         state.activeProfile = nil
+        state.profileRevision &+= 1
+        state.handledPlaybackInstabilityGeneration = 0
+        state.adaptivePlaybackRenderRecoveryAttempts = 0
+        state.adaptivePlaybackRenderRecoveryHealthGeneration = nil
+        state.playbackBufferInstabilityPersistenceGate.reset()
+        state.attemptedPlaybackTargetDownProbes.removeAll()
+        state.attemptedPlaybackFrameSizeDownProbes.removeAll()
         state.state = .stopped
         state.status = .stopped
     }
 
     // MARK: - Capture half (persistent global muted tap @ the tap rate)
 
-    private func ensureCaptureHalfLocked(_ state: inout ControlState, profile: EQProfile) throws {
+    private func ensureCaptureHalfLocked(
+        _ state: inout ControlState,
+        output: AudioOutputDevice,
+        profile: EQProfile
+    ) throws {
         if state.captureRunning, state.runtime != nil {
-            if updateDSPLocked(&state, profile: profile) {
+            let shouldRefreshCapture = Self.shouldRefreshCaptureForOutput(
+                tapSampleRate: state.tapSampleRate,
+                output: output
+            )
+            if !shouldRefreshCapture,
+               updateDSPLocked(&state, profile: profile, incrementsProfileRevision: false) {
                 return
             }
-            // Topology-incompatible DSP change: hold a second global muted tap while the
-            // capture half is torn down and recreated, so HAL-level muting never lapses.
+            // Hold a second global muted tap while capture is recreated, so HAL-level muting
+            // never lapses during topology changes or low-rate capture refreshes.
             try Self.performTopologyRebuild(
                 acquireMuteGuard: { try createTopologyRebuildMuteGuard() }
             ) {
@@ -1079,12 +1830,28 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         state.tapChannelCount = tapChannelCount
 
         let runtimeBufferFrameSize = Int(Self.maximumRuntimeBufferFrameSize)
-        // Low-latency tuning: a 512-frame prime (~11 ms @ 48k) — about 2x the tap's callback
-        // once we request a 256-frame capture buffer below. The ring keeps drift/transient
-        // headroom above the prime; raise the prime if underruns appear on a given device.
+        // Low-latency tuning: a 128-frame prime (~2.7 ms @ 48k) — about 2x the tap's callback
+        // once we request a 64-frame capture buffer below. Capacity is sized from the largest
+        // runtime output callback so every supported prime retains equal drift headroom.
         let playbackPrimeFrames = Self.preferredPlaybackPrimeFrames
-        let ringCapacityFrames = max(Self.minimumRingBufferFrames, playbackPrimeFrames * 2)
+        let ringCapacityFrames = Self.runtimeRingCapacityFrames
         let scratchFrames = max(runtimeBufferFrameSize, Self.minimumRingBufferFrames)
+
+        state.aggregateDeviceID = try createPrivateAggregateDevice(tapID: tapID)
+        // Ask the capture aggregate for small callbacks to cut latency. The write is best-effort,
+        // so size the initial playback reservoir from the value the aggregate actually reports.
+        try? CoreAudioDeviceQuery.setBufferFrameSize(
+            Self.preferredCaptureBufferFrameSize,
+            objectID: state.aggregateDeviceID
+        )
+        let reportedCaptureCallbackFrames = try? CoreAudioDeviceQuery.getUInt32Property(
+            objectID: state.aggregateDeviceID,
+            selector: kAudioDevicePropertyBufferFrameSize,
+            scope: kAudioObjectPropertyScopeGlobal
+        )
+        let captureCallbackFrames = Self.startupCaptureCallbackFrames(
+            reportedFrames: reportedCaptureCallbackFrames
+        )
 
         let runtime = AudioRuntime(
             profile: profile,
@@ -1092,15 +1859,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             channelCount: tapChannelCount,
             ringCapacityFrames: ringCapacityFrames,
             scratchFrames: scratchFrames,
+            captureCallbackFrames: captureCallbackFrames,
             playbackPrimeFrames: playbackPrimeFrames
         )
         state.runtime = runtime
         state.activeProfile = profile
 
-        state.aggregateDeviceID = try createPrivateAggregateDevice(tapID: tapID)
-        // Ask the capture aggregate for small callbacks to cut latency (best-effort; not all
-        // tap aggregates honor it — if ignored, the prime above still keeps capture safe).
-        try? CoreAudioDeviceQuery.setBufferFrameSize(Self.preferredCaptureBufferFrameSize, objectID: state.aggregateDeviceID)
         state.captureIOProcID = try createCaptureIOProc(deviceID: state.aggregateDeviceID, runtime: runtime)
         try checkOSStatus(
             AudioDeviceStart(state.aggregateDeviceID, state.captureIOProcID),
@@ -1133,30 +1897,30 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         state.captureRunning = false
     }
 
-    // MARK: - Output half (swappable; device forced to the tap rate so no resampling)
+    // MARK: - Output half (swappable; direct-rate or converted low-rate playback)
 
     private func prepareOutputRebuildLocked(
         _ state: inout ControlState,
         output: AudioOutputDevice,
-        profile: EQProfile
+        profile: EQProfile,
+        profileRevision: UInt64
     ) throws -> OutputRebuildPreparation {
         guard let runtime = state.runtime else {
             throw CoreAudioError(operation: "rebuildOutputHalf(missing runtime)", status: kAudioHardwareNotRunningError)
         }
-        // Match the device to the tap's fixed rate so the EQ'd stream needs no resampling.
+        // Mismatched low-rate endpoints keep their device-owned rates and receive realtime
+        // sample-rate conversion in the playback callback.
         let originalBufferFrameSize = output.bufferFrameSize
         _ = try Self.supportedRuntimeChannelCount(for: output)
         stopOutputHalfLocked(&state)
-        if state.tapSampleRate > 0, abs(output.nominalSampleRate - state.tapSampleRate) >= 1 {
-            try recordSampleRateRestorationIfNeeded(for: output, state: &state)
-        }
         return OutputRebuildPreparation(
             generation: state.outputRebuildGeneration,
             output: output,
             profile: profile,
             runtime: runtime,
             tapSampleRate: state.tapSampleRate,
-            originalBufferFrameSize: originalBufferFrameSize
+            originalBufferFrameSize: originalBufferFrameSize,
+            profileRevision: profileRevision
         )
     }
 
@@ -1172,6 +1936,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
         let runtime = preparation.runtime
         let output = preparation.output
+        let effectiveProfile = Self.effectiveOutputRebuildProfile(
+            preparedProfile: preparation.profile,
+            preparedProfileRevision: preparation.profileRevision,
+            activeProfile: state.activeProfile,
+            activeProfileRevision: state.profileRevision
+        )
         _ = try Self.supportedRuntimeChannelCount(for: matchedOutput)
         if state.bufferFrameSizeRestorations[output.uid] == nil {
             let restoration = BufferFrameSizeRestoration(
@@ -1217,16 +1987,68 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             throw error
         }
         state.outputIOProcID = outputIOProcID
+        // Keep IOProc ownership paired with its device so failure cleanup can stop it.
+        state.activeOutput = matchedOutput
 
         // Now that our output owns the device, apply the low-latency buffer size. The stream
         // restart it triggers happens under our muted IOProc, so it plays silence, not dry audio.
-        let tunedOutput = tuneBufferFrameSize(for: matchedOutput)
+        let allowsFrameSizeDownwardProbe = state.attemptedPlaybackFrameSizeDownProbes.insert(
+            PlaybackBufferRouteKey(output: matchedOutput)
+        ).inserted
+        let tunedOutput = tuneBufferFrameSize(
+            for: matchedOutput,
+            tapSampleRate: runtime.sampleRate,
+            allowsDownwardProbe: allowsFrameSizeDownwardProbe
+        )
+        try Self.validatePlaybackCallbackCapacity(for: tunedOutput)
+        try Self.validatePlaybackConversionCapacity(
+            for: tunedOutput,
+            tapSampleRate: runtime.sampleRate,
+            captureCallbackFrames: runtime.maximumKnownCaptureCallbackFrames()
+        )
+        state.activeOutput = tunedOutput
+        let operatingPointKey = PlaybackBufferOperatingPointKey(
+            output: tunedOutput,
+            tapSampleRate: runtime.sampleRate
+        )
+        let allowsDownwardProbe = state.attemptedPlaybackTargetDownProbes.insert(
+            operatingPointKey
+        ).inserted
+        let targetFrames = preferredPlaybackTargetFrames(
+            for: tunedOutput,
+            tapSampleRate: runtime.sampleRate,
+            captureCallbackFrames: runtime.maximumKnownCaptureCallbackFrames(),
+            allowsDownwardProbe: allowsDownwardProbe
+        )
+        // Capture applies prepared configs and retires their boxes. Output switches are a safe
+        // control-path opportunity to release those boxes before publishing the next config.
+        runtime.drainDSPConfigBoxes()
+        runtime.publishPendingDSPConfig(EQRenderConfiguration(
+            profile: Self.dspProfile(from: effectiveProfile),
+            sampleRate: runtime.sampleRate,
+            channelCount: runtime.channelCount,
+            maximumUsableFrequency: EQRouteFrequencyPolicy.maximumUsableFrequency(
+                sampleRate: tunedOutput.nominalSampleRate
+            )
+        ))
+        // Build the converter and its exact Core Audio input scratch on this control path while
+        // the new IOProc is muted. reprimePlayback() release-publishes both before the callback's
+        // acquiring mute check.
+        try runtime.configurePlayback(
+            primeFrames: targetFrames,
+            outputSampleRate: tunedOutput.nominalSampleRate
+        )
+        state.handledPlaybackInstabilityGeneration = runtime.playbackInstabilitySnapshot().generation
+        state.playbackBufferCalibrationProbe = playbackBufferCalibrationProbe(
+            for: tunedOutput,
+            tapSampleRate: runtime.sampleRate,
+            targetFrames: targetFrames
+        )
 
         // Unmute and re-anchor playback to the freshest captured audio on the new device.
         runtime.reprimePlayback()
 
-        state.activeOutput = tunedOutput
-        state.activeProfile = preparation.profile
+        state.activeProfile = effectiveProfile
     }
 
     private func stopOutputHalfLocked(_ state: inout ControlState) {
@@ -1238,6 +2060,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         state.outputIOProcID = nil
         restoreDeviceSettingsIfNeeded(&state)
         state.activeOutput = nil
+        state.playbackBufferCalibrationProbe = nil
     }
 
     private func forceSampleRate(
@@ -1260,6 +2083,16 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             output.id,
             "output sample rate \(freshOutput.nominalSampleRate) does not match tap sample rate \(sampleRate)"
         )
+    }
+
+    private func preparePlaybackOutput(
+        tapSampleRate: Double,
+        output: AudioOutputDevice
+    ) throws -> AudioOutputDevice {
+        if Self.shouldUseSampleRateConversion(tapSampleRate: tapSampleRate, output: output) {
+            return output
+        }
+        return try forceSampleRate(tapSampleRate, on: output)
     }
 
     private func recordSampleRateRestorationIfNeeded(
@@ -1414,18 +2247,22 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             return classifyCoreAudioError(coreAudioError)
         }
         if let availabilityError = error as? AudioDeviceAvailabilityError {
-            if case .unsupportedOutputChannelCount = availabilityError {
+            switch availabilityError {
+            case .unsupportedOutputChannelCount,
+                 .unsupportedOutputBufferFrameSize,
+                 .unsupportedPlaybackConversionBuffer:
                 return AudioEngineFailure(
                     category: .deviceFormatUnsupported,
                     userMessage: availabilityError.description,
                     operation: "CoreAudioDeviceQuery"
                 )
+            default:
+                return AudioEngineFailure(
+                    category: .outputDeviceUnavailable,
+                    userMessage: availabilityError.description,
+                    operation: "CoreAudioDeviceQuery"
+                )
             }
-            return AudioEngineFailure(
-                category: .outputDeviceUnavailable,
-                userMessage: availabilityError.description,
-                operation: "CoreAudioDeviceQuery"
-            )
         }
         return AudioEngineFailure(
             category: .coreAudioOperationFailed,
@@ -1444,6 +2281,39 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             throw AudioDeviceAvailabilityError.unsupportedOutputChannelCount(output.id, output.outputChannelCount)
         }
         return output.outputChannelCount
+    }
+
+    static func validatePlaybackCallbackCapacity(for output: AudioOutputDevice) throws {
+        guard output.bufferFrameSize <= UInt32(maximumSupportedCallbackFrames) else {
+            throw AudioDeviceAvailabilityError.unsupportedOutputBufferFrameSize(
+                output.id,
+                output.bufferFrameSize,
+                maximum: UInt32(maximumSupportedCallbackFrames)
+            )
+        }
+    }
+
+    static func validatePlaybackConversionCapacity(
+        for output: AudioOutputDevice,
+        tapSampleRate: Double,
+        captureCallbackFrames: Int = preferredLowSampleRatePlaybackReservoirFrames
+    ) throws {
+        guard shouldUseSampleRateConversion(tapSampleRate: tapSampleRate, output: output) else {
+            return
+        }
+        let requiredPrimeFrames = preferredPlaybackPrimeFrames(
+            for: output,
+            tapSampleRate: tapSampleRate,
+            captureCallbackFrames: captureCallbackFrames
+        )
+        let maximumPrimeFrames = runtimeRingCapacityFrames / playbackRingPullCount
+        guard requiredPrimeFrames <= maximumPrimeFrames else {
+            throw AudioDeviceAvailabilityError.unsupportedPlaybackConversionBuffer(
+                output.id,
+                requiredPrimeFrames: requiredPrimeFrames,
+                maximumPrimeFrames: maximumPrimeFrames
+            )
+        }
     }
 
     /// Normalizes a device-reported preferred stereo pair (1-based channel numbers; the HAL
@@ -1657,12 +2527,24 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         return try rebuild()
     }
 
-    private func tuneBufferFrameSize(for output: AudioOutputDevice) -> AudioOutputDevice {
+    private func tuneBufferFrameSize(
+        for output: AudioOutputDevice,
+        tapSampleRate: Double,
+        allowsDownwardProbe: Bool
+    ) -> AudioOutputDevice {
         do {
             let range = try CoreAudioDeviceQuery.bufferFrameSizeRangeValue(objectID: output.id)
-            let requested = clampedBufferFrameSize(
-                Self.preferredBufferFrameSize(for: output),
-                range: range
+            let calibration = PersistedPlaybackBufferCalibrationStore.calibration(
+                outputUID: output.uid,
+                sampleRate: output.nominalSampleRate,
+                tapSampleRate: tapSampleRate,
+                from: playbackBufferCalibrationStoreURL
+            )
+            let requested = AdaptivePlaybackBufferPolicy.startupFrameSize(
+                preferredFrameSize: Self.preferredBufferFrameSize(for: output),
+                calibration: calibration,
+                supportedRange: range,
+                allowsDownwardProbe: allowsDownwardProbe
             )
             guard requested != output.bufferFrameSize else {
                 return output
@@ -1672,6 +2554,522 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         } catch {
             return output
         }
+    }
+
+    private func playbackBufferCalibrationProbe(
+        for output: AudioOutputDevice,
+        tapSampleRate: Double,
+        targetFrames: Int,
+        startedAt: ContinuousClock.Instant = ContinuousClock().now
+    ) -> PlaybackBufferCalibrationProbe? {
+        guard Self.shouldAdaptPlaybackBuffer(for: output) else {
+            return nil
+        }
+        let calibration = PersistedPlaybackBufferCalibrationStore.calibration(
+            outputUID: output.uid,
+            sampleRate: output.nominalSampleRate,
+            tapSampleRate: tapSampleRate,
+            from: playbackBufferCalibrationStoreURL
+        )
+        guard PlaybackBufferCalibrationPolicy.shouldProbe(
+            frameSize: output.bufferFrameSize,
+            targetFrames: targetFrames,
+            calibration: calibration
+        ) else {
+            return nil
+        }
+        return PlaybackBufferCalibrationProbe(
+            outputUID: output.uid,
+            sampleRate: output.nominalSampleRate,
+            tapSampleRate: tapSampleRate,
+            frameSize: output.bufferFrameSize,
+            targetFrames: targetFrames,
+            startedAt: startedAt
+        )
+    }
+
+    private func preferredPlaybackTargetFrames(
+        for output: AudioOutputDevice,
+        tapSampleRate: Double,
+        captureCallbackFrames: Int,
+        allowsDownwardProbe: Bool
+    ) -> Int {
+        let baseline = Self.preferredPlaybackPrimeFrames(
+            for: output,
+            tapSampleRate: tapSampleRate,
+            captureCallbackFrames: captureCallbackFrames
+        )
+        guard Self.shouldAdaptPlaybackBuffer(for: output) else {
+            return baseline
+        }
+        let calibration = PersistedPlaybackBufferCalibrationStore.calibration(
+            outputUID: output.uid,
+            sampleRate: output.nominalSampleRate,
+            tapSampleRate: tapSampleRate,
+            from: playbackBufferCalibrationStoreURL
+        )
+        let targetFrames = AdaptivePlaybackBufferPolicy.startupTargetFrames(
+            callbackFrames: Self.playbackInputCallbackFrames(
+                for: output,
+                tapSampleRate: tapSampleRate
+            ),
+            baselineTargetFrames: baseline,
+            operatingPoint: calibration?.operatingPoint(for: output.bufferFrameSize),
+            allowsDownwardProbe: allowsDownwardProbe
+        )
+        return min(targetFrames, Self.runtimeRingCapacityFrames / 2)
+    }
+
+    private func updatePlaybackBufferAdaptationTimer() {
+        let shouldRun = control.withLock { state in
+            guard case .running = state.state,
+                  let output = state.activeOutput else {
+                return false
+            }
+            return Self.shouldAdaptPlaybackBuffer(for: output)
+        }
+        setPlaybackBufferAdaptationTimerRunning(shouldRun)
+    }
+
+    private func pausePlaybackBufferAdaptation() {
+        setPlaybackBufferAdaptationTimerRunning(false)
+        if DispatchQueue.getSpecific(key: playbackBufferAdaptationQueueKey) == nil {
+            playbackBufferAdaptationQueue.sync {}
+        }
+    }
+
+    private func setPlaybackBufferAdaptationTimerRunning(_ shouldRun: Bool) {
+        playbackBufferAdaptationTimerRunning.withLock { isRunning in
+            guard isRunning != shouldRun else {
+                return
+            }
+            isRunning = shouldRun
+            if shouldRun {
+                playbackBufferAdaptationTimer.resume()
+            } else {
+                playbackBufferAdaptationTimer.suspend()
+            }
+        }
+    }
+
+    private func serviceAdaptivePlaybackBuffering() {
+        let now = ContinuousClock().now
+        guard let action = control.withLock({ state -> PlaybackBufferAdaptationAction? in
+            guard let runtime = state.runtime,
+                  let output = state.activeOutput,
+                  Self.shouldAdaptPlaybackBuffer(for: output) else {
+                return nil
+            }
+
+            if let recoveryGeneration = state.adaptivePlaybackRenderRecoveryHealthGeneration,
+               runtime.playbackRenderHealthGeneration() != recoveryGeneration {
+                state.adaptivePlaybackRenderRecoveryAttempts = 0
+                state.adaptivePlaybackRenderRecoveryHealthGeneration = nil
+            }
+
+            let instability = runtime.playbackInstabilitySnapshot()
+            if instability.generation == state.handledPlaybackInstabilityGeneration {
+                guard let probe = state.playbackBufferCalibrationProbe,
+                      probe.hasCompletedProbation(at: now) else {
+                    return nil
+                }
+                return .stabilize(probe)
+            }
+            state.handledPlaybackInstabilityGeneration = instability.generation
+            return .renegotiate(PlaybackBufferRenegotiationPreparation(
+                outputRebuildGeneration: state.outputRebuildGeneration,
+                reason: instability.reason,
+                output: output,
+                runtime: runtime
+            ))
+        }) else {
+            return
+        }
+
+        let preparation: PlaybackBufferRenegotiationPreparation
+        switch action {
+        case .stabilize(let probe):
+            do {
+                try PersistedPlaybackBufferCalibrationStore.recordStable(
+                    outputUID: probe.outputUID,
+                    sampleRate: probe.sampleRate,
+                    tapSampleRate: probe.tapSampleRate,
+                    frameSize: probe.frameSize,
+                    targetFrames: probe.targetFrames,
+                    at: playbackBufferCalibrationStoreURL
+                )
+            } catch {
+                return
+            }
+            control.withLock { state in
+                if state.playbackBufferCalibrationProbe == probe {
+                    state.playbackBufferCalibrationProbe = nil
+                    state.playbackBufferInstabilityPersistenceGate.reset(outputUID: probe.outputUID)
+                }
+            }
+            return
+        case .renegotiate(let pendingRenegotiation):
+            preparation = pendingRenegotiation
+        }
+
+        if preparation.reason == .adaptiveRenderFailure {
+            recoverAdaptivePlaybackRenderFailure(preparation)
+            return
+        }
+
+        if increasePlaybackTargetIfPossible(preparation) {
+            return
+        }
+        guard AdaptivePlaybackBufferPolicy.shouldIncreaseCallback(for: preparation.reason) else {
+            continueCalibrationAfterUnresolvedInstability(preparation)
+            return
+        }
+
+        let range: AudioBufferFrameSizeRange
+        do {
+            range = try CoreAudioDeviceQuery.bufferFrameSizeRangeValue(objectID: preparation.output.id)
+        } catch {
+            continueCalibrationAfterUnresolvedInstability(preparation)
+            return
+        }
+        guard let nextFrameSize = AdaptivePlaybackBufferPolicy.nextFrameSize(
+            after: preparation.output.bufferFrameSize,
+            supportedRange: range
+        ) else {
+            continueCalibrationAfterUnresolvedInstability(preparation)
+            return
+        }
+        var proposedOutput = preparation.output
+        proposedOutput.bufferFrameSize = nextFrameSize
+        do {
+            try Self.validatePlaybackConversionCapacity(
+                for: proposedOutput,
+                tapSampleRate: preparation.runtime.sampleRate,
+                captureCallbackFrames: preparation.runtime.maximumKnownCaptureCallbackFrames()
+            )
+        } catch {
+            continueCalibrationAfterUnresolvedInstability(preparation)
+            return
+        }
+
+        let didBeginRenegotiation = control.withLock { state in
+            guard state.outputRebuildGeneration == preparation.outputRebuildGeneration,
+                  state.runtime === preparation.runtime,
+                  state.activeOutput == preparation.output else {
+                return false
+            }
+            preparation.runtime.muteOutputForTransition()
+            return true
+        }
+        guard didBeginRenegotiation else {
+            return
+        }
+
+        let updatedOutput: AudioOutputDevice
+        do {
+            guard let result = try Self.renegotiatedPlaybackOutput(
+                preparation.output,
+                supportedRange: range
+            ) else {
+                recoverFailedPlaybackBufferRenegotiation(preparation)
+                continueCalibrationAfterUnresolvedInstability(preparation)
+                return
+            }
+            updatedOutput = result
+        } catch {
+            recoverFailedPlaybackBufferRenegotiation(preparation)
+            continueCalibrationAfterUnresolvedInstability(preparation)
+            return
+        }
+
+        let completedRenegotiation = control.withLock { state -> PlaybackBufferRenegotiation? in
+            guard state.outputRebuildGeneration == preparation.outputRebuildGeneration,
+                  state.runtime === preparation.runtime,
+                  state.activeOutput == preparation.output else {
+                return nil
+            }
+
+            let previousTargetFrames = preparation.runtime.playbackTargetFrames()
+            let targetFrames = preferredPlaybackTargetFrames(
+                for: updatedOutput,
+                tapSampleRate: preparation.runtime.sampleRate,
+                captureCallbackFrames: preparation.runtime.maximumKnownCaptureCallbackFrames(),
+                allowsDownwardProbe: false
+            )
+            preparation.runtime.retargetPlayback(
+                primeFrames: targetFrames
+            )
+            preparation.runtime.recordPlaybackBufferRenegotiation()
+            preparation.runtime.reprimePlayback()
+
+            state.activeOutput = updatedOutput
+            state.state = .running(output: updatedOutput)
+            state.status = .running(output: updatedOutput)
+            state.handledPlaybackInstabilityGeneration = preparation.runtime.playbackInstabilitySnapshot().generation
+            state.attemptedPlaybackTargetDownProbes.insert(
+                PlaybackBufferOperatingPointKey(
+                    output: updatedOutput,
+                    tapSampleRate: preparation.runtime.sampleRate
+                )
+            )
+            state.playbackBufferCalibrationProbe = PlaybackBufferCalibrationProbe(
+                outputUID: updatedOutput.uid,
+                sampleRate: updatedOutput.nominalSampleRate,
+                tapSampleRate: preparation.runtime.sampleRate,
+                frameSize: updatedOutput.bufferFrameSize,
+                targetFrames: targetFrames,
+                startedAt: ContinuousClock().now
+            )
+            return PlaybackBufferRenegotiation(
+                outputName: updatedOutput.name,
+                outputUID: updatedOutput.uid,
+                sampleRate: updatedOutput.nominalSampleRate,
+                previousFrameSize: preparation.output.bufferFrameSize,
+                frameSize: updatedOutput.bufferFrameSize,
+                previousPlaybackTargetFrames: previousTargetFrames,
+                playbackTargetFrames: targetFrames,
+                reason: preparation.reason
+            )
+        }
+        guard let completedRenegotiation else {
+            return
+        }
+        try? PersistedPlaybackBufferCalibrationStore.recordInstability(
+            outputUID: completedRenegotiation.outputUID,
+            sampleRate: completedRenegotiation.sampleRate,
+            tapSampleRate: preparation.runtime.sampleRate,
+            previousFrameSize: completedRenegotiation.previousFrameSize,
+            resultingFrameSize: completedRenegotiation.frameSize,
+            previousTargetFrames: completedRenegotiation.previousPlaybackTargetFrames,
+            resultingTargetFrames: completedRenegotiation.playbackTargetFrames,
+            reason: completedRenegotiation.reason,
+            at: playbackBufferCalibrationStoreURL
+        )
+        let handler = playbackBufferRenegotiationHandler.withLock { $0 }
+        handler?(completedRenegotiation)
+    }
+
+    private func increasePlaybackTargetIfPossible(
+        _ preparation: PlaybackBufferRenegotiationPreparation
+    ) -> Bool {
+        let adjustment = control.withLock { state -> PlaybackBufferTargetAdjustment? in
+            guard state.outputRebuildGeneration == preparation.outputRebuildGeneration,
+                  state.runtime === preparation.runtime,
+                  state.activeOutput == preparation.output else {
+                return nil
+            }
+            let previousTargetFrames = preparation.runtime.playbackTargetFrames()
+            guard let targetFrames = AdaptivePlaybackBufferPolicy.nextTargetFrames(
+                for: preparation.reason,
+                callbackFrames: Self.playbackInputCallbackFrames(
+                    for: preparation.output,
+                    tapSampleRate: preparation.runtime.sampleRate
+                ),
+                after: previousTargetFrames,
+                maximumReservoirFrames: Self.maximumPlaybackReservoirFrames(
+                    for: preparation.output,
+                    tapSampleRate: preparation.runtime.sampleRate,
+                    maximumKnownCaptureCallbackFrames: preparation.runtime
+                        .maximumKnownCaptureCallbackFrames()
+                )
+            ) else {
+                return nil
+            }
+
+            preparation.runtime.retargetPlayback(
+                primeFrames: targetFrames
+            )
+            preparation.runtime.recordPlaybackBufferRenegotiation()
+            preparation.runtime.reprimePlayback()
+            state.handledPlaybackInstabilityGeneration = preparation.runtime.playbackInstabilitySnapshot().generation
+            state.playbackBufferCalibrationProbe = PlaybackBufferCalibrationProbe(
+                outputUID: preparation.output.uid,
+                sampleRate: preparation.output.nominalSampleRate,
+                tapSampleRate: preparation.runtime.sampleRate,
+                frameSize: preparation.output.bufferFrameSize,
+                targetFrames: targetFrames,
+                startedAt: ContinuousClock().now
+            )
+            return PlaybackBufferTargetAdjustment(
+                output: preparation.output,
+                tapSampleRate: preparation.runtime.sampleRate,
+                previousTargetFrames: previousTargetFrames,
+                targetFrames: targetFrames,
+                reason: preparation.reason
+            )
+        }
+        guard let adjustment else {
+            return false
+        }
+
+        try? PersistedPlaybackBufferCalibrationStore.recordInstability(
+            outputUID: adjustment.output.uid,
+            sampleRate: adjustment.output.nominalSampleRate,
+            tapSampleRate: adjustment.tapSampleRate,
+            previousFrameSize: adjustment.output.bufferFrameSize,
+            resultingFrameSize: adjustment.output.bufferFrameSize,
+            previousTargetFrames: adjustment.previousTargetFrames,
+            resultingTargetFrames: adjustment.targetFrames,
+            reason: adjustment.reason,
+            at: playbackBufferCalibrationStoreURL
+        )
+        return true
+    }
+
+    private func continueCalibrationAfterUnresolvedInstability(
+        _ preparation: PlaybackBufferRenegotiationPreparation
+    ) {
+        let targetFrames = preparation.runtime.playbackTargetFrames()
+        let instability = UnresolvedPlaybackBufferInstability(
+            outputUID: preparation.output.uid,
+            sampleRate: preparation.output.nominalSampleRate,
+            tapSampleRate: preparation.runtime.sampleRate,
+            frameSize: preparation.output.bufferFrameSize,
+            targetFrames: targetFrames,
+            reason: preparation.reason
+        )
+        let shouldPersist = control.withLock { state -> Bool? in
+            guard state.outputRebuildGeneration == preparation.outputRebuildGeneration,
+                  state.runtime === preparation.runtime,
+                  state.activeOutput == preparation.output else {
+                return nil
+            }
+            state.playbackBufferCalibrationProbe = PlaybackBufferCalibrationProbe(
+                outputUID: preparation.output.uid,
+                sampleRate: preparation.output.nominalSampleRate,
+                tapSampleRate: preparation.runtime.sampleRate,
+                frameSize: preparation.output.bufferFrameSize,
+                targetFrames: targetFrames,
+                startedAt: ContinuousClock().now
+            )
+            return state.playbackBufferInstabilityPersistenceGate.shouldPersist(instability)
+        }
+        guard shouldPersist == true else {
+            return
+        }
+        do {
+            try PersistedPlaybackBufferCalibrationStore.recordInstability(
+                outputUID: preparation.output.uid,
+                sampleRate: preparation.output.nominalSampleRate,
+                tapSampleRate: preparation.runtime.sampleRate,
+                previousFrameSize: preparation.output.bufferFrameSize,
+                resultingFrameSize: preparation.output.bufferFrameSize,
+                previousTargetFrames: targetFrames,
+                resultingTargetFrames: targetFrames,
+                reason: preparation.reason,
+                at: playbackBufferCalibrationStoreURL
+            )
+        } catch {
+            control.withLock { state in
+                state.playbackBufferInstabilityPersistenceGate.persistenceFailed(for: instability)
+            }
+        }
+    }
+
+    private func recoverFailedPlaybackBufferRenegotiation(
+        _ preparation: PlaybackBufferRenegotiationPreparation
+    ) {
+        control.withLock { state in
+            guard state.outputRebuildGeneration == preparation.outputRebuildGeneration,
+                  state.runtime === preparation.runtime,
+                  state.activeOutput == preparation.output else {
+                return
+            }
+            preparation.runtime.reprimePlayback()
+        }
+    }
+
+    private func recoverAdaptivePlaybackRenderFailure(
+        _ preparation: PlaybackBufferRenegotiationPreparation
+    ) {
+        let action = control.withLock { state -> AdaptivePlaybackRenderRecoveryAction? in
+            guard state.outputRebuildGeneration == preparation.outputRebuildGeneration,
+                  state.runtime === preparation.runtime,
+                  state.activeOutput == preparation.output,
+                  preparation.runtime.hasActiveAdaptivePlaybackRenderFailure(),
+                  let profile = state.activeProfile else {
+                return nil
+            }
+            if AdaptivePlaybackRenderRecoveryPolicy.shouldRestart(
+                afterCompletedAttempts: state.adaptivePlaybackRenderRecoveryAttempts
+            ) {
+                state.adaptivePlaybackRenderRecoveryAttempts += 1
+                state.adaptivePlaybackRenderRecoveryHealthGeneration = preparation.runtime
+                    .playbackRenderHealthGeneration()
+                return .restart(
+                    output: preparation.output,
+                    profile: profile,
+                    expectation: OutputRebuildExpectation(
+                        generation: state.outputRebuildGeneration,
+                        runtime: preparation.runtime,
+                        profileRevision: state.profileRevision
+                    )
+                )
+            }
+
+            let failure = AudioEngineFailure(
+                category: .coreAudioOperationFailed,
+                userMessage: "Adaptive playback rendering repeatedly failed, so GlassEQ stopped processing audio.",
+                operation: "AdaptivePlaybackRender"
+            )
+            stopLocked(&state)
+            state.state = .failed(failure.description)
+            state.status = .failed(failure)
+            return .fail(failure)
+        }
+        guard let action else {
+            return
+        }
+
+        switch action {
+        case .restart(let output, let profile, let expectation):
+            do {
+                try start(
+                    output: output,
+                    profile: profile,
+                    expectation: expectation
+                )
+            } catch {
+                let failure = control.withLock { state in
+                    if case .failed(let failure) = state.status {
+                        return failure
+                    }
+                    return audioEngineFailure(from: error)
+                }
+                runtimeFailureHandler.withLock { $0 }?(failure)
+            }
+        case .fail(let failure):
+            updatePlaybackBufferAdaptationTimer()
+            runtimeFailureHandler.withLock { $0 }?(failure)
+        }
+    }
+
+    static func renegotiatedPlaybackOutput(
+        _ output: AudioOutputDevice,
+        supportedRange: AudioBufferFrameSizeRange,
+        setBufferFrameSize: (UInt32, AudioObjectID) throws -> Void = CoreAudioDeviceQuery.setBufferFrameSize(_:objectID:),
+        queryOutput: (AudioObjectID) throws -> AudioOutputDevice = CoreAudioDeviceQuery.outputDevice(id:),
+        waitForPropertySettlement: () -> Void = { Thread.sleep(forTimeInterval: 0.01) }
+    ) throws -> AudioOutputDevice? {
+        guard let requestedFrameSize = AdaptivePlaybackBufferPolicy.nextFrameSize(
+            after: output.bufferFrameSize,
+            supportedRange: supportedRange
+        ) else {
+            return nil
+        }
+
+        try setBufferFrameSize(requestedFrameSize, output.id)
+        for attempt in 0..<3 {
+            let updatedOutput = try queryOutput(output.id)
+            if updatedOutput.id == output.id,
+               updatedOutput.bufferFrameSize > output.bufferFrameSize {
+                return updatedOutput
+            }
+            if attempt < 2 {
+                waitForPropertySettlement()
+            }
+        }
+        return nil
     }
 
     static func preferredBufferFrameSize(for output: AudioOutputDevice) -> UInt32 {
@@ -1686,12 +3084,150 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         return Self.preferredBufferFrameSize
     }
 
-    private static func isLowSampleRateRoute(_ output: AudioOutputDevice) -> Bool {
-        output.nominalSampleRate > 0 && output.nominalSampleRate <= Self.lowSampleRateThreshold
+    static func preferredPlaybackPrimeFrames(
+        for output: AudioOutputDevice,
+        tapSampleRate: Double? = nil,
+        captureCallbackFrames: Int = preferredLowSampleRatePlaybackReservoirFrames
+    ) -> Int {
+        let outputCallbackFrames = max(Int(output.bufferFrameSize), 1)
+        if hasLowSampleRateEndpoint(
+            tapSampleRate: tapSampleRate ?? output.nominalSampleRate,
+            output: output
+        ) {
+            let sampleRatePlan = PlaybackSampleRatePlan(
+                inputSampleRate: tapSampleRate ?? output.nominalSampleRate,
+                outputSampleRate: output.nominalSampleRate
+            )
+            let reservoirFrames = min(
+                max(captureCallbackFrames, Self.preferredLowSampleRatePlaybackReservoirFrames),
+                Self.maximumSupportedCallbackFrames
+            )
+            return max(
+                sampleRatePlan.inputFrames(forOutputFrames: Int(Self.preferredLowSampleRateBufferFrameSize)),
+                sampleRatePlan.inputFrames(forOutputFrames: outputCallbackFrames)
+                    + reservoirFrames
+            )
+        }
+        if output.isBluetoothTransport {
+            return max(
+                Self.preferredBluetoothPlaybackTargetFrames,
+                outputCallbackFrames + Self.preferredBluetoothPlaybackReservoirFrames
+            )
+        }
+        return max(
+            Self.preferredPlaybackPrimeFrames,
+            outputCallbackFrames + Int(Self.preferredCaptureBufferFrameSize)
+        )
     }
 
-    private func clampedBufferFrameSize(_ frameSize: UInt32, range: AudioBufferFrameSizeRange) -> UInt32 {
-        min(max(frameSize, range.minimum), range.maximum)
+    static func shouldAdaptPlaybackBuffer(for output: AudioOutputDevice) -> Bool {
+        output.nominalSampleRate > 0
+    }
+
+    static func playbackInputCallbackFrames(
+        for output: AudioOutputDevice,
+        tapSampleRate: Double
+    ) -> UInt32 {
+        UInt32(clamping: PlaybackSampleRatePlan(
+            inputSampleRate: tapSampleRate,
+            outputSampleRate: output.nominalSampleRate
+        ).inputFrames(forOutputFrames: Int(output.bufferFrameSize)))
+    }
+
+    static func startupCaptureCallbackFrames(reportedFrames: UInt32?) -> Int {
+        guard let reportedFrames,
+              reportedFrames > 0,
+              reportedFrames <= UInt32(maximumSupportedCallbackFrames) else {
+            return maximumSupportedCallbackFrames
+        }
+        return Int(reportedFrames)
+    }
+
+    static func shouldUseSampleRateConversion(
+        tapSampleRate: Double,
+        output: AudioOutputDevice
+    ) -> Bool {
+        abs(tapSampleRate - output.nominalSampleRate) >= 1
+            && hasLowSampleRateEndpoint(tapSampleRate: tapSampleRate, output: output)
+    }
+
+    static func shouldRecordSampleRateRestoration(
+        tapSampleRate: Double,
+        output: AudioOutputDevice
+    ) -> Bool {
+        tapSampleRate > 0
+            && abs(output.nominalSampleRate - tapSampleRate) >= 1
+            && !shouldUseSampleRateConversion(tapSampleRate: tapSampleRate, output: output)
+    }
+
+    static func effectiveOutputRebuildProfile(
+        preparedProfile: EQProfile,
+        preparedProfileRevision: UInt64,
+        activeProfile: EQProfile?,
+        activeProfileRevision: UInt64
+    ) -> EQProfile {
+        guard activeProfileRevision != preparedProfileRevision,
+              let activeProfile else {
+            return preparedProfile
+        }
+        return activeProfile
+    }
+
+    static func requestedOutputRebuildProfile(
+        requestedProfile: EQProfile,
+        expectedProfileRevision: UInt64?,
+        activeProfile: EQProfile?,
+        activeProfileRevision: UInt64
+    ) -> EQProfile? {
+        guard let expectedProfileRevision,
+              activeProfileRevision != expectedProfileRevision else {
+            return requestedProfile
+        }
+        return activeProfile
+    }
+
+    static func profileUpdateOutput(_ output: AudioOutputDevice?) throws -> AudioOutputDevice {
+        guard let output else {
+            throw AudioEngineProfileUpdateUnavailable()
+        }
+        return output
+    }
+
+    static func shouldRefreshCaptureForOutput(
+        tapSampleRate: Double,
+        output: AudioOutputDevice
+    ) -> Bool {
+        isLowSampleRate(tapSampleRate)
+            && output.nominalSampleRate - tapSampleRate >= 1
+    }
+
+    static func maximumPlaybackReservoirFrames(
+        for output: AudioOutputDevice,
+        tapSampleRate: Double,
+        maximumKnownCaptureCallbackFrames: Int
+    ) -> Int {
+        guard hasLowSampleRateEndpoint(tapSampleRate: tapSampleRate, output: output) else {
+            return AdaptivePlaybackBufferPolicy.maximumReservoirFrames
+        }
+        return max(
+            Self.preferredLowSampleRatePlaybackReservoirFrames,
+            maximumKnownCaptureCallbackFrames
+        )
+    }
+
+    private static func isLowSampleRateRoute(_ output: AudioOutputDevice) -> Bool {
+        isLowSampleRate(output.nominalSampleRate)
+    }
+
+    private static func isLowSampleRate(_ sampleRate: Double) -> Bool {
+        sampleRate > 0 && sampleRate <= Self.lowSampleRateThreshold
+    }
+
+    private static func hasLowSampleRateEndpoint(
+        tapSampleRate: Double,
+        output: AudioOutputDevice
+    ) -> Bool {
+        isLowSampleRate(tapSampleRate) || isLowSampleRateRoute(output)
     }
 
     private func createTopologyRebuildMuteGuard() throws -> any TopologyRebuildMuteGuarding {
@@ -1818,8 +3354,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         var ioProcID: AudioDeviceIOProcID?
 
         try checkOSStatus(
-            AudioDeviceCreateIOProcIDWithBlock(&ioProcID, deviceID, nil) { _, _, _, outputData, _ in
-                runtime.playback(outputData: outputData)
+            AudioDeviceCreateIOProcIDWithBlock(&ioProcID, deviceID, nil) { _, _, _, outputData, outputTime in
+                let outputTimestamp = outputTime.pointee
+                let sampleTime: Double? = if outputTimestamp.mFlags.contains(.sampleTimeValid) {
+                    outputTimestamp.mSampleTime
+                } else {
+                    nil
+                }
+                runtime.playback(outputData: outputData, outputSampleTime: sampleTime)
             },
             operation: "AudioDeviceCreateIOProcIDWithBlock(output)"
         )

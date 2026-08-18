@@ -129,7 +129,7 @@ private func runDiagnostics(options: DiagnosticsOptions) -> Int32 {
         Thread.sleep(forTimeInterval: options.holdAfterStart)
         let metrics = engine.snapshotMetrics()
         engine.stop()
-        printMetrics(metrics, sampleRate: output.nominalSampleRate)
+        printMetrics(metrics, fallbackSampleRate: output.nominalSampleRate)
         printAudioEngineStatus(.stopped)
         print("Engine stopped cleanly.")
 
@@ -242,7 +242,11 @@ private func printAudioEngineFailure(_ failure: AudioEngineFailure) {
     }
 }
 
-private func printMetrics(_ metrics: AudioEngineMetrics, sampleRate: Double) {
+private func printMetrics(_ metrics: AudioEngineMetrics, fallbackSampleRate: Double) {
+    let playbackBufferSampleRate = metrics.playbackBufferSampleRate > 0
+        ? metrics.playbackBufferSampleRate
+        : fallbackSampleRate
+    let playbackBufferMillisecondsPerFrame = 1_000 / playbackBufferSampleRate
     print("Captured frames: \(metrics.capturedFrames)")
     print("Played frames: \(metrics.playedFrames)")
     print("Playback underrun frames: \(metrics.playbackUnderrunFrames)")
@@ -255,12 +259,23 @@ private func printMetrics(_ metrics: AudioEngineMetrics, sampleRate: Double) {
     print("Max playback buffered frames: \(metrics.maximumPlaybackBufferedFrames)")
     print("Max capture callback frames: \(metrics.maximumCaptureCallbackFrames)")
     print("Max playback callback frames: \(metrics.maximumPlaybackCallbackFrames)")
-    print(String(format: "Max playback buffered latency: %.2f ms", Double(metrics.maximumPlaybackBufferedFrames) / sampleRate * 1_000))
+    print("Output timestamp discontinuities: \(metrics.playbackTimestampDiscontinuities)")
+    print("Playback buffer renegotiations: \(metrics.playbackBufferRenegotiations)")
+    print("Adaptive playback render failures: \(metrics.adaptivePlaybackRenderFailures)")
+    print("Sample-rate conversion active: \(metrics.playbackSampleRateConversionActive)")
+    print(String(format: "Playback rate correction: %+.2f ppm", metrics.playbackRateCorrectionPPM))
+    print("Playback rate correction saturated: \(metrics.playbackRateCorrectionSaturated)")
+    print("Playback occupancy target: \(metrics.playbackOccupancyTargetFrames) frames")
+    print(String(format: "Filtered playback occupancy: %.2f frames", metrics.filteredPlaybackOccupancyFrames))
+    print(String(
+        format: "Max playback buffered latency: %.2f ms",
+        Double(metrics.maximumPlaybackBufferedFrames) * playbackBufferMillisecondsPerFrame
+    ))
     print("Playback latency observations: \(metrics.playbackBufferObservations)")
     print(String(format: "GlassEQ added latency: min %.2f ms, avg %.2f ms, max %.2f ms",
-                 Double(metrics.minimumPlaybackBufferedFrames) / sampleRate * 1_000,
-                 metrics.averagePlaybackBufferedFrames / sampleRate * 1_000,
-                 Double(metrics.maximumPlaybackBufferedFrames) / sampleRate * 1_000))
+                 Double(metrics.minimumPlaybackBufferedFrames) * playbackBufferMillisecondsPerFrame,
+                 metrics.averagePlaybackBufferedFrames * playbackBufferMillisecondsPerFrame,
+                 Double(metrics.maximumPlaybackBufferedFrames) * playbackBufferMillisecondsPerFrame))
 }
 
 private struct DSPBenchmarkCase {
