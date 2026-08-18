@@ -405,6 +405,9 @@ final class SettingsCoordinator: NSObject {
                 sendResponse(response, requestID: requestID)
             } catch {
                 suppressedModelChangeDepth = max(suppressedModelChangeDepth - 1, 0)
+                if suppressedModelChangeDepth == 0, let model {
+                    sendSnapshotUpdate(model.settingsSnapshot())
+                }
                 sendError(error.localizedDescription, requestID: requestID)
             }
         }

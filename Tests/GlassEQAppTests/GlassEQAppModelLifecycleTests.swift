@@ -1483,6 +1483,94 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func playbackBufferCalibrationFailurePublishesReconciledHelperSnapshot() async throws {
+        let output = makeOutput(uid: "failed-helper-reset", name: "Failed Helper Reset")
+        let engine = FakeAudioEngine()
+        let model = makeModel(engine: engine, lookup: FakeDefaultOutputLookup(.success(output)))
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+        model.settingsCoordinator = coordinator
+
+        model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        engine.playbackBufferCalibrationResetError = TestAudioError.calibrationResetFailed
+        engine.playbackBufferCalibrationResetFailureState = .failed("Calibration rebuild failed")
+
+        #expect(coordinator.openSettings() == .helper)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first { message in
+            if case .bootstrap = message {
+                return true
+            }
+            return false
+        })
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "connect",
+            kind: .connect,
+            command: nil
+        ))
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .response(_, "connect", _, _) = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let commandMessageStart = launcher.receivedAppMessages.count
+
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "reset",
+            kind: .command,
+            command: .resetPlaybackBufferCalibration
+        ))
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .response(_, "reset", _, _) = message {
+                    return true
+                }
+                return false
+            }
+        }
+
+        let commandMessages = Array(launcher.receivedAppMessages.dropFirst(commandMessageStart))
+        let patchIndex = try #require(commandMessages.firstIndex { message in
+            guard case .event(_, .snapshotPatched(let patch)) = message else {
+                return false
+            }
+            return patch.isRunning == false && patch.statusMessage == "Calibration rebuild failed"
+        })
+        let errorIndex = try #require(commandMessages.firstIndex { message in
+            guard case .response(_, "reset", nil, let error) = message else {
+                return false
+            }
+            return error != nil
+        })
+        #expect(patchIndex < errorIndex)
+    }
+
+    @Test
     func playbackBufferCalibrationFailurePreservesRunningEngineState() async {
         let output = makeOutput(uid: "running-reset", name: "Running Reset")
         let engine = FakeAudioEngine()
@@ -2092,21 +2180,46 @@ private struct PermissionDeniedSettingsHelperLauncher: SettingsHelperLaunching {
     }
 }
 
-private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching {
+private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching, @unchecked Sendable {
     private let input = Pipe()
     private let output = Pipe()
     private let error = Pipe()
+    private let messagesLock = NSLock()
+    private var messages: [SettingsPipeMessage] = []
+    private var appReadPump: SettingsPipeReadPump?
+
+    var receivedAppMessages: [SettingsPipeMessage] {
+        messagesLock.withLock { messages }
+    }
 
     func launch(
         executableURL: URL,
         arguments: [String],
         terminationHandler: @escaping @Sendable (Process) -> Void
     ) throws -> SettingsHelperLaunch {
-        SettingsHelperLaunch(process: Process(), input: input, output: output, error: error)
+        let pump = SettingsPipeReadPump(
+            label: "com.glasseq.tests.settings-helper-input",
+            onMessages: { [weak self] result in
+                guard let self, case .success(let messages) = result else {
+                    return
+                }
+                messagesLock.withLock {
+                    self.messages.append(contentsOf: messages)
+                }
+            },
+            onEndOfFile: {}
+        )
+        appReadPump = pump
+        pump.install(on: input.fileHandleForReading)
+        return SettingsHelperLaunch(process: Process(), input: input, output: output, error: error)
     }
 
     func writeHelperOutput(_ data: Data) throws {
         try output.fileHandleForWriting.write(contentsOf: data)
+    }
+
+    func writeHelperMessage(_ message: SettingsPipeMessage) throws {
+        try writeHelperOutput(SettingsPipeCodec.encodeLine(message))
     }
 }
 
