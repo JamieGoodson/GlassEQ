@@ -229,6 +229,98 @@ struct RealtimeAudioRingBufferTests {
     }
 
     @Test
+    func uncontendedGateUseReportsNoContentionFailures() {
+        let ring = RealtimeAudioRingBuffer(channelCount: 2, capacityFrames: 4)
+        let input: [Float] = [1, 10, 2, 20, 3, 30, 4, 40, 5, 50]
+        var output = [Float](repeating: 0, count: 8)
+
+        _ = input.withUnsafeBufferPointer {
+            ring.writeInterleaved($0, frameCount: 5, sourceChannelCount: 2)
+        }
+        _ = output.withUnsafeMutableBufferPointer {
+            ring.readInterleaved(into: $0, frameCount: 4, destinationChannelCount: 2)
+        }
+        #expect(ring.reset())
+        #expect(ring.trimToLatestFrames(0))
+
+        #expect(ring.overwriteGateContentionFailureCount() == 0)
+    }
+
+    @Test
+    func sustainedOverflowContentionRarelyLosesTheOverwriteGate() {
+        // Capacity is deliberately smaller than one producer block, so every single write has to
+        // take the gate to drop the oldest frames. That is the maximum-contention case, and the
+        // case where losing the gate would cost a whole realtime callback.
+        let ring = RealtimeAudioRingBuffer(channelCount: 2, capacityFrames: 32)
+        let producerBlockFrames = 16
+        let consumerBlockFrames = 8
+        let totalFrames = 200_000
+        let producerDone = Atomic<Bool>(false)
+        let sawTornFrame = Atomic<Bool>(false)
+        let sawRewoundFrame = Atomic<Bool>(false)
+        let group = DispatchGroup()
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            var block = [Float](repeating: 0, count: producerBlockFrames * 2)
+            var nextValue = 1
+            while nextValue <= totalFrames {
+                for frame in 0..<producerBlockFrames {
+                    // Both channels carry the frame's own value, so a frame stitched together out
+                    // of two different writes is detectable on the consumer side.
+                    block[frame * 2] = Float(nextValue + frame)
+                    block[frame * 2 + 1] = Float(nextValue + frame)
+                }
+                _ = block.withUnsafeBufferPointer {
+                    ring.writeInterleaved($0, frameCount: producerBlockFrames, sourceChannelCount: 2)
+                }
+                nextValue += producerBlockFrames
+            }
+            producerDone.store(true, ordering: .releasing)
+            group.leave()
+        }
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            var block = [Float](repeating: 0, count: consumerBlockFrames * 2)
+            var lastValue: Float = 0
+            while !producerDone.load(ordering: .acquiring) || ring.occupancyFrames() > 0 {
+                let readFrames = block.withUnsafeMutableBufferPointer {
+                    ring.readInterleaved(
+                        into: $0,
+                        frameCount: consumerBlockFrames,
+                        destinationChannelCount: 2
+                    )
+                }
+                for frame in 0..<readFrames {
+                    let left = block[frame * 2]
+                    if left != block[frame * 2 + 1] {
+                        sawTornFrame.store(true, ordering: .releasing)
+                    }
+                    // The producer may skip frames past us, but a value must never repeat or go
+                    // backwards — that would mean `readFrame` was clobbered by the other thread.
+                    if left <= lastValue {
+                        sawRewoundFrame.store(true, ordering: .releasing)
+                    }
+                    lastValue = left
+                }
+            }
+            group.leave()
+        }
+
+        #expect(group.wait(timeout: .now() + 30) == .success)
+        let tornFrame = sawTornFrame.load(ordering: .acquiring)
+        let rewoundFrame = sawRewoundFrame.load(ordering: .acquiring)
+        #expect(!tornFrame)
+        #expect(!rewoundFrame)
+        // The spin makes losing the gate rare, not impossible: these are ordinary QoS threads, so
+        // one can still be descheduled while holding it. Measured on this test: 0 with the spin,
+        // 630-1323 with the budget cut to a single attempt. The bound separates those two regimes.
+        let failures = ring.overwriteGateContentionFailureCount()
+        #expect(failures * 1_000 < UInt64(totalFrames), "gate contention failures: \(failures)")
+    }
+
+    @Test
     func concurrentProducerConsumerKeepsReadFramesMonotonic() {
         let ring = RealtimeAudioRingBuffer(channelCount: 1, capacityFrames: 64)
         let producerDone = Atomic<Bool>(false)
