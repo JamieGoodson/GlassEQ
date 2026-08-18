@@ -189,6 +189,13 @@ struct AdaptivePlaybackRenderRecoveryPolicy {
     static func shouldRestart(afterCompletedAttempts attempts: Int) -> Bool {
         attempts < maximumRestartAttempts
     }
+
+    static func effectiveInstabilityReason(
+        latest: PlaybackBufferInstabilityReason,
+        renderFailureActive: Bool
+    ) -> PlaybackBufferInstabilityReason {
+        renderFailureActive ? .adaptiveRenderFailure : latest
+    }
 }
 
 enum PlaybackBufferCalibrationPolicy {

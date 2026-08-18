@@ -505,9 +505,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
         func playbackInstabilitySnapshot() -> (generation: UInt64, reason: PlaybackBufferInstabilityReason) {
             let generation = playbackInstabilityGeneration.load(ordering: .acquiring)
-            let reason = PlaybackBufferInstabilityReason(
+            let latestReason = PlaybackBufferInstabilityReason(
                 rawValue: latestPlaybackInstabilityReason.load(ordering: .relaxed)
             ) ?? .underrun
+            let reason = AdaptivePlaybackRenderRecoveryPolicy.effectiveInstabilityReason(
+                latest: latestReason,
+                renderFailureActive: adaptivePlaybackRenderFailureActive.load(ordering: .acquiring)
+            )
             return (generation, reason)
         }
 

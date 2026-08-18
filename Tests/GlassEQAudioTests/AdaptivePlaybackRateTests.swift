@@ -708,6 +708,18 @@ struct AdaptivePlaybackRateTests {
     }
 
     @Test
+    func activeAdaptiveRenderFailureTakesPriorityOverLaterInstability() {
+        #expect(AdaptivePlaybackRenderRecoveryPolicy.effectiveInstabilityReason(
+            latest: .outputTimestampDiscontinuity,
+            renderFailureActive: true
+        ) == .adaptiveRenderFailure)
+        #expect(AdaptivePlaybackRenderRecoveryPolicy.effectiveInstabilityReason(
+            latest: .outputTimestampDiscontinuity,
+            renderFailureActive: false
+        ) == .outputTimestampDiscontinuity)
+    }
+
+    @Test
     func playbackBufferCalibrationKeepsServoTargetsPerCallbackSize() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("GlassEQPlaybackBufferCalibration-\(UUID().uuidString)", isDirectory: true)
