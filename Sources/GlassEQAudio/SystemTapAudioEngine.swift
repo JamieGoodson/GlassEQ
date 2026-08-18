@@ -1884,6 +1884,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             for: matchedOutput,
             allowsDownwardProbe: allowsFrameSizeDownwardProbe
         )
+        try Self.validatePlaybackCallbackCapacity(for: tunedOutput)
         state.activeOutput = tunedOutput
         let operatingPointKey = PlaybackBufferOperatingPointKey(output: tunedOutput)
         let allowsDownwardProbe = state.attemptedPlaybackTargetDownProbes.insert(
@@ -2120,18 +2121,20 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             return classifyCoreAudioError(coreAudioError)
         }
         if let availabilityError = error as? AudioDeviceAvailabilityError {
-            if case .unsupportedOutputChannelCount = availabilityError {
+            switch availabilityError {
+            case .unsupportedOutputChannelCount, .unsupportedOutputBufferFrameSize:
                 return AudioEngineFailure(
                     category: .deviceFormatUnsupported,
                     userMessage: availabilityError.description,
                     operation: "CoreAudioDeviceQuery"
                 )
+            default:
+                return AudioEngineFailure(
+                    category: .outputDeviceUnavailable,
+                    userMessage: availabilityError.description,
+                    operation: "CoreAudioDeviceQuery"
+                )
             }
-            return AudioEngineFailure(
-                category: .outputDeviceUnavailable,
-                userMessage: availabilityError.description,
-                operation: "CoreAudioDeviceQuery"
-            )
         }
         return AudioEngineFailure(
             category: .coreAudioOperationFailed,
@@ -2150,6 +2153,16 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             throw AudioDeviceAvailabilityError.unsupportedOutputChannelCount(output.id, output.outputChannelCount)
         }
         return output.outputChannelCount
+    }
+
+    static func validatePlaybackCallbackCapacity(for output: AudioOutputDevice) throws {
+        guard output.bufferFrameSize <= UInt32(maximumSupportedCallbackFrames) else {
+            throw AudioDeviceAvailabilityError.unsupportedOutputBufferFrameSize(
+                output.id,
+                output.bufferFrameSize,
+                maximum: UInt32(maximumSupportedCallbackFrames)
+            )
+        }
     }
 
     /// Normalizes a device-reported preferred stereo pair (1-based channel numbers; the HAL

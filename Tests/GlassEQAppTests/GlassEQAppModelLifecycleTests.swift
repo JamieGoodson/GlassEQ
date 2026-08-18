@@ -88,19 +88,81 @@ struct GlassEQAppModelLifecycleTests {
         await waitUntil {
             model.lifecycleState == .running
         }
-        let failure = AudioEngineFailure(
-            category: .coreAudioOperationFailed,
-            userMessage: "Adaptive playback rendering repeatedly failed.",
-            operation: "AdaptivePlaybackRender"
-        )
-
-        engine.emitRuntimeFailure(failure)
+        engine.emitRuntimeFailure(adaptiveRenderFailure)
         await waitUntil {
             model.lifecycleState == .stopped
         }
 
         #expect(!model.isRunning)
-        #expect(model.statusMessage == localized("Audio engine failed: \(failure.userMessage)"))
+        #expect(model.statusMessage == localized("Audio engine failed: \(adaptiveRenderFailure.userMessage)"))
+    }
+
+    @Test
+    func runtimeFailureDoesNotCancelNewerPendingRouteStart() async {
+        let firstOutput = makeOutput(uid: "runtime-first", name: "Runtime First", id: 200)
+        let secondOutput = makeOutput(uid: "runtime-second", name: "Runtime Second", id: 300)
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(engine: engine, lookup: lookup, observers: observers, outputDelay: .zero)
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        engine.blockStart(for: secondOutput.uid)
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil {
+            engine.startCalls.contains { $0.output == secondOutput }
+        }
+        #expect(engine.waitUntilStartIsBlocked(for: secondOutput.uid, timeout: .now() + 1))
+
+        engine.emitRuntimeFailure(adaptiveRenderFailure)
+        await settleAsyncWork()
+        #expect(model.lifecycleState == .running)
+
+        engine.unblockStart(for: secondOutput.uid)
+        await waitUntil {
+            model.lifecycleState == .running
+                && model.currentOutputUID == secondOutput.uid
+                && engine.state == .running(output: secondOutput)
+        }
+    }
+
+    @Test
+    func staleRuntimeFailureDoesNotStopCompletedNewerRoute() async {
+        let firstOutput = makeOutput(uid: "stale-runtime-first", name: "Stale Runtime First", id: 200)
+        let secondOutput = makeOutput(uid: "stale-runtime-second", name: "Stale Runtime Second", id: 300)
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(engine: engine, lookup: lookup, observers: observers, outputDelay: .zero)
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil {
+            model.lifecycleState == .running
+                && model.currentOutputUID == secondOutput.uid
+                && engine.state == .running(output: secondOutput)
+        }
+
+        engine.emitRuntimeFailure(adaptiveRenderFailure, markEngineFailed: false)
+        await settleAsyncWork()
+
+        #expect(model.lifecycleState == .running)
+        #expect(model.isRunning)
+        #expect(model.currentOutputUID == secondOutput.uid)
+        #expect(engine.state == .running(output: secondOutput))
     }
 
     @Test
@@ -1581,6 +1643,48 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func malformedSettingsIPCBeforeConnectingRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        try launcher.writeHelperOutput(Data("not-json\n".utf8))
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("IPC failed before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
+    func settingsBootstrapWriteFailureRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: ClosedInputSettingsHelperLauncher(),
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("IPC failed before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
     func activeInProcessSettingsFallbackIsReusedWithoutLaunchingHelper() {
         let model = makeModel()
 
@@ -1916,6 +2020,12 @@ private enum TestAudioError: Error, Equatable {
     case calibrationResetFailed
 }
 
+private let adaptiveRenderFailure = AudioEngineFailure(
+    category: .coreAudioOperationFailed,
+    userMessage: "Adaptive playback rendering repeatedly failed.",
+    operation: "AdaptivePlaybackRender"
+)
+
 @MainActor
 private final class FakeWorkspaceOpener: WorkspaceOpening {
     private var results: [Bool]
@@ -1977,6 +2087,36 @@ private struct PermissionDeniedSettingsHelperLauncher: SettingsHelperLaunching {
         terminationHandler: @escaping @Sendable (Process) -> Void
     ) throws -> SettingsHelperLaunch {
         throw POSIXError(.EPERM)
+    }
+}
+
+private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching {
+    private let input = Pipe()
+    private let output = Pipe()
+    private let error = Pipe()
+
+    func launch(
+        executableURL: URL,
+        arguments: [String],
+        terminationHandler: @escaping @Sendable (Process) -> Void
+    ) throws -> SettingsHelperLaunch {
+        SettingsHelperLaunch(process: Process(), input: input, output: output, error: error)
+    }
+
+    func writeHelperOutput(_ data: Data) throws {
+        try output.fileHandleForWriting.write(contentsOf: data)
+    }
+}
+
+private struct ClosedInputSettingsHelperLauncher: SettingsHelperLaunching {
+    func launch(
+        executableURL: URL,
+        arguments: [String],
+        terminationHandler: @escaping @Sendable (Process) -> Void
+    ) throws -> SettingsHelperLaunch {
+        let input = Pipe()
+        try input.fileHandleForReading.close()
+        return SettingsHelperLaunch(process: Process(), input: input, output: Pipe(), error: Pipe())
     }
 }
 
@@ -2339,8 +2479,14 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         blocker?.unblock()
     }
 
-    func emitRuntimeFailure(_ failure: AudioEngineFailure) {
-        withLock { _runtimeFailureHandler }?(failure)
+    func emitRuntimeFailure(_ failure: AudioEngineFailure, markEngineFailed: Bool = true) {
+        let handler = withLock {
+            if markEngineFailed {
+                _state = .failed(failure.description)
+            }
+            return _runtimeFailureHandler
+        }
+        handler?(failure)
     }
 
     func start(output: AudioOutputDevice, profile: EQProfile) throws {

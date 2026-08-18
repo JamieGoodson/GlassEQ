@@ -74,6 +74,24 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
+    func playbackCallbackCapacityRejectsFramesAboveFixedRenderStorage() throws {
+        try SystemTapAudioEngine.validatePlaybackCallbackCapacity(
+            for: output(channelCount: 2, bufferFrameSize: 8_192)
+        )
+
+        do {
+            try SystemTapAudioEngine.validatePlaybackCallbackCapacity(
+                for: output(channelCount: 2, bufferFrameSize: 8_193)
+            )
+            Issue.record("Expected oversized playback callback to be rejected")
+        } catch let error as AudioDeviceAvailabilityError {
+            #expect(error == .unsupportedOutputBufferFrameSize(42, 8_193, maximum: 8_192))
+        } catch {
+            Issue.record("Expected unsupported buffer frame size error, got \(error)")
+        }
+    }
+
+    @Test
     func unsupportedRuntimeChannelCountSkipsDevicePreparation() {
         var didPrepareDevice = false
         let channelCount = CoreAudioDeviceQuery.maxChannelCount + 1

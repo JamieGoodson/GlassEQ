@@ -2057,10 +2057,12 @@ final class GlassEQAppModel {
             return audioEngineStatusMessage(classifyCoreAudioError(coreAudioError))
         }
         if let availabilityError = error as? AudioDeviceAvailabilityError {
-            if case .unsupportedOutputChannelCount = availabilityError {
+            switch availabilityError {
+            case .unsupportedOutputChannelCount, .unsupportedOutputBufferFrameSize:
                 return localized("Output format unsupported: \(availabilityError.description)")
+            default:
+                return localized("Default output unavailable: \(availabilityError.description)")
             }
-            return localized("Default output unavailable: \(availabilityError.description)")
         }
         return localized("Audio engine failed: \(error.localizedDescription)")
     }
@@ -2082,8 +2084,9 @@ final class GlassEQAppModel {
     }
 
     private func handleRuntimeAudioEngineFailure(_ failure: AudioEngineFailure) {
-        guard lifecycleState != .terminating,
-              lifecycleState != .sleeping else {
+        guard lifecycleState == .running,
+              engineStartTask == nil,
+              case .failed = engine.state else {
             return
         }
         invalidatePendingEngineStart()

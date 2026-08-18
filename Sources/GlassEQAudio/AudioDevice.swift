@@ -49,6 +49,7 @@ public enum AudioDeviceAvailabilityError: Error, Equatable, LocalizedError, Cust
     case outputDeviceNotAlive(AudioObjectID)
     case outputDeviceHasNoOutputChannels(AudioObjectID)
     case unsupportedOutputChannelCount(AudioObjectID, Int)
+    case unsupportedOutputBufferFrameSize(AudioObjectID, UInt32, maximum: UInt32)
     case invalidDeviceMetadata(AudioObjectID, String)
 
     public var description: String {
@@ -61,6 +62,8 @@ public enum AudioDeviceAvailabilityError: Error, Equatable, LocalizedError, Cust
             "Output device \(id) has no output channels"
         case .unsupportedOutputChannelCount(let id, let channelCount):
             "Output device \(id) reports channel count \(channelCount); GlassEQ supports up to \(CoreAudioDeviceQuery.maxChannelCount) output channels"
+        case .unsupportedOutputBufferFrameSize(let id, let frameSize, let maximum):
+            "Output device \(id) uses \(frameSize)-frame buffers; GlassEQ supports playback callbacks up to \(maximum) frames"
         case .invalidDeviceMetadata(let id, let message):
             "Output device \(id) reported invalid Core Audio metadata: \(message)"
         }
