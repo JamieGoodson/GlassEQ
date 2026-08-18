@@ -92,6 +92,34 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
+    func playbackConversionCapacityRejectsPrimesWithoutRingHeadroom() throws {
+        try SystemTapAudioEngine.validatePlaybackConversionCapacity(
+            for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 8_192),
+            tapSampleRate: 48_000
+        )
+        try SystemTapAudioEngine.validatePlaybackConversionCapacity(
+            for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 1_024),
+            tapSampleRate: 192_000
+        )
+
+        do {
+            try SystemTapAudioEngine.validatePlaybackConversionCapacity(
+                for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 8_192),
+                tapSampleRate: 96_000
+            )
+            Issue.record("Expected oversized converted playback prime to be rejected")
+        } catch let error as AudioDeviceAvailabilityError {
+            #expect(error == .unsupportedPlaybackConversionBuffer(
+                42,
+                requiredPrimeFrames: 50_176,
+                maximumPrimeFrames: 40_960
+            ))
+        } catch {
+            Issue.record("Expected unsupported converted playback buffer error, got \(error)")
+        }
+    }
+
+    @Test
     func unsupportedRuntimeChannelCountSkipsDevicePreparation() {
         var didPrepareDevice = false
         let channelCount = CoreAudioDeviceQuery.maxChannelCount + 1
