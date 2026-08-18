@@ -190,6 +190,13 @@ func clockCorrectionLimitIsReached(isRunning: Bool, metricsSaturated: Bool) -> B
     isRunning && metricsSaturated
 }
 
+func settingsCanDeleteSelectedProfile(_ snapshot: SettingsSnapshot) -> Bool {
+    !snapshot.profileStoreProtection.isProtected
+        && snapshot.profiles.count > 1
+        && !snapshot.isPreviewing
+        && snapshot.selectedProfileID != snapshot.activeProfileID
+}
+
 func settingsSnapshotPreservingLocalDraft(
     current: SettingsSnapshot,
     latest: SettingsSnapshot
@@ -330,7 +337,7 @@ public struct SettingsView: View {
     }
 
     private var canDeleteSelectedProfile: Bool {
-        !isProfileStoreProtected && snapshot.profiles.count > 1 && snapshot.selectedProfileID != snapshot.activeProfileID
+        settingsCanDeleteSelectedProfile(snapshot)
     }
 
     private var isProfileStoreProtected: Bool {

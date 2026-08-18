@@ -52,6 +52,23 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func profileDeletionIsDisabledWhilePreviewProtectsTheReturnProfile() {
+        let returnProfile = EQProfile(name: "Return", mode: .parametric, filters: [])
+        let previewProfile = EQProfile(name: "Preview", mode: .parametric, filters: [])
+        var snapshot = SettingsSnapshotDTO.disconnected
+        snapshot.profiles = [returnProfile, previewProfile]
+        snapshot.selectedProfileID = returnProfile.id
+        snapshot.draftProfile = returnProfile
+        snapshot.activeProfileID = previewProfile.id
+        snapshot.isPreviewing = true
+
+        #expect(!settingsCanDeleteSelectedProfile(snapshot))
+
+        snapshot.isPreviewing = false
+        #expect(settingsCanDeleteSelectedProfile(snapshot))
+    }
+
+    @Test
     func editableNumberParsingRejectsLocaleGroupingSeparators() {
         #expect(parseEditableNumber("1.234", locale: Locale(identifier: "de_DE")) == nil)
         #expect(parseEditableNumber("1,234", locale: Locale(identifier: "de_DE")) == 1.234)
