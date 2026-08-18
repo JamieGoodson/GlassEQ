@@ -535,6 +535,11 @@ final class GlassEQAppModel {
         case cancelled
     }
 
+    private enum PlaybackBufferCalibrationResetResult: Sendable {
+        case success(AudioEngineState)
+        case failure(any Error, AudioEngineState)
+    }
+
     private struct EngineWorkFailure: Error, LocalizedError, Sendable {
         var message: String
 
@@ -1040,6 +1045,7 @@ final class GlassEQAppModel {
         guard !currentOutputUID.isEmpty else {
             throw SettingsCommandFailure(message: localized("No output is available to recalibrate."))
         }
+        let generation = engineStartGeneration
         let outputUID = currentOutputUID
         let outputName = currentOutputName
         statusMessage = localized("Recalibrating the audio buffer for \(outputName)...")
@@ -1049,28 +1055,53 @@ final class GlassEQAppModel {
         let resetTask = engineWorkExecutor.enqueue(priority: .userInitiated) {
             do {
                 try engine.resetPlaybackBufferCalibration(forOutputUID: outputUID)
-                return Result<AudioEngineState, any Error>.success(engine.state)
+                return PlaybackBufferCalibrationResetResult.success(engine.state)
             } catch {
-                return Result<AudioEngineState, any Error>.failure(error)
+                return PlaybackBufferCalibrationResetResult.failure(error, engine.state)
             }
         }
 
-        do {
-            switch try await resetTask.value.get() {
+        let result = await resetTask.value
+        guard generation == engineStartGeneration else {
+            if case .failure(let error, _) = result {
+                throw error
+            }
+            return
+        }
+
+        switch result {
+        case .success(let state):
+            switch state {
             case .running(let output):
                 refreshCurrentOutputMetadata(from: output)
                 lifecycleState = .running
                 isRunning = true
                 statusMessage = processingStatus(outputName: output.name, profileName: activeProfile.name)
             case .stopped:
+                lifecycleState = .stopped
+                isRunning = false
                 statusMessage = localized("Buffer calibration reset for \(outputName)")
             case .failed(let message):
                 lifecycleState = .stopped
                 isRunning = false
                 statusMessage = message
             }
-        } catch {
-            statusMessage = localized("Buffer calibration reset failed: \(error.localizedDescription)")
+        case .failure(let error, let state):
+            switch state {
+            case .running(let output):
+                refreshCurrentOutputMetadata(from: output)
+                lifecycleState = .running
+                isRunning = true
+                statusMessage = localized("Buffer calibration reset failed: \(error.localizedDescription)")
+            case .stopped:
+                lifecycleState = .stopped
+                isRunning = false
+                statusMessage = localized("Buffer calibration reset failed: \(error.localizedDescription)")
+            case .failed(let message):
+                lifecycleState = .stopped
+                isRunning = false
+                statusMessage = message
+            }
             notifyModelDidChange()
             throw error
         }
