@@ -128,6 +128,16 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func pipeMessageRoundTripsReadyRequest() throws {
+        let message = SettingsPipeMessage.request(sessionToken: "token", id: "request-2", kind: .ready, command: nil)
+
+        let encoded = try SettingsPipeCodec.encodeLine(message)
+        let decoded = try SettingsPipeCodec.decodeLine(Data(encoded.dropLast()))
+
+        #expect(decoded == message)
+    }
+
+    @Test
     func pipeMessageRoundTripsBootstrapToken() throws {
         let message = SettingsPipeMessage.bootstrap(sessionToken: "bootstrap-token")
 
@@ -697,6 +707,8 @@ private final class FakeSettingsPipeClient: SettingsPipeClientConnection, @unche
     func perform(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
         SettingsCommandResponse()
     }
+
+    func acknowledgeReady() async throws {}
 
     func disconnect() {
         didDisconnect = true
