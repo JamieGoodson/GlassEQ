@@ -58,8 +58,8 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
     public var playbackTimestampDiscontinuities: UInt64
     public var playbackBufferRenegotiations: UInt64
     public var adaptivePlaybackRenderFailures: UInt64
-    public var ringGateContentionFailures: UInt64
     public var playbackRateCorrectionPPM: Double
+    public var playbackRateCorrectionSaturated: Bool
     public var playbackOccupancyTargetFrames: Int
     public var filteredPlaybackOccupancyFrames: Double
     public var playbackBufferSampleRate: Double
@@ -84,8 +84,8 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
         case playbackTimestampDiscontinuities
         case playbackBufferRenegotiations
         case adaptivePlaybackRenderFailures
-        case ringGateContentionFailures
         case playbackRateCorrectionPPM
+        case playbackRateCorrectionSaturated
         case playbackOccupancyTargetFrames
         case filteredPlaybackOccupancyFrames
         case playbackBufferSampleRate
@@ -111,8 +111,8 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
         playbackTimestampDiscontinuities: UInt64 = 0,
         playbackBufferRenegotiations: UInt64 = 0,
         adaptivePlaybackRenderFailures: UInt64 = 0,
-        ringGateContentionFailures: UInt64 = 0,
         playbackRateCorrectionPPM: Double = 0,
+        playbackRateCorrectionSaturated: Bool = false,
         playbackOccupancyTargetFrames: Int = 0,
         filteredPlaybackOccupancyFrames: Double = 0,
         playbackBufferSampleRate: Double = 0,
@@ -136,8 +136,8 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
         self.playbackTimestampDiscontinuities = playbackTimestampDiscontinuities
         self.playbackBufferRenegotiations = playbackBufferRenegotiations
         self.adaptivePlaybackRenderFailures = adaptivePlaybackRenderFailures
-        self.ringGateContentionFailures = ringGateContentionFailures
         self.playbackRateCorrectionPPM = playbackRateCorrectionPPM
+        self.playbackRateCorrectionSaturated = playbackRateCorrectionSaturated
         self.playbackOccupancyTargetFrames = playbackOccupancyTargetFrames
         self.filteredPlaybackOccupancyFrames = filteredPlaybackOccupancyFrames
         self.playbackBufferSampleRate = playbackBufferSampleRate
@@ -165,8 +165,8 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
             playbackTimestampDiscontinuities: try container.decodeIfPresent(UInt64.self, forKey: .playbackTimestampDiscontinuities) ?? 0,
             playbackBufferRenegotiations: try container.decodeIfPresent(UInt64.self, forKey: .playbackBufferRenegotiations) ?? 0,
             adaptivePlaybackRenderFailures: try container.decodeIfPresent(UInt64.self, forKey: .adaptivePlaybackRenderFailures) ?? 0,
-            ringGateContentionFailures: try container.decodeIfPresent(UInt64.self, forKey: .ringGateContentionFailures) ?? 0,
             playbackRateCorrectionPPM: try container.decodeIfPresent(Double.self, forKey: .playbackRateCorrectionPPM) ?? 0,
+            playbackRateCorrectionSaturated: try container.decodeIfPresent(Bool.self, forKey: .playbackRateCorrectionSaturated) ?? false,
             playbackOccupancyTargetFrames: try container.decodeIfPresent(Int.self, forKey: .playbackOccupancyTargetFrames) ?? 0,
             filteredPlaybackOccupancyFrames: try container.decodeIfPresent(Double.self, forKey: .filteredPlaybackOccupancyFrames) ?? 0,
             playbackBufferSampleRate: try container.decodeIfPresent(Double.self, forKey: .playbackBufferSampleRate) ?? 0,

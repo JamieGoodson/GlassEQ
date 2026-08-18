@@ -2231,6 +2231,12 @@ private struct OutputTab: View {
                             : localized("Inactive")
                     )
                     LabeledContent(localized("Clock Correction"), value: playbackRateCorrectionLabel)
+                    LabeledContent(
+                        localized("Clock Correction Limit"),
+                        value: snapshot.metrics.playbackRateCorrectionSaturated
+                            ? localized("Reached")
+                            : localized("Not reached")
+                    )
                     LabeledContent(localized("Servo Buffer"), value: servoBufferLabel)
                     LabeledContent(localized("Added Latency"), value: averageAddedLatencyLabel)
                     LabeledContent(localized("Latency Range"), value: addedLatencyRangeLabel)

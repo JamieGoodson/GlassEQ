@@ -1362,6 +1362,41 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func playbackBufferCalibrationResetIsRejectedWhileSleepingOrWaking() async {
+        let output = makeOutput(uid: "sleep-reset", name: "Sleep Reset")
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output)),
+            observers: observers,
+            wakeDelay: .zero
+        )
+
+        model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running
+        }
+        model.handleWillSleep()
+
+        await #expect(throws: SettingsCommandFailure.self) {
+            _ = try await model.performSettingsCommand(.resetPlaybackBufferCalibration)
+        }
+        #expect(model.lifecycleState == .sleeping)
+        #expect(engine.resetPlaybackBufferCalibrationUIDs.isEmpty)
+
+        model.handleDidWake()
+        await waitUntil {
+            model.lifecycleState == .waking && observers.observers.count == 1
+        }
+        await #expect(throws: SettingsCommandFailure.self) {
+            _ = try await model.performSettingsCommand(.resetPlaybackBufferCalibration)
+        }
+        #expect(model.lifecycleState == .waking)
+        #expect(engine.resetPlaybackBufferCalibrationUIDs.isEmpty)
+    }
+
+    @Test
     func playbackBufferCalibrationFailureReconcilesFailedEngineState() async {
         let output = makeOutput(uid: "failed-reset", name: "Failed Reset")
         let engine = FakeAudioEngine()

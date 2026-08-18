@@ -368,6 +368,8 @@ struct SystemPlaybackBufferRenegotiationNotifier: PlaybackBufferRenegotiationNot
             localized("an output timing discontinuity")
         case .excessiveBacklog:
             localized("an excessive playback backlog")
+        case .adaptiveRenderFailure:
+            localized("an adaptive playback render failure")
         }
         let targetLatency = renegotiation.sampleRate > 0
             ? localizedLatency(milliseconds: Double(renegotiation.playbackTargetFrames) / renegotiation.sampleRate * 1_000)
@@ -421,8 +423,8 @@ extension SettingsAudioMetricsDTO {
             playbackTimestampDiscontinuities: metrics.playbackTimestampDiscontinuities,
             playbackBufferRenegotiations: metrics.playbackBufferRenegotiations,
             adaptivePlaybackRenderFailures: metrics.adaptivePlaybackRenderFailures,
-            ringGateContentionFailures: metrics.ringGateContentionFailures,
             playbackRateCorrectionPPM: metrics.playbackRateCorrectionPPM,
+            playbackRateCorrectionSaturated: metrics.playbackRateCorrectionSaturated,
             playbackOccupancyTargetFrames: metrics.playbackOccupancyTargetFrames,
             filteredPlaybackOccupancyFrames: metrics.filteredPlaybackOccupancyFrames,
             playbackBufferSampleRate: metrics.playbackBufferSampleRate,
@@ -1073,6 +1075,11 @@ final class GlassEQAppModel {
     }
 
     func resetPlaybackBufferCalibrationForCurrentOutput() async throws {
+        guard lifecycleState == .running else {
+            throw SettingsCommandFailure(
+                message: localized("Buffer calibration can only be reset while audio processing is running.")
+            )
+        }
         guard !currentOutputUID.isEmpty else {
             throw SettingsCommandFailure(message: localized("No output is available to recalibrate."))
         }
