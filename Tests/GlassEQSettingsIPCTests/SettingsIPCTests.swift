@@ -141,6 +141,21 @@ struct SettingsIPCTests {
         #expect(metrics.playbackBufferObservations == 0)
         #expect(metrics.maximumCaptureCallbackFrames == 0)
         #expect(metrics.maximumPlaybackCallbackFrames == 0)
+        #expect(metrics.playbackBufferSampleRate == 0)
+    }
+
+    @Test
+    func playbackLatencyUsesTheBufferFrameRate() {
+        #expect(playbackFramesToMilliseconds(
+            480,
+            bufferSampleRate: 48_000,
+            fallbackSampleRate: 16_000
+        ) == 10)
+        #expect(playbackFramesToMilliseconds(
+            480,
+            bufferSampleRate: 0,
+            fallbackSampleRate: 16_000
+        ) == 30)
     }
 
     @Test

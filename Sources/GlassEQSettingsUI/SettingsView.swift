@@ -125,6 +125,18 @@ func clampedEditableNumber(
     return min(max(parsed, range.lowerBound), range.upperBound)
 }
 
+func playbackFramesToMilliseconds(
+    _ frames: Double,
+    bufferSampleRate: Double,
+    fallbackSampleRate: Double
+) -> Double {
+    let sampleRate = bufferSampleRate > 0 ? bufferSampleRate : fallbackSampleRate
+    guard sampleRate > 0 else {
+        return 0
+    }
+    return frames / sampleRate * 1_000
+}
+
 private func localizedInteger(_ value: Int) -> String {
     value.formatted(.number.locale(.autoupdatingCurrent))
 }
@@ -2266,10 +2278,11 @@ private struct OutputTab: View {
     }
 
     private func framesToMilliseconds(_ frames: Double) -> Double {
-        guard snapshot.currentOutputSampleRate > 0 else {
-            return 0
-        }
-        return frames / snapshot.currentOutputSampleRate * 1_000
+        playbackFramesToMilliseconds(
+            frames,
+            bufferSampleRate: snapshot.metrics.playbackBufferSampleRate,
+            fallbackSampleRate: snapshot.currentOutputSampleRate
+        )
     }
 
     private func formatLatency(milliseconds: Double) -> String {

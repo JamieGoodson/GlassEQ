@@ -329,7 +329,8 @@ extension SettingsAudioMetricsDTO {
             averagePlaybackBufferedFrames: metrics.averagePlaybackBufferedFrames,
             playbackBufferObservations: metrics.playbackBufferObservations,
             maximumCaptureCallbackFrames: metrics.maximumCaptureCallbackFrames,
-            maximumPlaybackCallbackFrames: metrics.maximumPlaybackCallbackFrames
+            maximumPlaybackCallbackFrames: metrics.maximumPlaybackCallbackFrames,
+            playbackBufferSampleRate: metrics.playbackBufferSampleRate
         )
     }
 }

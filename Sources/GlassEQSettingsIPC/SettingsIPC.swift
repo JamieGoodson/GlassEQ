@@ -55,6 +55,7 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
     public var playbackBufferObservations: UInt64
     public var maximumCaptureCallbackFrames: Int
     public var maximumPlaybackCallbackFrames: Int
+    public var playbackBufferSampleRate: Double
 
     private enum CodingKeys: String, CodingKey {
         case capturedFrames
@@ -72,6 +73,7 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
         case playbackBufferObservations
         case maximumCaptureCallbackFrames
         case maximumPlaybackCallbackFrames
+        case playbackBufferSampleRate
     }
 
     public init(
@@ -89,7 +91,8 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
         averagePlaybackBufferedFrames: Double = 0,
         playbackBufferObservations: UInt64 = 0,
         maximumCaptureCallbackFrames: Int = 0,
-        maximumPlaybackCallbackFrames: Int = 0
+        maximumPlaybackCallbackFrames: Int = 0,
+        playbackBufferSampleRate: Double = 0
     ) {
         self.capturedFrames = capturedFrames
         self.playedFrames = playedFrames
@@ -106,6 +109,7 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
         self.playbackBufferObservations = playbackBufferObservations
         self.maximumCaptureCallbackFrames = maximumCaptureCallbackFrames
         self.maximumPlaybackCallbackFrames = maximumPlaybackCallbackFrames
+        self.playbackBufferSampleRate = playbackBufferSampleRate
     }
 
     public init(from decoder: any Decoder) throws {
@@ -125,7 +129,8 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
             averagePlaybackBufferedFrames: try container.decodeIfPresent(Double.self, forKey: .averagePlaybackBufferedFrames) ?? 0,
             playbackBufferObservations: try container.decodeIfPresent(UInt64.self, forKey: .playbackBufferObservations) ?? 0,
             maximumCaptureCallbackFrames: try container.decodeIfPresent(Int.self, forKey: .maximumCaptureCallbackFrames) ?? 0,
-            maximumPlaybackCallbackFrames: try container.decodeIfPresent(Int.self, forKey: .maximumPlaybackCallbackFrames) ?? 0
+            maximumPlaybackCallbackFrames: try container.decodeIfPresent(Int.self, forKey: .maximumPlaybackCallbackFrames) ?? 0,
+            playbackBufferSampleRate: try container.decodeIfPresent(Double.self, forKey: .playbackBufferSampleRate) ?? 0
         )
     }
 }

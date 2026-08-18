@@ -1326,7 +1326,8 @@ struct GlassEQAppModelLifecycleTests {
         engine.metrics = AudioEngineMetrics(
             capturedFrames: 123,
             playedFrames: 100,
-            ringGateContentionFailures: 2
+            ringGateContentionFailures: 2,
+            playbackBufferSampleRate: 48_000
         )
         let model = makeModel(engine: engine)
 
@@ -1336,6 +1337,7 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.engineMetrics.capturedFrames == 123)
         #expect(model.engineMetrics.playedFrames == 100)
         #expect(model.engineMetrics.ringGateContentionFailures == 2)
+        #expect(model.settingsSnapshot().metrics.playbackBufferSampleRate == 48_000)
         model.stopMetricsPolling()
     }
 
