@@ -246,6 +246,8 @@ private func printMetrics(_ metrics: AudioEngineMetrics, sampleRate: Double) {
     print("Captured frames: \(metrics.capturedFrames)")
     print("Played frames: \(metrics.playedFrames)")
     print("Playback underrun frames: \(metrics.playbackUnderrunFrames)")
+    print("Dropped input frames: \(metrics.droppedInputFrames)")
+    print("Dropped buffered frames: \(metrics.droppedBufferedFrames)")
     print("Saturated samples: \(metrics.saturatedSamples)")
     print("Buffered frames at stop: \(metrics.currentBufferedFrames)")
     print("Max ring buffered frames: \(metrics.maxBufferedFrames)")
