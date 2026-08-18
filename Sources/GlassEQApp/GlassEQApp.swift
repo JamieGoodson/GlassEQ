@@ -1889,8 +1889,9 @@ final class GlassEQAppModel {
     }
 
     private func handleRuntimeAudioEngineFailure(_ failure: AudioEngineFailure) {
-        guard lifecycleState != .terminating,
-              lifecycleState != .sleeping else {
+        guard lifecycleState == .running,
+              engineStartTask == nil,
+              case .failed = engine.state else {
             return
         }
         invalidatePendingEngineStart()
