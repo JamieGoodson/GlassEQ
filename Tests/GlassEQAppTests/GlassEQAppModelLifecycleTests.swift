@@ -1414,7 +1414,15 @@ struct GlassEQAppModelLifecycleTests {
         )
 
         #expect(coordinator.openSettings() == .helper)
-        let bootstrap = try #require(launcher.readHostMessages().first)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first)
         guard case .bootstrap(let token) = bootstrap else {
             Issue.record("Expected Settings bootstrap message")
             return
@@ -1466,7 +1474,15 @@ struct GlassEQAppModelLifecycleTests {
         )
 
         #expect(coordinator.openSettings() == .helper)
-        let bootstrap = try #require(launcher.readHostMessages().first)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first)
         guard case .bootstrap(let token) = bootstrap else {
             Issue.record("Expected Settings bootstrap message")
             return
@@ -1481,7 +1497,7 @@ struct GlassEQAppModelLifecycleTests {
             try await Task.sleep(for: .milliseconds(10))
         }
         #expect(coordinator.isHelperReadyForTesting)
-        _ = try launcher.readHostMessages()
+        let baselineMessageCount = launcher.receivedAppMessages.count
 
         model.engineMetrics = AudioEngineMetrics(capturedFrames: 42)
         coordinator.modelDidChange()
@@ -1490,12 +1506,12 @@ struct GlassEQAppModelLifecycleTests {
             sessionToken: token,
             event: .metricsChanged(SettingsAudioMetricsDTO(capturedFrames: 42))
         )
-        var messages: [SettingsPipeMessage] = []
-        for _ in 0..<100 where !messages.contains(expectedMessage) {
-            try await Task.sleep(for: .milliseconds(10))
-            messages.append(contentsOf: try launcher.readHostMessages())
+        await waitUntil {
+            launcher.receivedAppMessages
+                .dropFirst(baselineMessageCount)
+                .contains(expectedMessage)
         }
-        #expect(messages.contains(expectedMessage))
+        #expect(launcher.receivedAppMessages.contains(expectedMessage))
         coordinator.shutdown()
     }
 
@@ -2000,33 +2016,52 @@ private struct PermissionDeniedSettingsHelperLauncher: SettingsHelperLaunching {
     }
 }
 
-private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching {
+private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching, @unchecked Sendable {
     private let input = Pipe()
     private let output = Pipe()
     private let error = Pipe()
+    private let messagesLock = NSLock()
+    private var messages: [SettingsPipeMessage] = []
+    private var appReadPump: SettingsPipeReadPump?
+
+    var receivedAppMessages: [SettingsPipeMessage] {
+        messagesLock.withLock { messages }
+    }
 
     func launch(
         executableURL: URL,
         arguments: [String],
         terminationHandler: @escaping @Sendable (Process) -> Void
     ) throws -> SettingsHelperLaunch {
-        SettingsHelperLaunch(process: Process(), input: input, output: output, error: error)
+        let pump = SettingsPipeReadPump(
+            label: "com.glasseq.tests.settings-helper-input",
+            onMessages: { [weak self] result in
+                guard let self, case .success(let messages) = result else {
+                    return
+                }
+                messagesLock.withLock {
+                    self.messages.append(contentsOf: messages)
+                }
+            },
+            onEndOfFile: {}
+        )
+        appReadPump = pump
+        pump.install(on: input.fileHandleForReading)
+        return SettingsHelperLaunch(process: Process(), input: input, output: output, error: error)
     }
 
     func writeHelperOutput(_ data: Data) throws {
         try output.fileHandleForWriting.write(contentsOf: data)
     }
 
+    func writeHelperMessage(_ message: SettingsPipeMessage) throws {
+        try writeHelperOutput(SettingsPipeCodec.encodeLine(message))
+    }
+
     func closeHelperOutput() throws {
         try output.fileHandleForWriting.close()
     }
 
-    func readHostMessages() throws -> [SettingsPipeMessage] {
-        let data = input.fileHandleForReading.availableData
-        return try data.split(separator: 0x0A).map { line in
-            try SettingsPipeCodec.decodeLine(Data(line))
-        }
-    }
 }
 
 private final class ClosedInputSettingsHelperLauncher: SettingsHelperLaunching {
