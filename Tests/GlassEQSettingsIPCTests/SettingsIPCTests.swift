@@ -21,6 +21,32 @@ struct SettingsIPCTests {
         #expect(parseEditableNumber("0,707", locale: Locale(identifier: "fi_FI")) == 0.707)
     }
 
+    @Test
+    func editableNumberParsingRejectsLocaleGroupingSeparators() {
+        #expect(parseEditableNumber("1.234", locale: Locale(identifier: "de_DE")) == nil)
+        #expect(parseEditableNumber("1,234", locale: Locale(identifier: "de_DE")) == 1.234)
+    }
+
+    @Test
+    func editableNumberUpdatesClampValidDraftText() {
+        let range = -24.0...24.0
+
+        #expect(clampedEditableNumber("-12.345", range: range, locale: Locale(identifier: "en_US_POSIX")) == -12.345)
+        #expect(clampedEditableNumber("30", range: range, locale: Locale(identifier: "en_US_POSIX")) == 24)
+        #expect(clampedEditableNumber("-", range: range, locale: Locale(identifier: "en_US_POSIX")) == nil)
+    }
+
+    @Test
+    func sliderQuantizationDoesNotIntroduceDisplayNoise() {
+        let locale = Locale(identifier: "en_US_POSIX")
+
+        for tenth in -240...240 {
+            let expected = Double(tenth) / 10
+            let value = quantized(expected, step: 0.1)
+            #expect(editableNumberText(value, locale: locale) == editableNumberText(expected, locale: locale))
+        }
+    }
+
     @Test(arguments: ["nan", "inf", "-inf", "infinity", "-infinity"])
     func editableNumberParsingRejectsNonFiniteValues(_ text: String) {
         #expect(parseEditableNumber(text, locale: Locale(identifier: "en_US_POSIX")) == nil)
@@ -108,6 +134,7 @@ struct SettingsIPCTests {
         #expect(metrics.maximumPlaybackBufferedFrames == 0)
         #expect(metrics.minimumPlaybackBufferedFrames == 0)
         #expect(metrics.averagePlaybackBufferedFrames == 0)
+        #expect(metrics.ringGateContentionFailures == 0)
         #expect(metrics.playbackBufferObservations == 0)
         #expect(metrics.maximumCaptureCallbackFrames == 0)
         #expect(metrics.maximumPlaybackCallbackFrames == 0)

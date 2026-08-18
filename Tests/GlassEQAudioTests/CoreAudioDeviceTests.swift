@@ -445,15 +445,15 @@ struct CoreAudioDeviceTests {
         ) == 1_088)
         #expect(SystemTapAudioEngine.preferredPlaybackPrimeFrames(
             for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 1_024)
-        ) == 1_088)
+        ) == 2_048)
         #expect(SystemTapAudioEngine.preferredPlaybackPrimeFrames(
             for: output(channelCount: 2, sampleRate: 24_000, bufferFrameSize: 1_024),
             tapSampleRate: 48_000
-        ) == 2_112)
+        ) == 3_072)
         #expect(SystemTapAudioEngine.preferredPlaybackPrimeFrames(
             for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 1_024),
             tapSampleRate: 48_000
-        ) == 3_136)
+        ) == 4_096)
     }
 
     @Test
@@ -486,7 +486,7 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
-    func adaptivePlaybackBufferAppliesToEveryNormalRateOutput() {
+    func adaptivePlaybackBufferAppliesToEveryValidOutputRate() {
         #expect(SystemTapAudioEngine.shouldAdaptPlaybackBuffer(
             for: output(channelCount: 2, bufferFrameSize: 64)
         ))
@@ -497,9 +497,13 @@ struct CoreAudioDeviceTests {
                 transportType: kAudioDeviceTransportTypeBluetooth
             )
         ))
-        #expect(!SystemTapAudioEngine.shouldAdaptPlaybackBuffer(
+        #expect(SystemTapAudioEngine.shouldAdaptPlaybackBuffer(
             for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 1_024)
         ))
+        #expect(SystemTapAudioEngine.playbackInputCallbackFrames(
+            for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 1_024),
+            tapSampleRate: 48_000
+        ) == 3_072)
     }
 
     @Test
@@ -526,6 +530,9 @@ struct CoreAudioDeviceTests {
         #expect(AdaptivePlaybackBufferPolicy.nextFrameSize(after: 128, supportedRange: range) == 256)
         #expect(AdaptivePlaybackBufferPolicy.nextFrameSize(after: 256, supportedRange: range) == 512)
         #expect(AdaptivePlaybackBufferPolicy.nextFrameSize(after: 512, supportedRange: range) == nil)
+        #expect(AdaptivePlaybackBufferPolicy.previousFrameSize(before: 512, supportedRange: range) == 256)
+        #expect(AdaptivePlaybackBufferPolicy.previousFrameSize(before: 128, supportedRange: range) == 64)
+        #expect(AdaptivePlaybackBufferPolicy.previousFrameSize(before: 64, supportedRange: range) == 15)
     }
 
     @Test
@@ -566,6 +573,34 @@ struct CoreAudioDeviceTests {
         )
 
         #expect(requestedFrameSize == 128)
+        #expect(updated?.bufferFrameSize == 128)
+    }
+
+    @Test
+    func adaptiveBufferRenegotiationWaitsForTheDevicePropertyToSettle() throws {
+        let current = output(channelCount: 2, bufferFrameSize: 64)
+        var queryCount = 0
+        var waitCount = 0
+
+        let updated = try SystemTapAudioEngine.renegotiatedPlaybackOutput(
+            current,
+            supportedRange: AudioBufferFrameSizeRange(minimum: 64, maximum: 512),
+            setBufferFrameSize: { _, _ in },
+            queryOutput: { objectID in
+                queryCount += 1
+                return output(
+                    id: objectID,
+                    channelCount: 2,
+                    bufferFrameSize: queryCount < 3 ? 64 : 128
+                )
+            },
+            waitForPropertySettlement: {
+                waitCount += 1
+            }
+        )
+
+        #expect(queryCount == 3)
+        #expect(waitCount == 2)
         #expect(updated?.bufferFrameSize == 128)
     }
 

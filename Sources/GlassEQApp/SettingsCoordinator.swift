@@ -200,9 +200,9 @@ final class SettingsCoordinator: NSObject {
             arguments: [
                 "--glasseq-main-pid", String(ProcessInfo.processInfo.processIdentifier)
             ],
-            terminationHandler: { [weak self] _ in
+            terminationHandler: { [weak self] process in
                 Task { @MainActor in
-                    self?.cleanupSession(terminateHelper: false)
+                    self?.handleHelperTermination(process)
                 }
             }
         )
@@ -218,7 +218,7 @@ final class SettingsCoordinator: NSObject {
         )
         pipeReader = helperOutput.fileHandleForReading
         pipeErrorReader = helperError.fileHandleForReading
-        installPipeReader(helperOutput.fileHandleForReading)
+        installPipeReader(helperOutput.fileHandleForReading, sessionToken: token)
         pipeErrorReader?.readabilityHandler = { handle in
             _ = handle.availableData
         }
@@ -289,7 +289,7 @@ final class SettingsCoordinator: NSObject {
         writePipeMessage(.event(sessionToken: launchToken, event: event))
     }
 
-    private func installPipeReader(_ readHandle: FileHandle) {
+    private func installPipeReader(_ readHandle: FileHandle, sessionToken: String) {
         let delivery = SettingsPipeOrderedMainActorDelivery(
             label: "com.glasseq.settings-coordinator.pipe-read.delivery"
         )
@@ -307,13 +307,38 @@ final class SettingsCoordinator: NSObject {
             },
             onEndOfFile: { [weak self, delivery] in
                 delivery.enqueue {
-                    self?.cleanupSession(terminateHelper: false)
+                    self?.handlePipeEndOfFile(sessionToken: sessionToken)
                 }
             }
         )
         pipeReadDelivery = delivery
         pipeReadPump = pump
         pump.install(on: readHandle)
+    }
+
+    private func handleHelperTermination(_ process: Process) {
+        guard helperProcess === process else {
+            return
+        }
+        handleHelperExitBeforeConnectionIfNeeded()
+    }
+
+    private func handlePipeEndOfFile(sessionToken: String) {
+        guard launchToken == sessionToken else {
+            return
+        }
+        handleHelperExitBeforeConnectionIfNeeded()
+    }
+
+    private func handleHelperExitBeforeConnectionIfNeeded() {
+        let shouldUseFallback = !settingsConnected
+        cleanupSession(terminateHelper: false)
+        guard shouldUseFallback else {
+            return
+        }
+        model?.requestInProcessSettingsPresentation(
+            statusMessage: localized("Settings helper exited before connecting. Opened Settings in GlassEQ instead.")
+        )
     }
 
     private func handlePipeMessages(_ messages: [SettingsPipeMessage]) {
@@ -523,7 +548,9 @@ final class SettingsCoordinator: NSObject {
 
     @discardableResult
     private func cleanupSession(terminateHelper: Bool) -> Task<Void, Never>? {
-        model?.stopMetricsPolling()
+        if settingsConnected {
+            model?.stopMetricsPolling()
+        }
         let processToTerminate = terminateHelper ? helperProcess : nil
         let writePumpToDrain = pipeWritePump
         let writerToCloseDirectly = writePumpToDrain == nil ? pipeWriter : nil
@@ -827,18 +854,38 @@ struct SecuritySettingsCodeSigningValidator: SettingsCodeSigningValidating {
 }
 
 extension GlassEQAppModel {
+    @discardableResult
     func openSettings() -> SettingsOpenDisposition {
-        guard !inProcessSettingsIsPresented else {
+        guard !inProcessSettingsIsPresented,
+              !inProcessSettingsPresentationIsPending else {
+            requestInProcessSettingsPresentation()
             return .activeInProcessFallback
         }
-        return settingsCoordinator.openSettings()
+        let disposition = settingsCoordinator.openSettings()
+        if case .inProcessFallback(let reason) = disposition {
+            requestInProcessSettingsPresentation(
+                statusMessage: localized("Settings helper unavailable: \(reason). Opened Settings in GlassEQ instead.")
+            )
+        }
+        return disposition
+    }
+
+    func requestInProcessSettingsPresentation(statusMessage: String? = nil) {
+        if let statusMessage {
+            self.statusMessage = statusMessage
+            notifyModelDidChange()
+        }
+        inProcessSettingsPresentationIsPending = true
+        inProcessSettingsPresentationGeneration &+= 1
     }
 
     func inProcessSettingsDidAppear() {
+        inProcessSettingsPresentationIsPending = false
         inProcessSettingsIsPresented = true
     }
 
     func inProcessSettingsDidDisappear() {
+        inProcessSettingsPresentationIsPending = false
         inProcessSettingsIsPresented = false
     }
 

@@ -5,6 +5,7 @@ public enum PlaybackBufferInstabilityReason: UInt8, Codable, Equatable, Sendable
     case underrun = 1
     case outputTimestampDiscontinuity = 2
     case excessiveBacklog = 3
+    case adaptiveRenderFailure = 4
 }
 
 public struct PlaybackBufferRenegotiation: Equatable, Sendable {
@@ -179,6 +180,14 @@ struct PlaybackBufferInstabilityPersistenceGate: Sendable {
     }
 }
 
+struct AdaptivePlaybackRenderRecoveryPolicy {
+    static let maximumRestartAttempts = 1
+
+    static func shouldRestart(afterCompletedAttempts attempts: Int) -> Bool {
+        attempts < maximumRestartAttempts
+    }
+}
+
 enum PlaybackBufferCalibrationPolicy {
     static let probationDuration: Duration = .seconds(60)
     static let maximumEventCount = 16
@@ -304,6 +313,10 @@ enum PersistedPlaybackBufferCalibrationStore {
             if resultingFrameSize != previousFrameSize,
                calibration.stableFrameSize == previousFrameSize {
                 calibration.stableFrameSize = nil
+            }
+            if resultingFrameSize != previousFrameSize,
+               calibration.probingFrameSize == previousFrameSize {
+                calibration.probingFrameSize = resultingFrameSize
             }
             if calibration.stableFrameSize == nil {
                 calibration.probingFrameSize = resultingFrameSize
@@ -552,7 +565,7 @@ enum PersistedPlaybackBufferCalibrationStore {
 struct AdaptivePlaybackBufferPolicy {
     private static let frameSizeLadder: [UInt32] = [64, 128, 256, 512]
     private static let reservoirStepFrames = 64
-    private static let maximumReservoirFrames = reservoirStepFrames * 3
+    static let maximumReservoirFrames = reservoirStepFrames * 3
 
     static func nextFrameSize(
         after currentFrameSize: UInt32,
@@ -567,10 +580,49 @@ struct AdaptivePlaybackBufferPolicy {
         return candidates.sorted().first(where: { $0 > currentFrameSize })
     }
 
+    static func previousFrameSize(
+        before currentFrameSize: UInt32,
+        supportedRange: AudioBufferFrameSizeRange
+    ) -> UInt32? {
+        let minimum = supportedRange.minimum
+        let maximum = min(supportedRange.maximum, currentFrameSize)
+        var candidates = frameSizeLadder.filter { $0 >= minimum && $0 < maximum }
+        if minimum < maximum, !candidates.contains(minimum) {
+            candidates.append(minimum)
+        }
+        return candidates.max()
+    }
+
+    static func startupFrameSize(
+        preferredFrameSize: UInt32,
+        calibration: PersistedPlaybackBufferCalibration?,
+        supportedRange: AudioBufferFrameSizeRange,
+        allowsDownwardProbe: Bool
+    ) -> UInt32 {
+        let calibratedFrameSize: UInt32
+        if let probingFrameSize = calibration?.probingFrameSize {
+            calibratedFrameSize = probingFrameSize
+        } else if allowsDownwardProbe,
+                  let stableFrameSize = calibration?.stableFrameSize,
+                  let downProbe = previousFrameSize(
+                      before: stableFrameSize,
+                      supportedRange: supportedRange
+                  ) {
+            calibratedFrameSize = downProbe
+        } else {
+            calibratedFrameSize = calibration?.stableFrameSize ?? 0
+        }
+        return min(
+            max(max(preferredFrameSize, calibratedFrameSize), supportedRange.minimum),
+            supportedRange.maximum
+        )
+    }
+
     static func nextTargetFrames(
         for reason: PlaybackBufferInstabilityReason,
         callbackFrames: UInt32,
-        after currentTargetFrames: Int
+        after currentTargetFrames: Int,
+        maximumReservoirFrames: Int = maximumReservoirFrames
     ) -> Int? {
         // Reservoir protects against missing input. Backlog is trimmed during reprime and does
         // not become safer when both the prime and target move upward together.
@@ -578,7 +630,7 @@ struct AdaptivePlaybackBufferPolicy {
             return nil
         }
         let callbackFrames = max(Int(callbackFrames), 1)
-        let maximumTargetFrames = callbackFrames + maximumReservoirFrames
+        let maximumTargetFrames = callbackFrames + max(maximumReservoirFrames, reservoirStepFrames)
         let nextTargetFrames = max(
             currentTargetFrames + reservoirStepFrames,
             minimumTargetFrames(callbackFrames: UInt32(callbackFrames))

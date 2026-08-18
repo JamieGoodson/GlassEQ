@@ -45,6 +45,7 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
     public var playbackUnderrunFrames: UInt64
     public var droppedInputFrames: UInt64
     public var droppedBufferedFrames: UInt64
+    public var ringGateContentionFailures: UInt64
     public var saturatedSamples: UInt64
     public var currentBufferedFrames: Int
     public var maxBufferedFrames: Int
@@ -70,6 +71,7 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
         case playbackUnderrunFrames
         case droppedInputFrames
         case droppedBufferedFrames
+        case ringGateContentionFailures
         case saturatedSamples
         case currentBufferedFrames
         case maxBufferedFrames
@@ -96,6 +98,7 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
         playbackUnderrunFrames: UInt64 = 0,
         droppedInputFrames: UInt64 = 0,
         droppedBufferedFrames: UInt64 = 0,
+        ringGateContentionFailures: UInt64 = 0,
         saturatedSamples: UInt64 = 0,
         currentBufferedFrames: Int = 0,
         maxBufferedFrames: Int = 0,
@@ -120,6 +123,7 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
         self.playbackUnderrunFrames = playbackUnderrunFrames
         self.droppedInputFrames = droppedInputFrames
         self.droppedBufferedFrames = droppedBufferedFrames
+        self.ringGateContentionFailures = ringGateContentionFailures
         self.saturatedSamples = saturatedSamples
         self.currentBufferedFrames = currentBufferedFrames
         self.maxBufferedFrames = maxBufferedFrames
@@ -148,6 +152,7 @@ public struct SettingsAudioMetricsDTO: Codable, Equatable, Sendable {
             playbackUnderrunFrames: try container.decodeIfPresent(UInt64.self, forKey: .playbackUnderrunFrames) ?? 0,
             droppedInputFrames: try container.decodeIfPresent(UInt64.self, forKey: .droppedInputFrames) ?? 0,
             droppedBufferedFrames: try container.decodeIfPresent(UInt64.self, forKey: .droppedBufferedFrames) ?? 0,
+            ringGateContentionFailures: try container.decodeIfPresent(UInt64.self, forKey: .ringGateContentionFailures) ?? 0,
             saturatedSamples: try container.decodeIfPresent(UInt64.self, forKey: .saturatedSamples) ?? 0,
             currentBufferedFrames: try container.decodeIfPresent(Int.self, forKey: .currentBufferedFrames) ?? 0,
             maxBufferedFrames: try container.decodeIfPresent(Int.self, forKey: .maxBufferedFrames) ?? 0,

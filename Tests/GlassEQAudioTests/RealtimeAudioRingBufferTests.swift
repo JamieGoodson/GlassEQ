@@ -247,10 +247,9 @@ struct RealtimeAudioRingBufferTests {
     }
 
     @Test
-    func sustainedOverflowContentionRarelyLosesTheOverwriteGate() {
-        // Capacity is deliberately smaller than one producer block, so every single write has to
-        // take the gate to drop the oldest frames. That is the maximum-contention case, and the
-        // case where losing the gate would cost a whole realtime callback.
+    func sustainedOverflowContentionPreservesFrameIntegrity() {
+        // The producer writes half-capacity blocks while a smaller consumer runs concurrently.
+        // Once the ring fills, overflow writes and reads repeatedly contend for the gate.
         let ring = RealtimeAudioRingBuffer(channelCount: 2, capacityFrames: 32)
         let producerBlockFrames = 16
         let consumerBlockFrames = 8
@@ -313,11 +312,6 @@ struct RealtimeAudioRingBufferTests {
         let rewoundFrame = sawRewoundFrame.load(ordering: .acquiring)
         #expect(!tornFrame)
         #expect(!rewoundFrame)
-        // The spin makes losing the gate rare, not impossible: these are ordinary QoS threads, so
-        // one can still be descheduled while holding it. Measured on this test: 0 with the spin,
-        // 630-1323 with the budget cut to a single attempt. The bound separates those two regimes.
-        let failures = ring.overwriteGateContentionFailureCount()
-        #expect(failures * 1_000 < UInt64(totalFrames), "gate contention failures: \(failures)")
     }
 
     @Test

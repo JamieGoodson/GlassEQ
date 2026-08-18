@@ -16,6 +16,7 @@ public struct AudioEngineMetrics: Equatable, Sendable {
     public var playbackUnderrunFrames: UInt64
     public var droppedInputFrames: UInt64
     public var droppedBufferedFrames: UInt64
+    public var ringGateContentionFailures: UInt64
     public var saturatedSamples: UInt64
     public var currentBufferedFrames: Int
     public var maxBufferedFrames: Int
@@ -28,8 +29,8 @@ public struct AudioEngineMetrics: Equatable, Sendable {
     public var playbackTimestampDiscontinuities: UInt64
     public var playbackBufferRenegotiations: UInt64
     public var adaptivePlaybackRenderFailures: UInt64
-    public var ringGateContentionFailures: UInt64
     public var playbackRateCorrectionPPM: Double
+    public var playbackRateCorrectionSaturated: Bool
     public var playbackOccupancyTargetFrames: Int
     public var filteredPlaybackOccupancyFrames: Double
     public var playbackBufferSampleRate: Double
@@ -41,6 +42,7 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         playbackUnderrunFrames: UInt64 = 0,
         droppedInputFrames: UInt64 = 0,
         droppedBufferedFrames: UInt64 = 0,
+        ringGateContentionFailures: UInt64 = 0,
         saturatedSamples: UInt64 = 0,
         currentBufferedFrames: Int = 0,
         maxBufferedFrames: Int = 0,
@@ -53,8 +55,8 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         playbackTimestampDiscontinuities: UInt64 = 0,
         playbackBufferRenegotiations: UInt64 = 0,
         adaptivePlaybackRenderFailures: UInt64 = 0,
-        ringGateContentionFailures: UInt64 = 0,
         playbackRateCorrectionPPM: Double = 0,
+        playbackRateCorrectionSaturated: Bool = false,
         playbackOccupancyTargetFrames: Int = 0,
         filteredPlaybackOccupancyFrames: Double = 0,
         playbackBufferSampleRate: Double = 0,
@@ -65,6 +67,7 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         self.playbackUnderrunFrames = playbackUnderrunFrames
         self.droppedInputFrames = droppedInputFrames
         self.droppedBufferedFrames = droppedBufferedFrames
+        self.ringGateContentionFailures = ringGateContentionFailures
         self.saturatedSamples = saturatedSamples
         self.currentBufferedFrames = currentBufferedFrames
         self.maxBufferedFrames = maxBufferedFrames
@@ -77,8 +80,8 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         self.playbackTimestampDiscontinuities = playbackTimestampDiscontinuities
         self.playbackBufferRenegotiations = playbackBufferRenegotiations
         self.adaptivePlaybackRenderFailures = adaptivePlaybackRenderFailures
-        self.ringGateContentionFailures = ringGateContentionFailures
         self.playbackRateCorrectionPPM = playbackRateCorrectionPPM
+        self.playbackRateCorrectionSaturated = playbackRateCorrectionSaturated
         self.playbackOccupancyTargetFrames = playbackOccupancyTargetFrames
         self.filteredPlaybackOccupancyFrames = filteredPlaybackOccupancyFrames
         self.playbackBufferSampleRate = playbackBufferSampleRate
@@ -113,6 +116,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     // Leaves one preferred 64-frame capture callback after servicing a 64-frame output pull.
     private static let preferredBluetoothPlaybackReservoirFrames = 64
     private static let preferredLowSampleRateBufferFrameSize: UInt32 = 1024
+    // Converted headset routes need enough tap-rate audio to span one full admitted
+    // capture callback even when the aggregate ignores the preferred 64-frame request.
+    private static let preferredLowSampleRatePlaybackReservoirFrames = Int(maximumRuntimeBufferFrameSize)
     private static let preferredCaptureBufferFrameSize: UInt32 = 64
     private static let minimumRingBufferFrames = 2048
     private static let maximumRuntimeBufferFrameSize: UInt32 = 1024
@@ -125,7 +131,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     private static let lowSampleRateThreshold = 24_000.0
     private static let maximumPlannedPlaybackPrimeFrames =
         maximumSupportedCallbackFrames * maximumPlannedPlaybackRateRatio
-            + Int(preferredCaptureBufferFrameSize)
+            + maximumSupportedCallbackFrames
     static let runtimeRingCapacityFrames = max(
         minimumRingBufferFrames,
         maximumPlannedPlaybackPrimeFrames * playbackRingPullCount
@@ -140,6 +146,16 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             self.outputUID = output.uid
             self.sampleRate = Int(output.nominalSampleRate.rounded())
             self.frameSize = output.bufferFrameSize
+        }
+    }
+
+    private struct PlaybackBufferRouteKey: Hashable {
+        var outputUID: String
+        var sampleRate: Int
+
+        init(output: AudioOutputDevice) {
+            self.outputUID = output.uid
+            self.sampleRate = Int(output.nominalSampleRate.rounded())
         }
     }
 
@@ -165,6 +181,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         var playbackBufferCalibrationProbe: PlaybackBufferCalibrationProbe?
         var playbackBufferInstabilityPersistenceGate = PlaybackBufferInstabilityPersistenceGate()
         var attemptedPlaybackTargetDownProbes: Set<PlaybackBufferOperatingPointKey> = []
+        var attemptedPlaybackFrameSizeDownProbes: Set<PlaybackBufferRouteKey> = []
+        var adaptivePlaybackRenderRecoveryAttempts = 0
+        var adaptivePlaybackRenderRecoveryHealthGeneration: UInt64?
     }
 
     private struct OutputRebuildPreparation {
@@ -193,6 +212,11 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     private enum PlaybackBufferAdaptationAction {
         case stabilize(PlaybackBufferCalibrationProbe)
         case renegotiate(PlaybackBufferRenegotiationPreparation)
+    }
+
+    private enum AdaptivePlaybackRenderRecoveryAction {
+        case restart(output: AudioOutputDevice, profile: EQProfile)
+        case fail(AudioEngineFailure)
     }
 
     private struct StaleOutputRebuild: Error {}
@@ -299,12 +323,15 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         private let playbackTimestampDiscontinuities = Atomic<UInt64>(0)
         private let playbackBufferRenegotiations = Atomic<UInt64>(0)
         private let adaptivePlaybackRenderFailures = Atomic<UInt64>(0)
+        private let adaptivePlaybackRenderFailureActive = Atomic<Bool>(false)
+        private let adaptivePlaybackRenderHealthGeneration = Atomic<UInt64>(0)
         private let playbackInstabilityGeneration = Atomic<UInt64>(0)
         private let latestPlaybackInstabilityReason = Atomic<UInt8>(PlaybackBufferInstabilityReason.underrun.rawValue)
         private let adaptivePlaybackTargetFrames: Atomic<Int>
         private let pendingPlaybackClockReset = Atomic<Bool>(true)
         private let pendingPlaybackTargetRetarget = Atomic<Bool>(false)
         private let playbackRateCorrectionPartsPerBillion = Atomic<Int64>(0)
+        private let playbackRateCorrectionSaturated = Atomic<Bool>(false)
         private let filteredPlaybackOccupancyMilliFrames = Atomic<Int64>(0)
         private let sampleRateConversionActive = Atomic<Bool>(false)
         private let bypassEnabled: Atomic<Bool>
@@ -431,6 +458,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             playbackSampleRateConverter = sampleRateConverter
             playbackSampleRatePlan = sampleRatePlan
             sampleRateConversionActive.store(sampleRateConverter != nil, ordering: .releasing)
+            adaptivePlaybackRenderFailureActive.store(false, ordering: .releasing)
             playbackPrimeFrames.store(targetFrames, ordering: .releasing)
             adaptivePlaybackTargetFrames.store(targetFrames, ordering: .releasing)
             pendingPlaybackTargetRetarget.store(false, ordering: .releasing)
@@ -448,6 +476,18 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
         func playbackTargetFrames() -> Int {
             adaptivePlaybackTargetFrames.load(ordering: .acquiring)
+        }
+
+        func maximumObservedCaptureCallbackFrames() -> Int {
+            maxCaptureCallbackFrames.load(ordering: .relaxed)
+        }
+
+        func hasActiveAdaptivePlaybackRenderFailure() -> Bool {
+            adaptivePlaybackRenderFailureActive.load(ordering: .acquiring)
+        }
+
+        func playbackRenderHealthGeneration() -> UInt64 {
+            adaptivePlaybackRenderHealthGeneration.load(ordering: .acquiring)
         }
 
         // Called when a new output half is started. Clears any transition mute (the runtime
@@ -489,6 +529,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             playbackTimestampDiscontinuities.store(0, ordering: .relaxed)
             playbackBufferRenegotiations.store(0, ordering: .relaxed)
             adaptivePlaybackRenderFailures.store(0, ordering: .relaxed)
+            playbackRateCorrectionSaturated.store(false, ordering: .relaxed)
             ringBuffer.resetOverwriteGateContentionFailureCount()
             playbackPriming.store(true, ordering: .releasing)
         }
@@ -502,6 +543,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 playbackUnderrunFrames: playbackUnderrunFrames.load(ordering: .relaxed),
                 droppedInputFrames: droppedInputFrames.load(ordering: .relaxed),
                 droppedBufferedFrames: droppedBufferedFrames.load(ordering: .relaxed),
+                ringGateContentionFailures: ringBuffer.overwriteGateContentionFailureCount(),
                 saturatedSamples: saturatedSamples.load(ordering: .relaxed),
                 currentBufferedFrames: ringBuffer.occupancyFrames(),
                 maxBufferedFrames: maxBufferedFrames.load(ordering: .relaxed),
@@ -516,10 +558,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 playbackTimestampDiscontinuities: playbackTimestampDiscontinuities.load(ordering: .relaxed),
                 playbackBufferRenegotiations: playbackBufferRenegotiations.load(ordering: .relaxed),
                 adaptivePlaybackRenderFailures: adaptivePlaybackRenderFailures.load(ordering: .relaxed),
-                ringGateContentionFailures: ringBuffer.overwriteGateContentionFailureCount(),
                 playbackRateCorrectionPPM: Double(
                     playbackRateCorrectionPartsPerBillion.load(ordering: .relaxed)
                 ) / 1_000,
+                playbackRateCorrectionSaturated: playbackRateCorrectionSaturated.load(ordering: .relaxed),
                 playbackOccupancyTargetFrames: adaptivePlaybackTargetFrames.load(ordering: .relaxed),
                 filteredPlaybackOccupancyFrames: Double(
                     filteredPlaybackOccupancyMilliFrames.load(ordering: .relaxed)
@@ -742,8 +784,11 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             var adaptiveRenderFailed = false
             switch result {
             case .rendered:
-                break
+                adaptivePlaybackRenderFailureActive.store(false, ordering: .releasing)
+                adaptivePlaybackRenderHealthGeneration.wrappingAdd(1, ordering: .releasing)
             case .underrun(let frames):
+                adaptivePlaybackRenderFailureActive.store(false, ordering: .releasing)
+                adaptivePlaybackRenderHealthGeneration.wrappingAdd(1, ordering: .releasing)
                 underrunFrames = frames
             case .failed:
                 adaptiveRenderFailed = true
@@ -754,6 +799,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 signalPlaybackInstability(.underrun)
             } else if adaptiveRenderFailed {
                 adaptivePlaybackRenderFailures.wrappingAdd(1, ordering: .relaxed)
+                if !adaptivePlaybackRenderFailureActive.exchange(true, ordering: .acquiringAndReleasing) {
+                    signalPlaybackInstability(.adaptiveRenderFailure)
+                }
             }
             if underrunFrames > 0 || adaptiveRenderFailed {
                 beginPlaybackReprime()
@@ -1010,6 +1058,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         private func publishAdaptivePlaybackMetrics() {
             playbackRateCorrectionPartsPerBillion.store(
                 Int64((playbackRateServo.correctionPartsPerMillion * 1_000).rounded()),
+                ordering: .relaxed
+            )
+            playbackRateCorrectionSaturated.store(
+                playbackRateServo.correctionIsSaturated,
                 ordering: .relaxed
             )
             filteredPlaybackOccupancyMilliFrames.store(
@@ -1332,6 +1384,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     private let control = Mutex(ControlState())
     private let playbackBufferRenegotiationHandler = Mutex<(@Sendable (PlaybackBufferRenegotiation) -> Void)?>(nil)
+    private let runtimeFailureHandler = Mutex<(@Sendable (AudioEngineFailure) -> Void)?>(nil)
     private let restorationStoreURL: URL
     private let playbackBufferCalibrationStoreURL: URL
     private let playbackBufferAdaptationQueue = DispatchQueue(
@@ -1596,6 +1649,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             state.attemptedPlaybackTargetDownProbes = Set(
                 state.attemptedPlaybackTargetDownProbes.filter { $0.outputUID != outputUID }
             )
+            state.attemptedPlaybackFrameSizeDownProbes = Set(
+                state.attemptedPlaybackFrameSizeDownProbes.filter { $0.outputUID != outputUID }
+            )
             guard let output = state.activeOutput,
                   output.uid == outputUID,
                   let profile = state.activeProfile else {
@@ -1617,14 +1673,25 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
     }
 
+    public func setRuntimeFailureHandler(
+        _ handler: (@Sendable (AudioEngineFailure) -> Void)?
+    ) {
+        runtimeFailureHandler.withLock { currentHandler in
+            currentHandler = handler
+        }
+    }
+
     private func stopLocked(_ state: inout ControlState) {
         state.runtime?.markStopping()
         stopOutputHalfLocked(&state)
         stopCaptureHalfLocked(&state)
         state.activeProfile = nil
         state.handledPlaybackInstabilityGeneration = 0
+        state.adaptivePlaybackRenderRecoveryAttempts = 0
+        state.adaptivePlaybackRenderRecoveryHealthGeneration = nil
         state.playbackBufferInstabilityPersistenceGate.reset()
         state.attemptedPlaybackTargetDownProbes.removeAll()
+        state.attemptedPlaybackFrameSizeDownProbes.removeAll()
         state.state = .stopped
         state.status = .stopped
     }
@@ -1810,7 +1877,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
         // Now that our output owns the device, apply the low-latency buffer size. The stream
         // restart it triggers happens under our muted IOProc, so it plays silence, not dry audio.
-        let tunedOutput = tuneBufferFrameSize(for: matchedOutput)
+        let allowsFrameSizeDownwardProbe = state.attemptedPlaybackFrameSizeDownProbes.insert(
+            PlaybackBufferRouteKey(output: matchedOutput)
+        ).inserted
+        let tunedOutput = tuneBufferFrameSize(
+            for: matchedOutput,
+            allowsDownwardProbe: allowsFrameSizeDownwardProbe
+        )
         state.activeOutput = tunedOutput
         let operatingPointKey = PlaybackBufferOperatingPointKey(output: tunedOutput)
         let allowsDownwardProbe = state.attemptedPlaybackTargetDownProbes.insert(
@@ -1821,6 +1894,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             tapSampleRate: runtime.sampleRate,
             allowsDownwardProbe: allowsDownwardProbe
         )
+        // Capture applies prepared configs and retires their boxes. Output switches are a safe
+        // control-path opportunity to release those boxes before publishing the next config.
+        runtime.drainDSPConfigBoxes()
         runtime.publishPendingDSPConfig(EQRenderConfiguration(
             profile: Self.dspProfile(from: preparation.profile),
             sampleRate: runtime.sampleRate,
@@ -2287,17 +2363,22 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         return try rebuild()
     }
 
-    private func tuneBufferFrameSize(for output: AudioOutputDevice) -> AudioOutputDevice {
+    private func tuneBufferFrameSize(
+        for output: AudioOutputDevice,
+        allowsDownwardProbe: Bool
+    ) -> AudioOutputDevice {
         do {
             let range = try CoreAudioDeviceQuery.bufferFrameSizeRangeValue(objectID: output.id)
-            let calibratedFrameSize = PersistedPlaybackBufferCalibrationStore.preferredFrameSize(
+            let calibration = PersistedPlaybackBufferCalibrationStore.calibration(
                 outputUID: output.uid,
                 sampleRate: output.nominalSampleRate,
                 from: playbackBufferCalibrationStoreURL
             )
-            let requested = clampedBufferFrameSize(
-                max(Self.preferredBufferFrameSize(for: output), calibratedFrameSize ?? 0),
-                range: range
+            let requested = AdaptivePlaybackBufferPolicy.startupFrameSize(
+                preferredFrameSize: Self.preferredBufferFrameSize(for: output),
+                calibration: calibration,
+                supportedRange: range,
+                allowsDownwardProbe: allowsDownwardProbe
             )
             guard requested != output.bufferFrameSize else {
                 return output
@@ -2356,7 +2437,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             from: playbackBufferCalibrationStoreURL
         )
         let targetFrames = AdaptivePlaybackBufferPolicy.startupTargetFrames(
-            callbackFrames: output.bufferFrameSize,
+            callbackFrames: Self.playbackInputCallbackFrames(
+                for: output,
+                tapSampleRate: tapSampleRate
+            ),
             baselineTargetFrames: baseline,
             operatingPoint: calibration?.operatingPoint(for: output.bufferFrameSize),
             allowsDownwardProbe: allowsDownwardProbe
@@ -2405,6 +2489,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 return nil
             }
 
+            if let recoveryGeneration = state.adaptivePlaybackRenderRecoveryHealthGeneration,
+               runtime.playbackRenderHealthGeneration() != recoveryGeneration {
+                state.adaptivePlaybackRenderRecoveryAttempts = 0
+                state.adaptivePlaybackRenderRecoveryHealthGeneration = nil
+            }
+
             let instability = runtime.playbackInstabilitySnapshot()
             if instability.generation == state.handledPlaybackInstabilityGeneration {
                 guard let probe = state.playbackBufferCalibrationProbe,
@@ -2447,6 +2537,11 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             return
         case .renegotiate(let pendingRenegotiation):
             preparation = pendingRenegotiation
+        }
+
+        if preparation.reason == .adaptiveRenderFailure {
+            recoverAdaptivePlaybackRenderFailure(preparation)
+            return
         }
 
         if increasePlaybackTargetIfPossible(preparation) {
@@ -2575,8 +2670,17 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             let previousTargetFrames = preparation.runtime.playbackTargetFrames()
             guard let targetFrames = AdaptivePlaybackBufferPolicy.nextTargetFrames(
                 for: preparation.reason,
-                callbackFrames: preparation.output.bufferFrameSize,
-                after: previousTargetFrames
+                callbackFrames: Self.playbackInputCallbackFrames(
+                    for: preparation.output,
+                    tapSampleRate: preparation.runtime.sampleRate
+                ),
+                after: previousTargetFrames,
+                maximumReservoirFrames: Self.isLowSampleRateRoute(preparation.output)
+                    ? max(
+                        Self.preferredLowSampleRatePlaybackReservoirFrames,
+                        preparation.runtime.maximumObservedCaptureCallbackFrames()
+                    )
+                    : AdaptivePlaybackBufferPolicy.maximumReservoirFrames
             ) else {
                 return nil
             }
@@ -2678,11 +2782,65 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
     }
 
+    private func recoverAdaptivePlaybackRenderFailure(
+        _ preparation: PlaybackBufferRenegotiationPreparation
+    ) {
+        let action = control.withLock { state -> AdaptivePlaybackRenderRecoveryAction? in
+            guard state.outputRebuildGeneration == preparation.outputRebuildGeneration,
+                  state.runtime === preparation.runtime,
+                  state.activeOutput == preparation.output,
+                  preparation.runtime.hasActiveAdaptivePlaybackRenderFailure(),
+                  let profile = state.activeProfile else {
+                return nil
+            }
+            if AdaptivePlaybackRenderRecoveryPolicy.shouldRestart(
+                afterCompletedAttempts: state.adaptivePlaybackRenderRecoveryAttempts
+            ) {
+                state.adaptivePlaybackRenderRecoveryAttempts += 1
+                state.adaptivePlaybackRenderRecoveryHealthGeneration = preparation.runtime
+                    .playbackRenderHealthGeneration()
+                return .restart(output: preparation.output, profile: profile)
+            }
+
+            let failure = AudioEngineFailure(
+                category: .coreAudioOperationFailed,
+                userMessage: "Adaptive playback rendering repeatedly failed, so GlassEQ stopped processing audio.",
+                operation: "AdaptivePlaybackRender"
+            )
+            stopLocked(&state)
+            state.state = .failed(failure.description)
+            state.status = .failed(failure)
+            return .fail(failure)
+        }
+        guard let action else {
+            return
+        }
+
+        switch action {
+        case .restart(let output, let profile):
+            do {
+                try start(output: output, profile: profile)
+            } catch {
+                let failure = control.withLock { state in
+                    if case .failed(let failure) = state.status {
+                        return failure
+                    }
+                    return audioEngineFailure(from: error)
+                }
+                runtimeFailureHandler.withLock { $0 }?(failure)
+            }
+        case .fail(let failure):
+            updatePlaybackBufferAdaptationTimer()
+            runtimeFailureHandler.withLock { $0 }?(failure)
+        }
+    }
+
     static func renegotiatedPlaybackOutput(
         _ output: AudioOutputDevice,
         supportedRange: AudioBufferFrameSizeRange,
         setBufferFrameSize: (UInt32, AudioObjectID) throws -> Void = CoreAudioDeviceQuery.setBufferFrameSize(_:objectID:),
-        queryOutput: (AudioObjectID) throws -> AudioOutputDevice = CoreAudioDeviceQuery.outputDevice(id:)
+        queryOutput: (AudioObjectID) throws -> AudioOutputDevice = CoreAudioDeviceQuery.outputDevice(id:),
+        waitForPropertySettlement: () -> Void = { Thread.sleep(forTimeInterval: 0.01) }
     ) throws -> AudioOutputDevice? {
         guard let requestedFrameSize = AdaptivePlaybackBufferPolicy.nextFrameSize(
             after: output.bufferFrameSize,
@@ -2692,12 +2850,17 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
 
         try setBufferFrameSize(requestedFrameSize, output.id)
-        let updatedOutput = try queryOutput(output.id)
-        guard updatedOutput.id == output.id,
-              updatedOutput.bufferFrameSize > output.bufferFrameSize else {
-            return nil
+        for attempt in 0..<3 {
+            let updatedOutput = try queryOutput(output.id)
+            if updatedOutput.id == output.id,
+               updatedOutput.bufferFrameSize > output.bufferFrameSize {
+                return updatedOutput
+            }
+            if attempt < 2 {
+                waitForPropertySettlement()
+            }
         }
-        return updatedOutput
+        return nil
     }
 
     static func preferredBufferFrameSize(for output: AudioOutputDevice) -> UInt32 {
@@ -2725,7 +2888,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             return max(
                 sampleRatePlan.inputFrames(forOutputFrames: Int(Self.preferredLowSampleRateBufferFrameSize)),
                 sampleRatePlan.inputFrames(forOutputFrames: outputCallbackFrames)
-                    + Self.preferredBluetoothPlaybackReservoirFrames
+                    + Self.preferredLowSampleRatePlaybackReservoirFrames
             )
         }
         if output.isBluetoothTransport {
@@ -2741,7 +2904,17 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     }
 
     static func shouldAdaptPlaybackBuffer(for output: AudioOutputDevice) -> Bool {
-        !isLowSampleRateRoute(output)
+        output.nominalSampleRate > 0
+    }
+
+    static func playbackInputCallbackFrames(
+        for output: AudioOutputDevice,
+        tapSampleRate: Double
+    ) -> UInt32 {
+        UInt32(clamping: PlaybackSampleRatePlan(
+            inputSampleRate: tapSampleRate,
+            outputSampleRate: output.nominalSampleRate
+        ).inputFrames(forOutputFrames: Int(output.bufferFrameSize)))
     }
 
     static func shouldUseSampleRateConversion(
@@ -2753,10 +2926,6 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     private static func isLowSampleRateRoute(_ output: AudioOutputDevice) -> Bool {
         output.nominalSampleRate > 0 && output.nominalSampleRate <= Self.lowSampleRateThreshold
-    }
-
-    private func clampedBufferFrameSize(_ frameSize: UInt32, range: AudioBufferFrameSizeRange) -> UInt32 {
-        min(max(frameSize, range.minimum), range.maximum)
     }
 
     private func createTopologyRebuildMuteGuard() throws -> any TopologyRebuildMuteGuarding {

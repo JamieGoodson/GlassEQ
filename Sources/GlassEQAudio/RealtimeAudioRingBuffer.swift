@@ -239,7 +239,9 @@ public final class RealtimeAudioRingBuffer: @unchecked Sendable {
     // a callback deadline and a bounded spin is safe on a realtime thread. Giving up costs a whole
     // callback (silence out, or an incoming capture block dropped), which is why the spin exists
     // rather than failing on the first missed exchange.
-    private static let overwriteGateSpinLimit = 256
+    // A reader holds the gate across one callback-sized memcpy. Leave ample headroom over the
+    // normal 1,024–2,048-frame copy while keeping the wait bounded on a realtime thread.
+    private static let overwriteGateSpinLimit = 4_096
 
     private func enterOverwriteGate() -> Bool {
         for _ in 0..<Self.overwriteGateSpinLimit {

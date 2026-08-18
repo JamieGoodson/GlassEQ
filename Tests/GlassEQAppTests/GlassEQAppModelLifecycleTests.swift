@@ -79,6 +79,31 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func runtimeEngineFailureStopsTheModelAndSurfacesItsStatus() async {
+        let output = makeOutput(uid: "runtime-output", name: "Runtime Output")
+        let engine = FakeAudioEngine()
+        engine.state = .running(output: output)
+        let model = makeModel(engine: engine)
+        model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running
+        }
+        let failure = AudioEngineFailure(
+            category: .coreAudioOperationFailed,
+            userMessage: "Adaptive playback rendering repeatedly failed.",
+            operation: "AdaptivePlaybackRender"
+        )
+
+        engine.emitRuntimeFailure(failure)
+        await waitUntil {
+            model.lifecycleState == .stopped
+        }
+
+        #expect(!model.isRunning)
+        #expect(model.statusMessage == localized("Audio engine failed: \(failure.userMessage)"))
+    }
+
+    @Test
     func settingsRetryDisabledActiveProfileDoesNotStartEngine() async throws {
         var disabled = makeProfile(name: "Disabled")
         disabled.isBypassed = true
@@ -1236,7 +1261,11 @@ struct GlassEQAppModelLifecycleTests {
     @Test
     func metricsPollingCommandReturnsNoSnapshotAndPublishesImmediateMetrics() async throws {
         let engine = FakeAudioEngine()
-        engine.metrics = AudioEngineMetrics(capturedFrames: 123, playedFrames: 100)
+        engine.metrics = AudioEngineMetrics(
+            capturedFrames: 123,
+            playedFrames: 100,
+            ringGateContentionFailures: 2
+        )
         let model = makeModel(engine: engine)
 
         let response = try await model.performSettingsCommand(.startMetricsPolling)
@@ -1244,6 +1273,7 @@ struct GlassEQAppModelLifecycleTests {
         #expect(response.snapshot == nil)
         #expect(model.engineMetrics.capturedFrames == 123)
         #expect(model.engineMetrics.playedFrames == 100)
+        #expect(model.engineMetrics.ringGateContentionFailures == 2)
         model.stopMetricsPolling()
     }
 
@@ -1496,6 +1526,26 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsHelperExitBeforeConnectingRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: ProcessSettingsHelperLauncher(),
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("exited before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
     func activeInProcessSettingsFallbackIsReusedWithoutLaunchingHelper() {
         let model = makeModel()
 
@@ -1503,6 +1553,17 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.openSettings() == .activeInProcessFallback)
 
         model.inProcessSettingsDidDisappear()
+    }
+
+    @Test
+    func pendingInProcessSettingsFallbackIsReusedWithoutLaunchingHelper() {
+        let model = makeModel()
+
+        model.requestInProcessSettingsPresentation()
+        let firstGeneration = model.inProcessSettingsPresentationGeneration
+
+        #expect(model.openSettings() == .activeInProcessFallback)
+        #expect(model.inProcessSettingsPresentationGeneration == firstGeneration + 1)
     }
 
     @Test
@@ -1868,7 +1929,7 @@ private struct FailingSettingsHelperLaunchValidator: SettingsHelperLaunchValidat
 
 private struct PermissiveSettingsHelperLaunchValidator: SettingsHelperLaunchValidating {
     func validatedExecutableURL(for helperURL: URL) throws -> URL {
-        URL(fileURLWithPath: "/bin/true")
+        URL(fileURLWithPath: "/usr/bin/true")
     }
 
     func validateRunningProcess(processIdentifier: pid_t, expectedHelperURL: URL) throws {}
@@ -2112,6 +2173,7 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
     private var _metrics = AudioEngineMetrics()
     private var _bufferRenegotiationHandler: (@Sendable (PlaybackBufferRenegotiation) -> Void)?
     private var _events: [String] = []
+    private var _runtimeFailureHandler: (@Sendable (AudioEngineFailure) -> Void)?
 
     var state: AudioEngineState {
         get { withLock { _state } }
@@ -2242,6 +2304,10 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         blocker?.unblock()
     }
 
+    func emitRuntimeFailure(_ failure: AudioEngineFailure) {
+        withLock { _runtimeFailureHandler }?(failure)
+    }
+
     func start(output: AudioOutputDevice, profile: EQProfile) throws {
         let startControl = withLock {
             _events.append("start:\(output.uid)")
@@ -2306,6 +2372,14 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         withLock {
             _events.append("mute")
             _muteOutputCallCount += 1
+        }
+    }
+
+    func setRuntimeFailureHandler(
+        _ handler: (@Sendable (AudioEngineFailure) -> Void)?
+    ) {
+        withLock {
+            _runtimeFailureHandler = handler
         }
     }
 

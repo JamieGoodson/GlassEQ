@@ -77,12 +77,42 @@ func parseEditableNumber(_ text: String, locale: Locale = .autoupdatingCurrent) 
     let formatter = NumberFormatter()
     formatter.locale = locale
     formatter.numberStyle = .decimal
-    let parsed = formatter.number(from: trimmed)?.doubleValue
-        ?? Double(trimmed.replacingOccurrences(of: ",", with: "."))
+    if let groupingSeparator = formatter.groupingSeparator,
+       !groupingSeparator.isEmpty,
+       groupingSeparator != formatter.decimalSeparator,
+       trimmed.contains(groupingSeparator) {
+        return nil
+    }
+
+    var normalized = trimmed
+    if let decimalSeparator = formatter.decimalSeparator,
+       decimalSeparator != "." {
+        normalized = normalized.replacingOccurrences(of: decimalSeparator, with: ".")
+    }
+    if let minusSign = formatter.minusSign,
+       minusSign != "-" {
+        normalized = normalized.replacingOccurrences(of: minusSign, with: "-")
+    }
+    if let plusSign = formatter.plusSign,
+       plusSign != "+" {
+        normalized = normalized.replacingOccurrences(of: plusSign, with: "+")
+    }
+    let parsed = Double(normalized)
     guard let parsed, parsed.isFinite else {
         return nil
     }
     return parsed
+}
+
+func clampedEditableNumber(
+    _ text: String,
+    range: ClosedRange<Double>,
+    locale: Locale = .autoupdatingCurrent
+) -> Double? {
+    guard let parsed = parseEditableNumber(text, locale: locale) else {
+        return nil
+    }
+    return min(max(parsed, range.lowerBound), range.upperBound)
 }
 
 private func localizedInteger(_ value: Int) -> String {
@@ -1837,11 +1867,12 @@ private struct ParametricFilterInspector: View {
 
 // Quantizes slider output in the binding instead of passing `step:` to Slider — stepped macOS
 // sliders render a tick mark per step, which draws a dense line of dots under the track.
-private func quantized(_ value: Double, step: Double) -> Double {
+func quantized(_ value: Double, step: Double) -> Double {
     guard step > 0 else {
         return value
     }
-    return (value / step).rounded() * step
+    let scale = 1 / step
+    return (value * scale).rounded() / scale
 }
 
 private enum SliderScale {
@@ -1944,6 +1975,9 @@ private struct EditableValueText: View {
                     .onExitCommand {
                         isEditing = false
                     }
+                    .onChange(of: editText) { _, text in
+                        updateValue(from: text)
+                    }
                     .onChange(of: isFocused) { _, focused in
                         if !focused {
                             commit()
@@ -1977,11 +2011,16 @@ private struct EditableValueText: View {
         guard isEditing else {
             return
         }
+        updateValue(from: editText)
         isEditing = false
-        guard let parsed = parseEditableNumber(editText) else {
+    }
+
+    private func updateValue(from text: String) {
+        guard isEditing,
+              let parsed = clampedEditableNumber(text, range: range) else {
             return
         }
-        value = min(max(parsed, range.lowerBound), range.upperBound)
+        value = parsed
     }
 }
 

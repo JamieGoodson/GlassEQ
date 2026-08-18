@@ -252,6 +252,7 @@ private func printMetrics(_ metrics: AudioEngineMetrics, fallbackSampleRate: Dou
     print("Playback underrun frames: \(metrics.playbackUnderrunFrames)")
     print("Dropped input frames: \(metrics.droppedInputFrames)")
     print("Dropped buffered frames: \(metrics.droppedBufferedFrames)")
+    print("Ring gate contention failures: \(metrics.ringGateContentionFailures)")
     print("Saturated samples: \(metrics.saturatedSamples)")
     print("Buffered frames at stop: \(metrics.currentBufferedFrames)")
     print("Max ring buffered frames: \(metrics.maxBufferedFrames)")
@@ -262,8 +263,8 @@ private func printMetrics(_ metrics: AudioEngineMetrics, fallbackSampleRate: Dou
     print("Playback buffer renegotiations: \(metrics.playbackBufferRenegotiations)")
     print("Adaptive playback render failures: \(metrics.adaptivePlaybackRenderFailures)")
     print("Sample-rate conversion active: \(metrics.playbackSampleRateConversionActive)")
-    print("Ring gate contention failures: \(metrics.ringGateContentionFailures)")
     print(String(format: "Playback rate correction: %+.2f ppm", metrics.playbackRateCorrectionPPM))
+    print("Playback rate correction saturated: \(metrics.playbackRateCorrectionSaturated)")
     print("Playback occupancy target: \(metrics.playbackOccupancyTargetFrames) frames")
     print(String(format: "Filtered playback occupancy: %.2f frames", metrics.filteredPlaybackOccupancyFrames))
     print(String(
