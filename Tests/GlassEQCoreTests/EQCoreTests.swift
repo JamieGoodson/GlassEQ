@@ -58,6 +58,96 @@ struct EQCoreTests {
     }
 
     @Test
+    func routeFrequencyPolicyKeepsFiltersInsideNyquistGuardBand() {
+        #expect(EQRouteFrequencyPolicy.maximumUsableFrequency(sampleRate: 48_000) == 20_000)
+        #expect(EQRouteFrequencyPolicy.maximumUsableFrequency(sampleRate: 44_100) == 19_845)
+        #expect(EQRouteFrequencyPolicy.maximumUsableFrequency(sampleRate: 16_000) == 7_200)
+    }
+
+    @Test
+    func outOfBandFilterRendersAsIdentityWithoutChangingProfileFrequency() {
+        let filter = EQFilter(kind: .peak, frequency: 20_000, gainDB: 12, q: 8)
+
+        let lowRateCoefficients = BiquadCoefficients.make(filter: filter, sampleRate: 44_100)
+        let fullRateCoefficients = BiquadCoefficients.make(filter: filter, sampleRate: 48_000)
+
+        #expect(lowRateCoefficients == .identity)
+        #expect(fullRateCoefficients != .identity)
+        #expect(filter.frequency == 20_000)
+    }
+
+    @Test
+    func outputRouteCeilingDisablesFilterWithoutChangingDSPRateOrTopology() {
+        let profile = EQProfile(
+            name: "Low-rate route",
+            mode: .parametric,
+            filters: [EQFilter(kind: .highShelf, frequency: 8_000, gainDB: 12, q: 0.7)]
+        )
+        let fullRate = EQRenderConfiguration(
+            profile: profile,
+            sampleRate: 48_000,
+            channelCount: 2
+        )
+        let lowRateRoute = EQRenderConfiguration(
+            profile: profile,
+            sampleRate: 48_000,
+            channelCount: 2,
+            maximumUsableFrequency: 7_200
+        )
+
+        #expect(fullRate.configuration.coefficients[0] != .identity)
+        #expect(lowRateRoute.configuration.sampleRate == 48_000)
+        #expect(lowRateRoute.configuration.maximumUsableFrequency == 7_200)
+        #expect(lowRateRoute.configuration.coefficients == [.identity])
+        #expect(lowRateRoute.hasRealtimeCompatibleTopology(with: fullRate))
+    }
+
+    @Test
+    func frequencyResponseStopsAtRouteCeilingAndIgnoresOutOfBandFilters() {
+        let filter = EQFilter(kind: .highShelf, frequency: 8_000, gainDB: 12, q: 0.7)
+
+        let points = FrequencyResponse.points(
+            for: [filter],
+            preampDB: -3,
+            sampleRate: 16_000,
+            count: 8
+        )
+
+        #expect(abs((points.last?.frequency ?? 0) - 7_200) < 0.000_000_001)
+        #expect(points.allSatisfy { abs($0.magnitudeDB + 3) < 0.000_000_001 })
+    }
+
+    @Test
+    func inactiveFilterCountUsesCurrentChannelModeAndIgnoresDisabledFilters() {
+        let linkedProfile = EQProfile(
+            name: "Linked",
+            mode: .parametric,
+            filters: [
+                EQFilter(kind: .peak, frequency: 6_000, gainDB: 3),
+                EQFilter(kind: .peak, frequency: 8_000, gainDB: 3),
+                EQFilter(kind: .peak, frequency: 20_000, gainDB: 3, isEnabled: false)
+            ]
+        )
+        let stereoProfile = EQProfile(
+            name: "Stereo",
+            mode: .parametric,
+            channelMode: .stereo,
+            filters: [],
+            leftFilters: [EQFilter(kind: .peak, frequency: 8_000, gainDB: 3)],
+            rightFilters: [EQFilter(kind: .peak, frequency: 20_000, gainDB: 3)]
+        )
+
+        #expect(EQRouteFrequencyPolicy.inactiveEnabledFilterCount(
+            profile: linkedProfile,
+            sampleRate: 16_000
+        ) == 1)
+        #expect(EQRouteFrequencyPolicy.inactiveEnabledFilterCount(
+            profile: stereoProfile,
+            sampleRate: 16_000
+        ) == 2)
+    }
+
+    @Test
     func recommendedPreampUsesLouderStereoChannel() {
         let profile = EQProfile(
             name: "Stereo Headroom",

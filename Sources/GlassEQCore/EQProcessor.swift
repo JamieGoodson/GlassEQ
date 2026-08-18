@@ -4,35 +4,58 @@ public struct EQChannelConfiguration: Equatable, Sendable {
     public var preampLinearGain: Float
     public var coefficients: [BiquadCoefficients]
 
-    public init(preampDB: Double, filters: [EQFilter], sampleRate: Double) {
+    public init(
+        preampDB: Double,
+        filters: [EQFilter],
+        sampleRate: Double,
+        maximumUsableFrequency: Double? = nil
+    ) {
         self.preampLinearGain = Float(pow(10, preampDB / 20))
         self.coefficients = filters
             .filter(\.isEnabled)
-            .map { BiquadCoefficients.make(filter: $0, sampleRate: sampleRate) }
+            .map {
+                BiquadCoefficients.make(
+                    filter: $0,
+                    sampleRate: sampleRate,
+                    maximumUsableFrequency: maximumUsableFrequency
+                )
+            }
     }
 }
 
 public struct EQConfiguration: Equatable, Sendable {
     public var sampleRate: Double
+    public var maximumUsableFrequency: Double
     public var channelCount: Int
     public var preampLinearGain: Float
     public var coefficients: [BiquadCoefficients]
     public var channelConfigurations: [EQChannelConfiguration]
     public var isBypassed: Bool
 
-    public init(profile: EQProfile, sampleRate: Double, channelCount: Int) {
+    public init(
+        profile: EQProfile,
+        sampleRate: Double,
+        channelCount: Int,
+        maximumUsableFrequency: Double? = nil
+    ) {
         self.sampleRate = sampleRate
+        self.maximumUsableFrequency = min(
+            EQRouteFrequencyPolicy.maximumUsableFrequency(sampleRate: sampleRate),
+            maximumUsableFrequency ?? .greatestFiniteMagnitude
+        )
         self.channelCount = max(channelCount, 1)
         let linkedConfiguration = EQChannelConfiguration(
             preampDB: profile.preampDB,
             filters: profile.filters,
-            sampleRate: sampleRate
+            sampleRate: sampleRate,
+            maximumUsableFrequency: self.maximumUsableFrequency
         )
         self.preampLinearGain = linkedConfiguration.preampLinearGain
         self.coefficients = linkedConfiguration.coefficients
         self.channelConfigurations = Self.makeChannelConfigurations(
             profile: profile,
             sampleRate: sampleRate,
+            maximumUsableFrequency: self.maximumUsableFrequency,
             channelCount: self.channelCount,
             linkedConfiguration: linkedConfiguration
         )
@@ -42,6 +65,7 @@ public struct EQConfiguration: Equatable, Sendable {
     private static func makeChannelConfigurations(
         profile: EQProfile,
         sampleRate: Double,
+        maximumUsableFrequency: Double,
         channelCount: Int,
         linkedConfiguration: EQChannelConfiguration
     ) -> [EQChannelConfiguration] {
@@ -52,12 +76,14 @@ public struct EQConfiguration: Equatable, Sendable {
         let left = EQChannelConfiguration(
             preampDB: profile.leftPreampDB,
             filters: profile.leftFilters,
-            sampleRate: sampleRate
+            sampleRate: sampleRate,
+            maximumUsableFrequency: maximumUsableFrequency
         )
         let right = EQChannelConfiguration(
             preampDB: profile.rightPreampDB,
             filters: profile.rightFilters,
-            sampleRate: sampleRate
+            sampleRate: sampleRate,
+            maximumUsableFrequency: maximumUsableFrequency
         )
 
         return (0..<channelCount).map { channel in
@@ -80,8 +106,18 @@ public struct EQRenderConfiguration: Equatable, Sendable {
     var channelFilterCounts: [Int]
     var preampLinearGains: [Float]
 
-    public init(profile: EQProfile, sampleRate: Double, channelCount: Int) {
-        self.init(configuration: EQConfiguration(profile: profile, sampleRate: sampleRate, channelCount: channelCount))
+    public init(
+        profile: EQProfile,
+        sampleRate: Double,
+        channelCount: Int,
+        maximumUsableFrequency: Double? = nil
+    ) {
+        self.init(configuration: EQConfiguration(
+            profile: profile,
+            sampleRate: sampleRate,
+            channelCount: channelCount,
+            maximumUsableFrequency: maximumUsableFrequency
+        ))
     }
 
     public init(configuration: EQConfiguration) {

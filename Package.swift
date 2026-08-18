@@ -25,7 +25,8 @@ let package = Package(
             name: "GlassEQAudio",
             dependencies: ["GlassEQCore"],
             linkerSettings: [
-                .linkedFramework("CoreAudio")
+                .linkedFramework("CoreAudio"),
+                .linkedFramework("AudioToolbox")
             ]
         ),
         .target(
