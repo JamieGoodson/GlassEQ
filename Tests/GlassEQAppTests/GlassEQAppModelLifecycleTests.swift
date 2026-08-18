@@ -487,7 +487,10 @@ struct GlassEQAppModelLifecycleTests {
         await waitUntil {
             model.lifecycleState == .running
                 && model.currentOutputUID == secondOutput.uid
-                && engine.startCalls.contains { $0.output == secondOutput }
+                && engine.state == .running(output: secondOutput)
+                && model.statusMessage == localized(
+                    "Processing \(secondOutput.name) with \(model.activeProfile.name)"
+                )
         }
 
         #expect(model.currentOutputUID == secondOutput.uid)
