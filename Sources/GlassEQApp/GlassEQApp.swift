@@ -23,6 +23,9 @@ struct GlassEQApp: App {
                 .accessibilityLabel(Text(model.menuBarAccessibilityLabel))
                 .accessibilityValue(Text(model.statusMessage))
                 .accessibilityHint(Text(localized("Opens GlassEQ controls")))
+                .background {
+                    InProcessSettingsPresenter(model: model)
+                }
         }
         .menuBarExtraStyle(.window)
 
@@ -30,16 +33,34 @@ struct GlassEQApp: App {
             SettingsView(model: model.inProcessSettingsViewModel())
                 .frame(minWidth: 760, minHeight: 500)
                 .onAppear {
+                    NSApplication.shared.setActivationPolicy(.regular)
                     model.inProcessSettingsDidAppear()
                 }
                 .onDisappear {
                     model.inProcessSettingsDidDisappear()
+                    NSApplication.shared.setActivationPolicy(.accessory)
                 }
         }
         .defaultSize(width: 1180, height: 720)
         .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
         .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+    }
+}
+
+private struct InProcessSettingsPresenter: View {
+    let model: GlassEQAppModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onChange(of: model.inProcessSettingsPresentationGeneration) {
+                NSApplication.shared.setActivationPolicy(.regular)
+                openWindow(id: GlassEQWindowID.inProcessSettings)
+                NSApplication.shared.activate(ignoringOtherApps: true)
+            }
     }
 }
 
@@ -401,6 +422,8 @@ final class GlassEQAppModel {
     @ObservationIgnored lazy var settingsCoordinator = SettingsCoordinator(model: self)
     @ObservationIgnored var inProcessSettingsViewModelStorage: GlassEQSettingsViewModel?
     @ObservationIgnored var inProcessSettingsIsPresented = false
+    @ObservationIgnored var inProcessSettingsPresentationIsPending = false
+    var inProcessSettingsPresentationGeneration = 0
 
     private enum ProfilePersistenceMode: Equatable, Sendable {
         case normal
@@ -1889,7 +1912,6 @@ final class GlassEQAppModel {
 private struct MenuBarView: View {
     @Bindable var model: GlassEQAppModel
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.openWindow) private var openWindow
     @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
@@ -1937,13 +1959,7 @@ private struct MenuBarView: View {
 
                 Button {
                     dismiss()
-                    switch model.openSettings() {
-                    case .helper:
-                        break
-                    case .inProcessFallback, .activeInProcessFallback:
-                        openWindow(id: GlassEQWindowID.inProcessSettings)
-                        NSApplication.shared.activate(ignoringOtherApps: true)
-                    }
+                    model.openSettings()
                 } label: {
                     Label(localized("Settings"), systemImage: "slider.horizontal.3")
                         .frame(minWidth: 86, minHeight: 28)

@@ -1343,6 +1343,26 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsHelperExitBeforeConnectingRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: ProcessSettingsHelperLauncher(),
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("exited before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
     func activeInProcessSettingsFallbackIsReusedWithoutLaunchingHelper() {
         let model = makeModel()
 
@@ -1350,6 +1370,17 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.openSettings() == .activeInProcessFallback)
 
         model.inProcessSettingsDidDisappear()
+    }
+
+    @Test
+    func pendingInProcessSettingsFallbackIsReusedWithoutLaunchingHelper() {
+        let model = makeModel()
+
+        model.requestInProcessSettingsPresentation()
+        let firstGeneration = model.inProcessSettingsPresentationGeneration
+
+        #expect(model.openSettings() == .activeInProcessFallback)
+        #expect(model.inProcessSettingsPresentationGeneration == firstGeneration + 1)
     }
 
     @Test
@@ -1698,7 +1729,7 @@ private struct FailingSettingsHelperLaunchValidator: SettingsHelperLaunchValidat
 
 private struct PermissiveSettingsHelperLaunchValidator: SettingsHelperLaunchValidating {
     func validatedExecutableURL(for helperURL: URL) throws -> URL {
-        URL(fileURLWithPath: "/bin/true")
+        URL(fileURLWithPath: "/usr/bin/true")
     }
 
     func validateRunningProcess(processIdentifier: pid_t, expectedHelperURL: URL) throws {}
