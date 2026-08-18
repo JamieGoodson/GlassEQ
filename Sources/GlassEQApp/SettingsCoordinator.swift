@@ -943,6 +943,11 @@ extension GlassEQAppModel {
     }
 
     func performSettingsCommand(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
+        try beginSettingsCommand()
+        defer {
+            finishSettingsCommand()
+        }
+
         switch command {
         case .createProfile(let kind):
             try createProfile(kind: kind)
