@@ -1966,6 +1966,7 @@ private struct EditableValueText: View {
 
     @State private var isEditing = false
     @State private var editText = ""
+    @State private var editSession = EditableValueEditSession()
     @FocusState private var isFocused: Bool
 
     var body: some View {
@@ -1981,10 +1982,21 @@ private struct EditableValueText: View {
                     }
                     .onSubmit(commit)
                     .onExitCommand {
+                        if let originalValue = editSession.cancel() {
+                            value = originalValue
+                        }
                         isEditing = false
                     }
                     .onChange(of: editText) { _, text in
                         updateValue(from: text)
+                    }
+                    .onChange(of: value) { _, newValue in
+                        guard isEditing,
+                              editSession.valueChanged(newValue) else {
+                            return
+                        }
+                        editText = editableNumberText(newValue)
+                        isEditing = false
                     }
                     .onChange(of: isFocused) { _, focused in
                         if !focused {
@@ -1994,6 +2006,7 @@ private struct EditableValueText: View {
             } else {
                 Button {
                     editText = editableText
+                    editSession.begin(value: value)
                     isEditing = true
                 } label: {
                     Text(display)
@@ -2020,6 +2033,7 @@ private struct EditableValueText: View {
             return
         }
         updateValue(from: editText)
+        editSession.finish()
         isEditing = false
     }
 
@@ -2028,7 +2042,42 @@ private struct EditableValueText: View {
               let parsed = clampedEditableNumber(text, range: range) else {
             return
         }
+        editSession.recordTextDrivenValue(parsed)
         value = parsed
+    }
+}
+
+struct EditableValueEditSession: Equatable {
+    private var originalValue: Double?
+    private var textDrivenValue: Double?
+
+    mutating func begin(value: Double) {
+        originalValue = value
+        textDrivenValue = nil
+    }
+
+    mutating func recordTextDrivenValue(_ value: Double) {
+        textDrivenValue = value
+    }
+
+    mutating func valueChanged(_ value: Double) -> Bool {
+        if textDrivenValue == value {
+            textDrivenValue = nil
+            return false
+        }
+        finish()
+        return true
+    }
+
+    mutating func cancel() -> Double? {
+        let value = originalValue
+        finish()
+        return value
+    }
+
+    mutating func finish() {
+        originalValue = nil
+        textDrivenValue = nil
     }
 }
 
