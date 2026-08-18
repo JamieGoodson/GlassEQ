@@ -1299,7 +1299,7 @@ struct GlassEQAppModelLifecycleTests {
             settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
         )
 
-        coordinator.openSettings()
+        let disposition = coordinator.openSettings()
 
         let process = try #require(launcher.launchedProcesses.first)
         defer {
@@ -1308,6 +1308,11 @@ struct GlassEQAppModelLifecycleTests {
             }
         }
         #expect(!coordinator.hasActiveSessionResourcesForTesting)
+        if case .inProcessFallback(let reason) = disposition {
+            #expect(reason.contains("Intentional post-launch validation failure"))
+        } else {
+            Issue.record("Expected in-process Settings fallback")
+        }
         for _ in 0..<250 {
             if !process.isRunning {
                 break
@@ -1315,7 +1320,42 @@ struct GlassEQAppModelLifecycleTests {
             try? await Task.sleep(for: .milliseconds(10))
         }
         #expect(!process.isRunning)
-        #expect(model.statusMessage.contains("Settings failed to open"))
+    }
+
+    @Test
+    func settingsLaunchPermissionFailureRequestsInProcessFallback() {
+        let model = makeModel()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: PermissionDeniedSettingsHelperLauncher(),
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        let disposition = coordinator.openSettings()
+
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+        if case .inProcessFallback(let reason) = disposition {
+            #expect(reason.contains("Operation not permitted"))
+        } else {
+            Issue.record("Expected in-process Settings fallback after EPERM")
+        }
+    }
+
+    @Test
+    func inProcessSettingsFallbackPerformsCommandsAndTracksModelChanges() async throws {
+        let model = makeModel()
+        let settingsModel = model.inProcessSettingsViewModel()
+        let snapshotVersion = settingsModel.snapshotVersion
+
+        #expect(settingsModel.isConnected)
+        #expect(settingsModel.snapshot == model.settingsSnapshot())
+        #expect(model.inProcessSettingsViewModel() === settingsModel)
+        #expect(settingsModel.snapshotVersion == snapshotVersion)
+
+        let response = await settingsModel.perform(.createProfile(.parametric))
+        #expect(response?.snapshot?.profiles.count == 2)
+        #expect(settingsModel.snapshot == model.settingsSnapshot())
     }
 
     @Test
@@ -1643,6 +1683,24 @@ private struct FailingSettingsHelperLaunchValidator: SettingsHelperLaunchValidat
 
     func validateRunningProcess(processIdentifier: pid_t, expectedHelperURL: URL) throws {
         throw SettingsCommandFailure(message: "Intentional post-launch validation failure")
+    }
+}
+
+private struct PermissiveSettingsHelperLaunchValidator: SettingsHelperLaunchValidating {
+    func validatedExecutableURL(for helperURL: URL) throws -> URL {
+        URL(fileURLWithPath: "/bin/true")
+    }
+
+    func validateRunningProcess(processIdentifier: pid_t, expectedHelperURL: URL) throws {}
+}
+
+private struct PermissionDeniedSettingsHelperLauncher: SettingsHelperLaunching {
+    func launch(
+        executableURL: URL,
+        arguments: [String],
+        terminationHandler: @escaping @Sendable (Process) -> Void
+    ) throws -> SettingsHelperLaunch {
+        throw POSIXError(.EPERM)
     }
 }
 

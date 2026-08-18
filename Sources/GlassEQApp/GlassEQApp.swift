@@ -2,7 +2,12 @@ import AppKit
 import GlassEQAudio
 import GlassEQCore
 import GlassEQSettingsIPC
+import GlassEQSettingsUI
 import SwiftUI
+
+private enum GlassEQWindowID {
+    static let inProcessSettings = "in-process-settings"
+}
 
 @main
 struct GlassEQApp: App {
@@ -20,6 +25,15 @@ struct GlassEQApp: App {
                 .accessibilityHint(Text(localized("Opens GlassEQ controls")))
         }
         .menuBarExtraStyle(.window)
+
+        Window(localized("Configure GlassEQ"), id: GlassEQWindowID.inProcessSettings) {
+            SettingsView(model: model.inProcessSettingsViewModel())
+                .frame(minWidth: 760, minHeight: 500)
+        }
+        .defaultSize(width: 1180, height: 720)
+        .windowResizability(.contentMinSize)
+        .windowStyle(.hiddenTitleBar)
+        .defaultLaunchBehavior(.suppressed)
     }
 }
 
@@ -377,6 +391,7 @@ final class GlassEQAppModel {
     private var profilePersistenceMode: ProfilePersistenceMode = .normal
     @ObservationIgnored private let engineWorkExecutor = EngineWorkExecutor()
     @ObservationIgnored lazy var settingsCoordinator = SettingsCoordinator(model: self)
+    @ObservationIgnored var inProcessSettingsViewModelStorage: GlassEQSettingsViewModel?
 
     private enum ProfilePersistenceMode: Equatable, Sendable {
         case normal
@@ -1607,11 +1622,13 @@ final class GlassEQAppModel {
     func notifyModelDidChange() {
         NotificationCenter.default.post(name: .glassEQModelDidChange, object: self)
         settingsCoordinator.modelDidChange()
+        refreshInProcessSettingsSnapshot()
     }
 
     private func notifyMetricsDidChange() {
         NotificationCenter.default.post(name: .glassEQMetricsDidChange, object: self)
         settingsCoordinator.metricsDidChange()
+        refreshInProcessSettingsMetrics()
     }
 
     private func stopObserver() {
@@ -1863,6 +1880,7 @@ final class GlassEQAppModel {
 private struct MenuBarView: View {
     @Bindable var model: GlassEQAppModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
@@ -1910,7 +1928,10 @@ private struct MenuBarView: View {
 
                 Button {
                     dismiss()
-                    model.openSettings()
+                    if case .inProcessFallback = model.openSettings() {
+                        openWindow(id: GlassEQWindowID.inProcessSettings)
+                        NSApplication.shared.activate(ignoringOtherApps: true)
+                    }
                 } label: {
                     Label(localized("Settings"), systemImage: "slider.horizontal.3")
                         .frame(minWidth: 86, minHeight: 28)

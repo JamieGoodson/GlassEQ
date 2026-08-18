@@ -3,11 +3,20 @@ import Darwin
 import Foundation
 import GlassEQCore
 import GlassEQSettingsIPC
+import GlassEQSettingsUI
+import OSLog
 import Security
 
 private struct UncheckedSendable<Value>: @unchecked Sendable {
     var value: Value
 }
+
+enum SettingsOpenDisposition: Equatable {
+    case helper
+    case inProcessFallback(reason: String)
+}
+
+private let settingsLogger = Logger(subsystem: "com.glasseq.app", category: "Settings")
 
 struct SettingsHelperLaunch {
     var process: Process
@@ -101,7 +110,8 @@ final class SettingsCoordinator: NSObject {
         super.init()
     }
 
-    func openSettings() {
+    @discardableResult
+    func openSettings() -> SettingsOpenDisposition {
         if let helperProcess, helperProcess.isRunning {
             if settingsConnected {
                 send(.focusRequested)
@@ -109,17 +119,19 @@ final class SettingsCoordinator: NSObject {
                 pendingFocusRequest = true
             }
             focusSettings()
-            return
+            return .helper
         }
 
         do {
             let token = try prepareSession()
             pendingFocusRequest = true
             try launchHelper(token: token)
+            return .helper
         } catch {
-            model?.statusMessage = localized("Settings failed to open: \(error.localizedDescription)")
-            model?.notifyModelDidChangeFromCoordinator()
+            let reason = error.localizedDescription
+            settingsLogger.error("Settings helper failed to launch; using in-process fallback: \(reason, privacy: .public)")
             cleanupSession(terminateHelper: true)
+            return .inProcessFallback(reason: reason)
         }
     }
 
@@ -810,8 +822,30 @@ struct SecuritySettingsCodeSigningValidator: SettingsCodeSigningValidating {
 }
 
 extension GlassEQAppModel {
-    func openSettings() {
+    func openSettings() -> SettingsOpenDisposition {
         settingsCoordinator.openSettings()
+    }
+
+    func inProcessSettingsViewModel() -> GlassEQSettingsViewModel {
+        if let inProcessSettingsViewModelStorage {
+            return inProcessSettingsViewModelStorage
+        }
+
+        let settingsModel = GlassEQSettingsViewModel()
+        settingsModel.attach(
+            client: InProcessSettingsClient(model: self),
+            snapshot: settingsSnapshot()
+        )
+        inProcessSettingsViewModelStorage = settingsModel
+        return settingsModel
+    }
+
+    func refreshInProcessSettingsSnapshot() {
+        inProcessSettingsViewModelStorage?.accept(snapshot: settingsSnapshot())
+    }
+
+    func refreshInProcessSettingsMetrics() {
+        inProcessSettingsViewModelStorage?.accept(metrics: SettingsAudioMetricsDTO(engineMetrics))
     }
 
     func notifyModelDidChangeFromCoordinator() {
@@ -895,5 +929,21 @@ extension GlassEQAppModel {
             store.profiles.append(profile)
         }
         try ProfilePersistence.validateForCommit(store)
+    }
+}
+
+@MainActor
+private final class InProcessSettingsClient: SettingsCommanding {
+    private weak var model: GlassEQAppModel?
+
+    init(model: GlassEQAppModel) {
+        self.model = model
+    }
+
+    func perform(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
+        guard let model else {
+            throw SettingsCommandFailure(message: "GlassEQ is shutting down.")
+        }
+        return try await model.performSettingsCommand(command)
     }
 }

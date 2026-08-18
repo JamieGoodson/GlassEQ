@@ -211,8 +211,10 @@ cp "$ICON_FILE" "$RESOURCES_DIR/GlassEQ.icns"
 cp "$ICON_FILE" "$SETTINGS_RESOURCES_DIR/GlassEQ.icns"
 cp "$MIGRATION_PLIST" "$RESOURCES_DIR/container-migration.plist"
 copy_spm_resources "$BUILD_BIN_DIR" "$APP_NAME" "$APP_TARGET" "$RESOURCES_DIR"
+copy_spm_resources "$BUILD_BIN_DIR" "$APP_NAME" "GlassEQSettingsUI" "$RESOURCES_DIR" 1
 copy_spm_resources "$BUILD_BIN_DIR" "$SETTINGS_APP_NAME" "$SETTINGS_APP_TARGET" "$SETTINGS_RESOURCES_DIR" 0
 copy_spm_resources "$BUILD_BIN_DIR" "$APP_NAME" "GlassEQSettingsUI" "$SETTINGS_RESOURCES_DIR" 1
+[[ -d "$RESOURCES_DIR/GlassEQ_GlassEQSettingsUI.bundle" ]] || fail "GlassEQSettingsUI fallback resource bundle was not copied into the main app resources"
 [[ -d "$SETTINGS_RESOURCES_DIR/GlassEQ_GlassEQSettingsUI.bundle" ]] || fail "GlassEQSettingsUI resource bundle was not copied into the settings helper resources"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$INFO_PLIST"
