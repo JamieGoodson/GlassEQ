@@ -94,6 +94,7 @@ final class SettingsCoordinator: NSObject {
     private var pipeReadDelivery: SettingsPipeOrderedMainActorDelivery?
     private var pipeWritePump: SettingsPipeWritePump?
     private var settingsConnected = false
+    private var readyAcknowledgmentPending = false
     private var pendingFocusRequest = false
     private var suppressedModelChangeDepth = 0
     private var lastSentSnapshot: SettingsSnapshot?
@@ -174,6 +175,7 @@ final class SettingsCoordinator: NSObject {
         let token = try Self.makeSessionToken()
         launchToken = token
         settingsConnected = false
+        readyAcknowledgmentPending = false
         pendingFocusRequest = false
         suppressedModelChangeDepth = 0
         lastSentSnapshot = nil
@@ -393,16 +395,27 @@ final class SettingsCoordinator: NSObject {
     }
 
     private func handleReady(requestID: String) {
-        settingsConnected = true
-        if let model {
-            let snapshot = model.settingsSnapshot()
-            lastSentSnapshot = snapshot
-            send(.snapshotChanged(snapshot))
+        guard !settingsConnected,
+              !readyAcknowledgmentPending else {
+            return
         }
-        sendResponse(SettingsCommandResponse(), requestID: requestID)
-        if pendingFocusRequest {
-            pendingFocusRequest = false
-            send(.focusRequested)
+        readyAcknowledgmentPending = true
+        sendResponse(SettingsCommandResponse(), requestID: requestID) { [weak self] in
+            guard let self,
+                  readyAcknowledgmentPending else {
+                return
+            }
+            readyAcknowledgmentPending = false
+            settingsConnected = true
+            if let model {
+                let snapshot = model.settingsSnapshot()
+                lastSentSnapshot = snapshot
+                send(.snapshotChanged(snapshot))
+            }
+            if pendingFocusRequest {
+                pendingFocusRequest = false
+                send(.focusRequested)
+            }
         }
     }
 
@@ -518,11 +531,18 @@ final class SettingsCoordinator: NSObject {
         }
     }
 
-    private func sendResponse(_ response: SettingsCommandResponse, requestID: String) {
+    private func sendResponse(
+        _ response: SettingsCommandResponse,
+        requestID: String,
+        onSuccess: (@MainActor @Sendable () -> Void)? = nil
+    ) {
         guard let launchToken else {
             return
         }
-        writePipeMessage(.response(sessionToken: launchToken, id: requestID, response: response, error: nil))
+        writePipeMessage(
+            .response(sessionToken: launchToken, id: requestID, response: response, error: nil),
+            onSuccess: onSuccess
+        )
     }
 
     private func sendError(_ message: String, requestID: String) {
@@ -532,7 +552,10 @@ final class SettingsCoordinator: NSObject {
         writePipeMessage(.response(sessionToken: launchToken, id: requestID, response: nil, error: message))
     }
 
-    private func writePipeMessage(_ message: SettingsPipeMessage) {
+    private func writePipeMessage(
+        _ message: SettingsPipeMessage,
+        onSuccess: (@MainActor @Sendable () -> Void)? = nil
+    ) {
         guard let pipeWritePump else {
             failPipeSession(SettingsCommandFailure(message: localized("Settings IPC pipe is not connected.")))
             return
@@ -540,18 +563,20 @@ final class SettingsCoordinator: NSObject {
         let expectedToken = message.sessionToken
         let expectedPump = pipeWritePump
         pipeWritePump.enqueue(message) { [weak self] result in
-            guard case .failure(let error) = result else {
-                return
-            }
             Task { @MainActor in
                 guard let self,
                       self.launchToken == expectedToken,
                       self.pipeWritePump === expectedPump else {
                     return
                 }
-                self.failPipeSession(SettingsCommandFailure(
-                    message: localized("Settings IPC write failed: \(error.localizedDescription)")
-                ))
+                switch result {
+                case .success:
+                    onSuccess?()
+                case .failure(let error):
+                    self.failPipeSession(SettingsCommandFailure(
+                        message: localized("Settings IPC write failed: \(error.localizedDescription)")
+                    ))
+                }
             }
         }
     }
@@ -602,6 +627,7 @@ final class SettingsCoordinator: NSObject {
         runningApplication = nil
         helperProcess = nil
         settingsConnected = false
+        readyAcknowledgmentPending = false
         if writePumpToDrain != nil || processToTerminate != nil {
             return Task {
                 if let writePumpToDrain {
