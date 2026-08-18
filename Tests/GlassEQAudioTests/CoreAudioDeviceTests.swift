@@ -643,6 +643,25 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
+    func staleOutputRebuildRequestUsesTheCurrentProfile() {
+        let requested = EQProfile(name: "Requested", mode: .parametric, filters: [])
+        let current = EQProfile(name: "Current", mode: .parametric, filters: [])
+
+        #expect(SystemTapAudioEngine.requestedOutputRebuildProfile(
+            requestedProfile: requested,
+            expectedProfileRevision: 1,
+            activeProfile: requested,
+            activeProfileRevision: 1
+        ) == requested)
+        #expect(SystemTapAudioEngine.requestedOutputRebuildProfile(
+            requestedProfile: requested,
+            expectedProfileRevision: 1,
+            activeProfile: current,
+            activeProfileRevision: 2
+        ) == current)
+    }
+
+    @Test
     func adaptivePlaybackBufferAppliesToEveryValidOutputRate() {
         #expect(SystemTapAudioEngine.shouldAdaptPlaybackBuffer(
             for: output(channelCount: 2, bufferFrameSize: 64)
