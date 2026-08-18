@@ -437,6 +437,8 @@ final class SettingsCoordinator: NSObject {
             return
         }
 
+        let metricsChanged = previous.metrics != snapshot.metrics
+
         var patch = SettingsSnapshotPatchDTO()
         var didPatch = false
 
@@ -497,11 +499,17 @@ final class SettingsCoordinator: NSObject {
 
         guard didPatch else {
             lastSentSnapshot = snapshot
+            if metricsChanged {
+                send(.metricsChanged(snapshot.metrics))
+            }
             return
         }
 
         lastSentSnapshot = snapshot
         send(.snapshotPatched(patch))
+        if metricsChanged {
+            send(.metricsChanged(snapshot.metrics))
+        }
     }
 
     private func sendResponse(_ response: SettingsCommandResponse, requestID: String) {

@@ -1415,6 +1415,46 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsModelNotificationPublishesMetricsOnlyChanges() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        let bootstrap = try #require(launcher.readHostMessages().first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        let requests = try SettingsPipeCodec.encodeLine(
+            .request(sessionToken: token, id: "connect", kind: .connect, command: nil)
+        ) + SettingsPipeCodec.encodeLine(
+            .request(sessionToken: token, id: "ready", kind: .ready, command: nil)
+        )
+        try launcher.writeHelperOutput(requests)
+        for _ in 0..<100 where !coordinator.isHelperReadyForTesting {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(coordinator.isHelperReadyForTesting)
+        _ = try launcher.readHostMessages()
+
+        model.engineMetrics = AudioEngineMetrics(capturedFrames: 42)
+        coordinator.modelDidChange()
+
+        let messages = try launcher.readHostMessages()
+        #expect(messages.contains(.event(
+            sessionToken: token,
+            event: .metricsChanged(SettingsAudioMetricsDTO(capturedFrames: 42))
+        )))
+        coordinator.shutdown()
+    }
+
+    @Test
     func settingsBootstrapWriteFailureRequestsInProcessFallback() async throws {
         let model = makeModel()
         let coordinator = SettingsCoordinator(
