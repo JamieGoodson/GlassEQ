@@ -101,6 +101,28 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func delayedSnapshotPreservesNewerLocalDraftAndSelection() {
+        let first = EQProfile(name: "First", mode: .parametric, filters: [])
+        let second = EQProfile(name: "Second", mode: .parametric, filters: [])
+        var editedSecond = second
+        editedSecond.preampDB = -3.25
+        var current = SettingsSnapshotDTO.disconnected
+        current.profiles = [first, second]
+        current.selectedProfileID = second.id
+        current.draftProfile = editedSecond
+        var latest = current
+        latest.selectedProfileID = first.id
+        latest.draftProfile = first
+        latest.statusMessage = "Command completed"
+
+        let merged = settingsSnapshotPreservingLocalDraft(current: current, latest: latest)
+
+        #expect(merged.selectedProfileID == second.id)
+        #expect(merged.draftProfile == editedSecond)
+        #expect(merged.statusMessage == "Command completed")
+    }
+
+    @Test
     func sliderQuantizationDoesNotIntroduceDisplayNoise() {
         let locale = Locale(identifier: "en_US_POSIX")
 
@@ -125,6 +147,16 @@ struct SettingsIPCTests {
 
         #expect(decoded == message)
         try decoded.validateSessionToken("token")
+    }
+
+    @Test
+    func pipeMessageRoundTripsReadyRequest() throws {
+        let message = SettingsPipeMessage.request(sessionToken: "token", id: "request-2", kind: .ready, command: nil)
+
+        let encoded = try SettingsPipeCodec.encodeLine(message)
+        let decoded = try SettingsPipeCodec.decodeLine(Data(encoded.dropLast()))
+
+        #expect(decoded == message)
     }
 
     @Test
@@ -713,6 +745,8 @@ private final class FakeSettingsPipeClient: SettingsPipeClientConnection, @unche
     func perform(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
         SettingsCommandResponse()
     }
+
+    func acknowledgeReady() async throws {}
 
     func disconnect() {
         didDisconnect = true
