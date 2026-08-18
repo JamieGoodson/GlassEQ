@@ -530,6 +530,9 @@ struct CoreAudioDeviceTests {
         #expect(AdaptivePlaybackBufferPolicy.nextFrameSize(after: 128, supportedRange: range) == 256)
         #expect(AdaptivePlaybackBufferPolicy.nextFrameSize(after: 256, supportedRange: range) == 512)
         #expect(AdaptivePlaybackBufferPolicy.nextFrameSize(after: 512, supportedRange: range) == nil)
+        #expect(AdaptivePlaybackBufferPolicy.previousFrameSize(before: 512, supportedRange: range) == 256)
+        #expect(AdaptivePlaybackBufferPolicy.previousFrameSize(before: 128, supportedRange: range) == 64)
+        #expect(AdaptivePlaybackBufferPolicy.previousFrameSize(before: 64, supportedRange: range) == 15)
     }
 
     @Test

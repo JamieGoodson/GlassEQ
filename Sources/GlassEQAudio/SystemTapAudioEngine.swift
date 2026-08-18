@@ -149,6 +149,16 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
     }
 
+    private struct PlaybackBufferRouteKey: Hashable {
+        var outputUID: String
+        var sampleRate: Int
+
+        init(output: AudioOutputDevice) {
+            self.outputUID = output.uid
+            self.sampleRate = Int(output.nominalSampleRate.rounded())
+        }
+    }
+
     private struct ControlState {
         var state: AudioEngineState = .stopped
         var status: AudioEngineStatus = .stopped
@@ -171,6 +181,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         var playbackBufferCalibrationProbe: PlaybackBufferCalibrationProbe?
         var playbackBufferInstabilityPersistenceGate = PlaybackBufferInstabilityPersistenceGate()
         var attemptedPlaybackTargetDownProbes: Set<PlaybackBufferOperatingPointKey> = []
+        var attemptedPlaybackFrameSizeDownProbes: Set<PlaybackBufferRouteKey> = []
     }
 
     private struct OutputRebuildPreparation {
@@ -1613,6 +1624,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             state.attemptedPlaybackTargetDownProbes = Set(
                 state.attemptedPlaybackTargetDownProbes.filter { $0.outputUID != outputUID }
             )
+            state.attemptedPlaybackFrameSizeDownProbes = Set(
+                state.attemptedPlaybackFrameSizeDownProbes.filter { $0.outputUID != outputUID }
+            )
             guard let output = state.activeOutput,
                   output.uid == outputUID,
                   let profile = state.activeProfile else {
@@ -1827,7 +1841,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
         // Now that our output owns the device, apply the low-latency buffer size. The stream
         // restart it triggers happens under our muted IOProc, so it plays silence, not dry audio.
-        let tunedOutput = tuneBufferFrameSize(for: matchedOutput)
+        let allowsFrameSizeDownwardProbe = state.attemptedPlaybackFrameSizeDownProbes.insert(
+            PlaybackBufferRouteKey(output: matchedOutput)
+        ).inserted
+        let tunedOutput = tuneBufferFrameSize(
+            for: matchedOutput,
+            allowsDownwardProbe: allowsFrameSizeDownwardProbe
+        )
         state.activeOutput = tunedOutput
         let operatingPointKey = PlaybackBufferOperatingPointKey(output: tunedOutput)
         let allowsDownwardProbe = state.attemptedPlaybackTargetDownProbes.insert(
@@ -2304,17 +2324,22 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         return try rebuild()
     }
 
-    private func tuneBufferFrameSize(for output: AudioOutputDevice) -> AudioOutputDevice {
+    private func tuneBufferFrameSize(
+        for output: AudioOutputDevice,
+        allowsDownwardProbe: Bool
+    ) -> AudioOutputDevice {
         do {
             let range = try CoreAudioDeviceQuery.bufferFrameSizeRangeValue(objectID: output.id)
-            let calibratedFrameSize = PersistedPlaybackBufferCalibrationStore.preferredFrameSize(
+            let calibration = PersistedPlaybackBufferCalibrationStore.calibration(
                 outputUID: output.uid,
                 sampleRate: output.nominalSampleRate,
                 from: playbackBufferCalibrationStoreURL
             )
-            let requested = clampedBufferFrameSize(
-                max(Self.preferredBufferFrameSize(for: output), calibratedFrameSize ?? 0),
-                range: range
+            let requested = AdaptivePlaybackBufferPolicy.startupFrameSize(
+                preferredFrameSize: Self.preferredBufferFrameSize(for: output),
+                calibration: calibration,
+                supportedRange: range,
+                allowsDownwardProbe: allowsDownwardProbe
             )
             guard requested != output.bufferFrameSize else {
                 return output
@@ -2792,10 +2817,6 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     private static func isLowSampleRateRoute(_ output: AudioOutputDevice) -> Bool {
         output.nominalSampleRate > 0 && output.nominalSampleRate <= Self.lowSampleRateThreshold
-    }
-
-    private func clampedBufferFrameSize(_ frameSize: UInt32, range: AudioBufferFrameSizeRange) -> UInt32 {
-        min(max(frameSize, range.minimum), range.maximum)
     }
 
     private func createTopologyRebuildMuteGuard() throws -> any TopologyRebuildMuteGuarding {

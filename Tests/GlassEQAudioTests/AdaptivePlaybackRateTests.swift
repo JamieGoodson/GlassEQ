@@ -834,6 +834,41 @@ struct AdaptivePlaybackRateTests {
     }
 
     @Test
+    func startupFrameSizeProbesOneRungBelowStableCalibration() {
+        let calibration = PersistedPlaybackBufferCalibration(
+            outputUID: "output-a",
+            sampleRate: 48_000,
+            stableFrameSize: 256,
+            probingFrameSize: nil,
+            operatingPoints: [],
+            events: []
+        )
+        let range = AudioBufferFrameSizeRange(minimum: 64, maximum: 512)
+
+        #expect(AdaptivePlaybackBufferPolicy.startupFrameSize(
+            preferredFrameSize: 64,
+            calibration: calibration,
+            supportedRange: range,
+            allowsDownwardProbe: true
+        ) == 128)
+        #expect(AdaptivePlaybackBufferPolicy.startupFrameSize(
+            preferredFrameSize: 64,
+            calibration: calibration,
+            supportedRange: range,
+            allowsDownwardProbe: false
+        ) == 256)
+
+        var probing = calibration
+        probing.probingFrameSize = 512
+        #expect(AdaptivePlaybackBufferPolicy.startupFrameSize(
+            preferredFrameSize: 64,
+            calibration: probing,
+            supportedRange: range,
+            allowsDownwardProbe: true
+        ) == 512)
+    }
+
+    @Test
     func servoLearnsSteadyClockDriftFromOccupancy() {
         var servo = PlaybackRateServo(sampleRate: 48_000, targetFrames: 1_024)
         servo.didPrime(occupancyFrames: 1_024)

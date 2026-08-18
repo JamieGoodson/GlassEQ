@@ -305,6 +305,10 @@ enum PersistedPlaybackBufferCalibrationStore {
                calibration.stableFrameSize == previousFrameSize {
                 calibration.stableFrameSize = nil
             }
+            if resultingFrameSize != previousFrameSize,
+               calibration.probingFrameSize == previousFrameSize {
+                calibration.probingFrameSize = resultingFrameSize
+            }
             if calibration.stableFrameSize == nil {
                 calibration.probingFrameSize = resultingFrameSize
             }
@@ -565,6 +569,44 @@ struct AdaptivePlaybackBufferPolicy {
             candidates.append(maximum)
         }
         return candidates.sorted().first(where: { $0 > currentFrameSize })
+    }
+
+    static func previousFrameSize(
+        before currentFrameSize: UInt32,
+        supportedRange: AudioBufferFrameSizeRange
+    ) -> UInt32? {
+        let minimum = supportedRange.minimum
+        let maximum = min(supportedRange.maximum, currentFrameSize)
+        var candidates = frameSizeLadder.filter { $0 >= minimum && $0 < maximum }
+        if minimum < maximum, !candidates.contains(minimum) {
+            candidates.append(minimum)
+        }
+        return candidates.max()
+    }
+
+    static func startupFrameSize(
+        preferredFrameSize: UInt32,
+        calibration: PersistedPlaybackBufferCalibration?,
+        supportedRange: AudioBufferFrameSizeRange,
+        allowsDownwardProbe: Bool
+    ) -> UInt32 {
+        let calibratedFrameSize: UInt32
+        if let probingFrameSize = calibration?.probingFrameSize {
+            calibratedFrameSize = probingFrameSize
+        } else if allowsDownwardProbe,
+                  let stableFrameSize = calibration?.stableFrameSize,
+                  let downProbe = previousFrameSize(
+                      before: stableFrameSize,
+                      supportedRange: supportedRange
+                  ) {
+            calibratedFrameSize = downProbe
+        } else {
+            calibratedFrameSize = calibration?.stableFrameSize ?? 0
+        }
+        return min(
+            max(max(preferredFrameSize, calibratedFrameSize), supportedRange.minimum),
+            supportedRange.maximum
+        )
     }
 
     static func nextTargetFrames(
