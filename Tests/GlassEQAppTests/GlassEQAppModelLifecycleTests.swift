@@ -1451,11 +1451,16 @@ struct GlassEQAppModelLifecycleTests {
         model.engineMetrics = AudioEngineMetrics(capturedFrames: 42)
         coordinator.modelDidChange()
 
-        let messages = try launcher.readHostMessages()
-        #expect(messages.contains(.event(
+        let expectedMessage = SettingsPipeMessage.event(
             sessionToken: token,
             event: .metricsChanged(SettingsAudioMetricsDTO(capturedFrames: 42))
-        )))
+        )
+        var messages: [SettingsPipeMessage] = []
+        for _ in 0..<100 where !messages.contains(expectedMessage) {
+            try await Task.sleep(for: .milliseconds(10))
+            messages.append(contentsOf: try launcher.readHostMessages())
+        }
+        #expect(messages.contains(expectedMessage))
         coordinator.shutdown()
     }
 
