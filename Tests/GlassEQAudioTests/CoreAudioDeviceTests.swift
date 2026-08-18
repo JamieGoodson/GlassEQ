@@ -577,6 +577,34 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
+    func adaptiveBufferRenegotiationWaitsForTheDevicePropertyToSettle() throws {
+        let current = output(channelCount: 2, bufferFrameSize: 64)
+        var queryCount = 0
+        var waitCount = 0
+
+        let updated = try SystemTapAudioEngine.renegotiatedPlaybackOutput(
+            current,
+            supportedRange: AudioBufferFrameSizeRange(minimum: 64, maximum: 512),
+            setBufferFrameSize: { _, _ in },
+            queryOutput: { objectID in
+                queryCount += 1
+                return output(
+                    id: objectID,
+                    channelCount: 2,
+                    bufferFrameSize: queryCount < 3 ? 64 : 128
+                )
+            },
+            waitForPropertySettlement: {
+                waitCount += 1
+            }
+        )
+
+        #expect(queryCount == 3)
+        #expect(waitCount == 2)
+        #expect(updated?.bufferFrameSize == 128)
+    }
+
+    @Test
     func topologyRebuildAcquiresMuteGuardBeforeRebuildAndReleasesAfter() throws {
         var events: [String] = []
         let result = try SystemTapAudioEngine.performTopologyRebuild(

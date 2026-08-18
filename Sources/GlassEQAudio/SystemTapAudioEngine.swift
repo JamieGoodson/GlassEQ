@@ -2736,7 +2736,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         _ output: AudioOutputDevice,
         supportedRange: AudioBufferFrameSizeRange,
         setBufferFrameSize: (UInt32, AudioObjectID) throws -> Void = CoreAudioDeviceQuery.setBufferFrameSize(_:objectID:),
-        queryOutput: (AudioObjectID) throws -> AudioOutputDevice = CoreAudioDeviceQuery.outputDevice(id:)
+        queryOutput: (AudioObjectID) throws -> AudioOutputDevice = CoreAudioDeviceQuery.outputDevice(id:),
+        waitForPropertySettlement: () -> Void = { Thread.sleep(forTimeInterval: 0.01) }
     ) throws -> AudioOutputDevice? {
         guard let requestedFrameSize = AdaptivePlaybackBufferPolicy.nextFrameSize(
             after: output.bufferFrameSize,
@@ -2746,12 +2747,17 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
 
         try setBufferFrameSize(requestedFrameSize, output.id)
-        let updatedOutput = try queryOutput(output.id)
-        guard updatedOutput.id == output.id,
-              updatedOutput.bufferFrameSize > output.bufferFrameSize else {
-            return nil
+        for attempt in 0..<3 {
+            let updatedOutput = try queryOutput(output.id)
+            if updatedOutput.id == output.id,
+               updatedOutput.bufferFrameSize > output.bufferFrameSize {
+                return updatedOutput
+            }
+            if attempt < 2 {
+                waitForPropertySettlement()
+            }
         }
-        return updatedOutput
+        return nil
     }
 
     static func preferredBufferFrameSize(for output: AudioOutputDevice) -> UInt32 {
