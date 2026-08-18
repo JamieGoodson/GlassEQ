@@ -109,6 +109,12 @@ private struct AudioEngineInternalError: Error, LocalizedError {
     }
 }
 
+struct AudioEngineProfileUpdateUnavailable: Error, LocalizedError {
+    var errorDescription: String? {
+        "The audio output is being rebuilt; the profile change was not applied."
+    }
+}
+
 public final class SystemTapAudioEngine: @unchecked Sendable {
     private static let preferredBufferFrameSize: UInt32 = 64
     private static let preferredBluetoothBufferFrameSize: UInt32 = 64
@@ -1575,9 +1581,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
         // Topology-incompatible change: rebuild around the persistent tap (the tap rate is
         // constant, so start() keeps the capture half and only swaps the DSP graph + output).
-        guard let output = control.withLock({ $0.activeOutput }) else {
-            return
-        }
+        let output = try Self.profileUpdateOutput(control.withLock { $0.activeOutput })
         let freshOutput = try CoreAudioDeviceQuery.outputDevice(id: output.id)
         try start(output: freshOutput, profile: profile)
         let didApplyProfile = control.withLock { state in
@@ -3139,6 +3143,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             return requestedProfile
         }
         return activeProfile
+    }
+
+    static func profileUpdateOutput(_ output: AudioOutputDevice?) throws -> AudioOutputDevice {
+        guard let output else {
+            throw AudioEngineProfileUpdateUnavailable()
+        }
+        return output
     }
 
     static func shouldRefreshCaptureForOutput(
