@@ -31,6 +31,44 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func playbackBufferCalibrationResetRequiresRunningOutput() {
+        #expect(canResetPlaybackBufferCalibration(isRunning: true, outputUID: "speakers"))
+        #expect(!canResetPlaybackBufferCalibration(isRunning: false, outputUID: "speakers"))
+        #expect(!canResetPlaybackBufferCalibration(isRunning: true, outputUID: ""))
+    }
+
+    @Test
+    func sampleRateConversionRequiresARunningEngineAndActiveMetrics() {
+        #expect(sampleRateConversionIsActive(isRunning: true, metricsActive: true))
+        #expect(!sampleRateConversionIsActive(isRunning: false, metricsActive: true))
+        #expect(!sampleRateConversionIsActive(isRunning: true, metricsActive: false))
+    }
+
+    @Test
+    func clockCorrectionLimitRequiresARunningEngineAndSaturatedMetrics() {
+        #expect(clockCorrectionLimitIsReached(isRunning: true, metricsSaturated: true))
+        #expect(!clockCorrectionLimitIsReached(isRunning: false, metricsSaturated: true))
+        #expect(!clockCorrectionLimitIsReached(isRunning: true, metricsSaturated: false))
+    }
+
+    @Test
+    func profileDeletionIsDisabledWhilePreviewProtectsTheReturnProfile() {
+        let returnProfile = EQProfile(name: "Return", mode: .parametric, filters: [])
+        let previewProfile = EQProfile(name: "Preview", mode: .parametric, filters: [])
+        var snapshot = SettingsSnapshotDTO.disconnected
+        snapshot.profiles = [returnProfile, previewProfile]
+        snapshot.selectedProfileID = returnProfile.id
+        snapshot.draftProfile = returnProfile
+        snapshot.activeProfileID = previewProfile.id
+        snapshot.isPreviewing = true
+
+        #expect(!settingsCanDeleteSelectedProfile(snapshot))
+
+        snapshot.isPreviewing = false
+        #expect(settingsCanDeleteSelectedProfile(snapshot))
+    }
+
+    @Test
     func editableNumberParsingRejectsLocaleGroupingSeparators() {
         #expect(parseEditableNumber("1.234", locale: Locale(identifier: "de_DE")) == nil)
         #expect(parseEditableNumber("1,234", locale: Locale(identifier: "de_DE")) == 1.234)
@@ -239,6 +277,22 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func resetPlaybackBufferCalibrationCommandRoundTrips() throws {
+        let message = SettingsPipeMessage.request(
+            sessionToken: "token",
+            id: "request-reset-buffer",
+            kind: .command,
+            command: .resetPlaybackBufferCalibration
+        )
+
+        let decoded = try SettingsPipeCodec.decodeLine(
+            Data(try SettingsPipeCodec.encodeLine(message).dropLast())
+        )
+
+        #expect(decoded == message)
+    }
+
+    @Test
     func audioMetricsDecodeOldPayloadsWithDefaultedNewFields() throws {
         let data = Data("""
         {
@@ -266,7 +320,17 @@ struct SettingsIPCTests {
         #expect(metrics.playbackBufferObservations == 0)
         #expect(metrics.maximumCaptureCallbackFrames == 0)
         #expect(metrics.maximumPlaybackCallbackFrames == 0)
+        #expect(metrics.playbackTimestampDiscontinuities == 0)
+        #expect(metrics.playbackBufferRenegotiations == 0)
+        #expect(metrics.adaptivePlaybackRenderFailures == 0)
+        #expect(metrics.droppedInputFrames == 0)
+        #expect(metrics.droppedBufferedFrames == 0)
+        #expect(metrics.playbackRateCorrectionPPM == 0)
+        #expect(!metrics.playbackRateCorrectionSaturated)
+        #expect(metrics.playbackOccupancyTargetFrames == 0)
+        #expect(metrics.filteredPlaybackOccupancyFrames == 0)
         #expect(metrics.playbackBufferSampleRate == 0)
+        #expect(!metrics.playbackSampleRateConversionActive)
     }
 
     @Test
@@ -299,6 +363,10 @@ struct SettingsIPCTests {
         #expect(routeAnalysis.signature.sampleRate == 44_100)
         #expect(fallbackAnalysis.signature.sampleRate == EQAnalysisSignature.defaultSampleRate)
         #expect(routeAnalysis.signature != fallbackAnalysis.signature)
+        #expect(routeAnalysis.maximumUsableFrequency == 19_845)
+        #expect(routeAnalysis.inactiveEnabledFilterCount == 1)
+        #expect(fallbackAnalysis.maximumUsableFrequency == 20_000)
+        #expect(fallbackAnalysis.inactiveEnabledFilterCount == 0)
         #expect(routeAnalysis.linkedPoints == FrequencyResponse.points(
             for: profile.filters,
             preampDB: profile.preampDB,
@@ -595,6 +663,7 @@ struct SettingsIPCTests {
         let profileID = UUID()
         let patch = SettingsSnapshotPatchDTO(
             statusMessage: "Running",
+            isRunning: true,
             activeProfileID: profileID,
             activeProfileName: "Flat",
             currentOutput: SettingsOutputDTO(
@@ -616,6 +685,34 @@ struct SettingsIPCTests {
         let decoded = try SettingsPipeCodec.decodeLine(Data(try SettingsPipeCodec.encodeLine(message).dropLast()))
 
         #expect(decoded == message)
+    }
+
+    @Test
+    func snapshotDecodeDefaultsMissingRunningStateToStopped() throws {
+        var snapshot = SettingsSnapshotDTO.disconnected
+        snapshot.isRunning = true
+        let encoded = try JSONEncoder().encode(snapshot)
+        var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "isRunning")
+
+        let decoded = try JSONDecoder().decode(
+            SettingsSnapshotDTO.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+
+        #expect(!decoded.isRunning)
+    }
+
+    @Test
+    @MainActor
+    func snapshotPatchUpdatesRunningState() {
+        let model = GlassEQSettingsViewModel()
+
+        model.accept(patch: SettingsSnapshotPatchDTO(isRunning: true))
+        #expect(model.snapshot.isRunning)
+
+        model.accept(patch: SettingsSnapshotPatchDTO(isRunning: false))
+        #expect(!model.snapshot.isRunning)
     }
 
     @Test

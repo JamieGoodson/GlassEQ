@@ -38,6 +38,9 @@ public final class GlassEQSettingsViewModel {
         if let statusMessage = patch.statusMessage {
             snapshot.statusMessage = statusMessage
         }
+        if let isRunning = patch.isRunning {
+            snapshot.isRunning = isRunning
+        }
         if let isPreviewing = patch.isPreviewing {
             snapshot.isPreviewing = isPreviewing
         }

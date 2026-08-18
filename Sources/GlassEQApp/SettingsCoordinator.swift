@@ -434,6 +434,9 @@ final class SettingsCoordinator: NSObject {
                 sendResponse(response, requestID: requestID)
             } catch {
                 suppressedModelChangeDepth = max(suppressedModelChangeDepth - 1, 0)
+                if suppressedModelChangeDepth == 0, let model {
+                    sendSnapshotUpdate(model.settingsSnapshot())
+                }
                 sendError(error.localizedDescription, requestID: requestID)
             }
         }
@@ -463,6 +466,10 @@ final class SettingsCoordinator: NSObject {
 
         if previous.statusMessage != snapshot.statusMessage {
             patch.statusMessage = snapshot.statusMessage
+            didPatch = true
+        }
+        if previous.isRunning != snapshot.isRunning {
+            patch.isRunning = snapshot.isRunning
             didPatch = true
         }
         if previous.isPreviewing != snapshot.isPreviewing {
@@ -1017,6 +1024,10 @@ extension GlassEQAppModel {
 
         case .resetDiagnostics:
             resetDiagnostics()
+            return SettingsCommandResponse(snapshot: settingsSnapshot())
+
+        case .resetPlaybackBufferCalibration:
+            try await resetPlaybackBufferCalibrationForCurrentOutput()
             return SettingsCommandResponse(snapshot: settingsSnapshot())
 
         case .retryAudioEngine:
