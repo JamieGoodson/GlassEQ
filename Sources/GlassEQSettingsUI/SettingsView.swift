@@ -57,6 +57,34 @@ private func localizedDecimal(
     return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
 }
 
+func editableNumberText(_ value: Double, locale: Locale = .autoupdatingCurrent) -> String {
+    let formatter = NumberFormatter()
+    formatter.locale = locale
+    formatter.numberStyle = .decimal
+    formatter.usesGroupingSeparator = false
+    formatter.usesSignificantDigits = true
+    formatter.minimumSignificantDigits = 1
+    formatter.maximumSignificantDigits = 17
+    return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+}
+
+func parseEditableNumber(_ text: String, locale: Locale = .autoupdatingCurrent) -> Double? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+        return nil
+    }
+
+    let formatter = NumberFormatter()
+    formatter.locale = locale
+    formatter.numberStyle = .decimal
+    let parsed = formatter.number(from: trimmed)?.doubleValue
+        ?? Double(trimmed.replacingOccurrences(of: ",", with: "."))
+    guard let parsed, parsed.isFinite else {
+        return nil
+    }
+    return parsed
+}
+
 private func localizedInteger(_ value: Int) -> String {
     value.formatted(.number.locale(.autoupdatingCurrent))
 }
@@ -1526,7 +1554,6 @@ private struct GraphicFilterEditor: View {
                         title: localized("Gain"),
                         value: $filter.gainDB,
                         range: -12...12,
-                        step: 0.1,
                         display: filter.gainDB.dbLabel,
                         width: 56
                     )
@@ -1792,7 +1819,6 @@ private struct SliderRow: View {
                 title: title,
                 value: $value,
                 range: range,
-                step: step,
                 display: label
             )
         }
@@ -1842,7 +1868,6 @@ private struct EditableValueText: View {
     var title: String
     @Binding var value: Double
     var range: ClosedRange<Double>
-    var step: Double
     var display: String
     var width: CGFloat = 64
 
@@ -1891,20 +1916,7 @@ private struct EditableValueText: View {
     }
 
     private var editableText: String {
-        let formatter = NumberFormatter()
-        formatter.locale = .autoupdatingCurrent
-        formatter.numberStyle = .decimal
-        formatter.usesGroupingSeparator = false
-        formatter.minimumFractionDigits = 0
-        formatter.maximumFractionDigits = editFractionDigits
-        return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
-    }
-
-    private var editFractionDigits: Int {
-        guard step > 0, step < 1 else {
-            return 0
-        }
-        return step < 0.1 ? 2 : 1
+        editableNumberText(value)
     }
 
     private func commit() {
@@ -1912,24 +1924,10 @@ private struct EditableValueText: View {
             return
         }
         isEditing = false
-        guard let parsed = parseNumber(editText) else {
+        guard let parsed = parseEditableNumber(editText) else {
             return
         }
         value = min(max(parsed, range.lowerBound), range.upperBound)
-    }
-
-    private func parseNumber(_ text: String) -> Double? {
-        let trimmed = text.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else {
-            return nil
-        }
-        let formatter = NumberFormatter()
-        formatter.locale = .autoupdatingCurrent
-        formatter.numberStyle = .decimal
-        if let number = formatter.number(from: trimmed) {
-            return number.doubleValue
-        }
-        return Double(trimmed.replacingOccurrences(of: ",", with: "."))
     }
 }
 
@@ -2127,6 +2125,8 @@ private struct OutputTab: View {
                     LabeledContent(localized("Captured"), value: localizedInteger(snapshot.metrics.capturedFrames))
                     LabeledContent(localized("Played"), value: localizedInteger(snapshot.metrics.playedFrames))
                     LabeledContent(localized("Underruns"), value: localizedInteger(snapshot.metrics.playbackUnderrunFrames))
+                    LabeledContent(localized("Dropped Input"), value: localizedInteger(snapshot.metrics.droppedInputFrames))
+                    LabeledContent(localized("Dropped Buffered"), value: localizedInteger(snapshot.metrics.droppedBufferedFrames))
                     LabeledContent(localized("Saturated Samples"), value: localizedInteger(snapshot.metrics.saturatedSamples))
                     LabeledContent(localized("Buffered"), value: localizedFrameCount(snapshot.metrics.currentBufferedFrames))
                     LabeledContent(localized("Peak Buffer"), value: localizedFrameCount(snapshot.metrics.maximumPlaybackBufferedFrames))
