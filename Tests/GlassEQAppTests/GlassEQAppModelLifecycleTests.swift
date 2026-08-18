@@ -243,6 +243,10 @@ struct GlassEQAppModelLifecycleTests {
             model.lifecycleState == .running
                 && model.currentOutputUID == secondOutput.uid
                 && engine.startCalls.count == 3
+                && engine.startCalls.last?.profile == appliedProfile
+                && model.activeProfile == appliedProfile
+                && model.statusMessage
+                    == localized("Processing \(secondOutput.name) with \(appliedProfile.name)")
         }
 
         #expect(engine.startCalls.last?.profile == appliedProfile)
