@@ -14,6 +14,7 @@ private struct UncheckedSendable<Value>: @unchecked Sendable {
 enum SettingsOpenDisposition: Equatable {
     case helper
     case inProcessFallback(reason: String)
+    case activeInProcessFallback
 }
 
 private let settingsLogger = Logger(subsystem: "com.glasseq.app", category: "Settings")
@@ -827,7 +828,18 @@ struct SecuritySettingsCodeSigningValidator: SettingsCodeSigningValidating {
 
 extension GlassEQAppModel {
     func openSettings() -> SettingsOpenDisposition {
-        settingsCoordinator.openSettings()
+        guard !inProcessSettingsIsPresented else {
+            return .activeInProcessFallback
+        }
+        return settingsCoordinator.openSettings()
+    }
+
+    func inProcessSettingsDidAppear() {
+        inProcessSettingsIsPresented = true
+    }
+
+    func inProcessSettingsDidDisappear() {
+        inProcessSettingsIsPresented = false
     }
 
     func inProcessSettingsViewModel() -> GlassEQSettingsViewModel {
