@@ -1289,6 +1289,46 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func quitWaitsForInFlightImportBeforeFlushingProfiles() async throws {
+        let storeURL = temporaryAppStoreURL()
+        defer { removeTemporaryStoreDirectory(for: storeURL) }
+        let importer = BlockingProfileImportOperation()
+        let importedProfile = makeProfile(name: "Imported Before Quit")
+        let model = makeModel(
+            storeURL: storeURL,
+            profileImportOperation: { format, name, text in
+                await importer.run(format: format, name: name, text: text)
+            }
+        )
+
+        let importTask = Task {
+            try await model.performSettingsCommand(.importProfile(
+                format: .autoEQ,
+                name: importedProfile.name,
+                text: "1 0"
+            ))
+        }
+        await waitUntil {
+            importer.hasEntered
+        }
+
+        let flushTask = Task {
+            await model.stopAcceptingSettingsCommandsAndWait()
+            return await model.flushStoreBeforeQuit()
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(!FileManager.default.fileExists(atPath: storeURL.path))
+
+        importer.complete(with: .success(importedProfile))
+        _ = try await importTask.value
+        #expect(await flushTask.value)
+
+        let loaded = ProfilePersistence.load(from: storeURL).store
+        #expect(loaded.profiles.contains { $0.name == importedProfile.name })
+        model.resumeSettingsCommandsAfterCancelledQuit()
+    }
+
+    @Test
     func settingsLaunchValidationFailureTerminatesPartiallyStartedHelper() async throws {
         let model = makeModel()
         let launcher = SleepingSettingsHelperLauncher()
@@ -1456,6 +1496,70 @@ struct GlassEQAppModelLifecycleTests {
             messages.append(contentsOf: try launcher.readHostMessages())
         }
         #expect(messages.contains(expectedMessage))
+        coordinator.shutdown()
+    }
+
+    @Test
+    func settingsReadyPublishesChangesThatOccurredAfterConnect() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "connect",
+            kind: .connect,
+            command: nil
+        ))
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .response(_, "connect", _, _) = message {
+                    return true
+                }
+                return false
+            }
+        }
+
+        model.statusMessage = "Changed before ready"
+        model.engineMetrics = AudioEngineMetrics(capturedFrames: 42)
+        coordinator.modelDidChange()
+        coordinator.metricsDidChange()
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "ready",
+            kind: .ready,
+            command: nil
+        ))
+
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                guard case .event(_, .snapshotChanged(let snapshot)) = message else {
+                    return false
+                }
+                return snapshot.statusMessage == "Changed before ready"
+                    && snapshot.metrics.capturedFrames == 42
+            }
+        }
+        #expect(coordinator.isHelperReadyForTesting)
         coordinator.shutdown()
     }
 
@@ -1680,6 +1784,7 @@ private func makeModel(
     lookup: FakeDefaultOutputLookup = FakeDefaultOutputLookup(.success(makeOutput())),
     observers: any DefaultOutputObservingMaking = FakeDefaultOutputObserverFactory(),
     workspaceOpener: any WorkspaceOpening = FakeWorkspaceOpener(results: []),
+    profileImportOperation: (@Sendable (ImportFormat, String, String) async -> Result<EQProfile, any Error>)? = nil,
     saveDelay: Duration = .zero,
     outputDelay: Duration? = nil,
     wakeDelay: Duration? = nil
@@ -1695,10 +1800,43 @@ private func makeModel(
         installLifecycleObservers: false,
         registerAppDelegate: false,
         workspaceOpener: workspaceOpener,
+        profileImportOperation: profileImportOperation,
         saveDebounceDelay: saveDelay,
         outputChangeSettlingDelayOverride: outputDelay,
         wakeReconnectDelayOverride: wakeDelay
     )
+}
+
+private final class BlockingProfileImportOperation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entered = false
+    private var continuation: CheckedContinuation<Result<EQProfile, any Error>, Never>?
+
+    var hasEntered: Bool {
+        lock.withLock { entered }
+    }
+
+    func run(
+        format: ImportFormat,
+        name: String,
+        text: String
+    ) async -> Result<EQProfile, any Error> {
+        await withCheckedContinuation { continuation in
+            lock.withLock {
+                self.continuation = continuation
+                entered = true
+            }
+        }
+    }
+
+    func complete(with result: Result<EQProfile, any Error>) {
+        let continuation = lock.withLock {
+            let continuation = self.continuation
+            self.continuation = nil
+            return continuation
+        }
+        continuation?.resume(returning: result)
+    }
 }
 
 private func normalizedStore(_ store: ProfileStore) -> ProfileStore {
