@@ -1822,7 +1822,15 @@ struct GlassEQAppModelLifecycleTests {
         )
 
         #expect(coordinator.openSettings() == .helper)
-        let bootstrap = try #require(launcher.readHostMessages().first)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first)
         guard case .bootstrap(let token) = bootstrap else {
             Issue.record("Expected Settings bootstrap message")
             return
@@ -1874,7 +1882,15 @@ struct GlassEQAppModelLifecycleTests {
         )
 
         #expect(coordinator.openSettings() == .helper)
-        let bootstrap = try #require(launcher.readHostMessages().first)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first)
         guard case .bootstrap(let token) = bootstrap else {
             Issue.record("Expected Settings bootstrap message")
             return
@@ -1889,7 +1905,7 @@ struct GlassEQAppModelLifecycleTests {
             try await Task.sleep(for: .milliseconds(10))
         }
         #expect(coordinator.isHelperReadyForTesting)
-        _ = try launcher.readHostMessages()
+        let baselineMessageCount = launcher.receivedAppMessages.count
 
         model.engineMetrics = AudioEngineMetrics(capturedFrames: 42)
         coordinator.modelDidChange()
@@ -1898,12 +1914,12 @@ struct GlassEQAppModelLifecycleTests {
             sessionToken: token,
             event: .metricsChanged(SettingsAudioMetricsDTO(capturedFrames: 42))
         )
-        var messages: [SettingsPipeMessage] = []
-        for _ in 0..<100 where !messages.contains(expectedMessage) {
-            try await Task.sleep(for: .milliseconds(10))
-            messages.append(contentsOf: try launcher.readHostMessages())
+        await waitUntil {
+            launcher.receivedAppMessages
+                .dropFirst(baselineMessageCount)
+                .contains(expectedMessage)
         }
-        #expect(messages.contains(expectedMessage))
+        #expect(launcher.receivedAppMessages.contains(expectedMessage))
         coordinator.shutdown()
     }
 
@@ -2379,12 +2395,6 @@ private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching,
         try output.fileHandleForWriting.close()
     }
 
-    func readHostMessages() throws -> [SettingsPipeMessage] {
-        let data = input.fileHandleForReading.availableData
-        return try data.split(separator: 0x0A).map { line in
-            try SettingsPipeCodec.decodeLine(Data(line))
-        }
-    }
 }
 
 private final class ClosedInputSettingsHelperLauncher: SettingsHelperLaunching {
