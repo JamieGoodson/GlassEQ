@@ -560,35 +560,172 @@ final class GlassEQAppModel {
         var previewReturnProfile: EQProfile?
     }
 
-    private final class ConfirmedEngineProfileState: @unchecked Sendable {
-        private let lock = NSLock()
-        private var rollback: ProfileRollback?
+    private struct EngineProfileConfirmation: Sendable {
+        var activeProfile: EQProfile
 
-        func current() -> ProfileRollback? {
-            lock.withLock { rollback }
+        init(_ rollback: ProfileRollback) {
+            activeProfile = rollback.activeProfile
+        }
+    }
+
+    private struct FailedEngineProfileAttempt: Sendable {
+        struct MappingChange: Sendable {
+            var outputUID: String
+            var previous: OutputDeviceProfileMapping?
+            var previousIndex: Int?
+            var attempted: OutputDeviceProfileMapping?
         }
 
-        func confirm(_ rollback: ProfileRollback) {
+        var id = UUID()
+        var profileID: UUID
+        var previousProfile: EQProfile?
+        var previousProfileIndex: Int?
+        var attemptedProfile: EQProfile?
+        var previousSelectedProfileID: UUID
+        var attemptedSelectedProfileID: UUID
+        var previousDraftProfile: EQProfile
+        var attemptedDraftProfile: EQProfile
+        var previousPreviewReturnProfile: EQProfile?
+        var attemptedPreviewReturnProfile: EQProfile?
+        var mappingChanges: [MappingChange]
+
+        init(profileID: UUID, previous: ProfileRollback?, attempted: ProfileRollback) {
+            self.profileID = profileID
+            attemptedProfile = attempted.profileStore.profiles.first { $0.id == profileID }
+            attemptedSelectedProfileID = attempted.selectedProfileID
+            attemptedDraftProfile = attempted.draftProfile
+            attemptedPreviewReturnProfile = attempted.previewReturnProfile
+
+            guard let previous else {
+                previousProfile = attemptedProfile
+                previousProfileIndex = attempted.profileStore.profiles.firstIndex { $0.id == profileID }
+                previousSelectedProfileID = attempted.selectedProfileID
+                previousDraftProfile = attempted.draftProfile
+                previousPreviewReturnProfile = attempted.previewReturnProfile
+                mappingChanges = []
+                return
+            }
+            previousProfile = previous.profileStore.profiles.first { $0.id == profileID }
+            previousProfileIndex = previous.profileStore.profiles.firstIndex { $0.id == profileID }
+            previousSelectedProfileID = previous.selectedProfileID
+            previousDraftProfile = previous.draftProfile
+            previousPreviewReturnProfile = previous.previewReturnProfile
+            let outputUIDs = Set(previous.profileStore.outputMappings.map(\.outputDeviceUID))
+                .union(attempted.profileStore.outputMappings.map(\.outputDeviceUID))
+            mappingChanges = outputUIDs.compactMap { outputUID in
+                let previousMapping = previous.profileStore.outputMappings.first {
+                    $0.outputDeviceUID == outputUID
+                }
+                let attemptedMapping = attempted.profileStore.outputMappings.first {
+                    $0.outputDeviceUID == outputUID
+                }
+                guard previousMapping != attemptedMapping else {
+                    return nil
+                }
+                return MappingChange(
+                    outputUID: outputUID,
+                    previous: previousMapping,
+                    previousIndex: previous.profileStore.outputMappings.firstIndex {
+                        $0.outputDeviceUID == outputUID
+                    },
+                    attempted: attemptedMapping
+                )
+            }
+        }
+    }
+
+    private struct EngineProfileReconciliation: Sendable {
+        var confirmation: EngineProfileConfirmation
+        var failedAttempts: [FailedEngineProfileAttempt]
+    }
+
+    private final class ConfirmedEngineProfileState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var confirmation: EngineProfileConfirmation?
+        private var failedAttempts: [FailedEngineProfileAttempt] = []
+
+        func reconciliation(
+            after failedAttempt: FailedEngineProfileAttempt,
+            fallback: EngineProfileConfirmation?
+        ) -> EngineProfileReconciliation? {
             lock.withLock {
-                self.rollback = rollback
+                appendIfNeeded(failedAttempt)
+                guard let confirmation = confirmation ?? fallback else {
+                    return nil
+                }
+                return EngineProfileReconciliation(
+                    confirmation: confirmation,
+                    failedAttempts: failedAttempts
+                )
+            }
+        }
+
+        func recordCancelledAttempt(_ failedAttempt: FailedEngineProfileAttempt) {
+            lock.withLock {
+                appendIfNeeded(failedAttempt)
+            }
+        }
+
+        func activeProfileID() -> UUID? {
+            lock.withLock { confirmation?.activeProfile.id }
+        }
+
+        func confirm(_ confirmation: EngineProfileConfirmation) {
+            lock.withLock {
+                self.confirmation = confirmation
+                failedAttempts = []
+            }
+        }
+
+        func acknowledge(_ reconciliation: EngineProfileReconciliation) {
+            guard let lastAppliedID = reconciliation.failedAttempts.last?.id else {
+                return
+            }
+            lock.withLock {
+                guard let lastAppliedIndex = failedAttempts.firstIndex(where: { $0.id == lastAppliedID }) else {
+                    return
+                }
+                failedAttempts.removeFirst(lastAppliedIndex + 1)
             }
         }
 
         func clear() {
             lock.withLock {
-                rollback = nil
+                confirmation = nil
+                failedAttempts = []
             }
+        }
+
+        private func appendIfNeeded(_ failedAttempt: FailedEngineProfileAttempt) {
+            guard !failedAttempts.contains(where: { $0.id == failedAttempt.id }) else {
+                return
+            }
+            failedAttempts.append(failedAttempt)
         }
     }
 
     private enum EngineWork: Sendable {
         case start(output: AudioOutputDevice, profile: EQProfile, rollback: ProfileRollback?)
         case restart(profile: EQProfile, rollback: ProfileRollback?)
+
+        var profile: EQProfile {
+            switch self {
+            case .start(_, let profile, _), .restart(let profile, _):
+                return profile
+            }
+        }
+
+        var rollback: ProfileRollback? {
+            switch self {
+            case .start(_, _, let rollback), .restart(_, let rollback):
+                return rollback
+            }
+        }
     }
 
     private enum EngineWorkResult: Sendable {
         case success(AudioOutputDevice)
-        case profileChangeNotApplied(any Error, AudioOutputDevice, ProfileRollback?)
+        case profileChangeNotApplied(any Error, AudioOutputDevice, EngineProfileReconciliation?)
         case failure(any Error, AudioOutputDevice?)
         case cancelled
     }
@@ -931,6 +1068,7 @@ final class GlassEQAppModel {
             reportProfileActionFailure(error)
             return
         }
+        let rollback = profileRollback()
         var profile = activeProfile
         profile.isBypassed = isBypassed
         var store = profileStore
@@ -943,7 +1081,7 @@ final class GlassEQAppModel {
                 draftProfile = profile
             }
             saveStore()
-            synchronizeActiveProfileProcessing()
+            synchronizeActiveProfileProcessing(rollback: rollback)
             notifyModelDidChange()
         } catch {
             reportProfileActionFailure(error)
@@ -1058,6 +1196,12 @@ final class GlassEQAppModel {
             reportProfileActionFailure(error)
             return
         }
+        guard profileStore.profiles.contains(where: { $0.id == profile.id }) else {
+            reportProfileActionFailure(SettingsCommandFailure(
+                message: localized("The selected profile no longer exists. Refresh settings and try again.")
+            ))
+            return
+        }
         let rollback = profileRollback()
         guard lifecycleState != .terminating,
               lifecycleState != .sleeping,
@@ -1075,7 +1219,7 @@ final class GlassEQAppModel {
         } else if hasPendingProfileReplacingEngineWork {
             reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
         } else if engine.updateDSP(profile: profile) {
-            confirmedEngineProfileState.confirm(profileRollback())
+            confirmedEngineProfileState.confirm(EngineProfileConfirmation(profileRollback()))
             statusMessage = localized("Previewing settings for \(profile.name)")
         } else {
             restartEngineWithActiveProfile(rollback: rollback)
@@ -1102,7 +1246,7 @@ final class GlassEQAppModel {
         } else if hasPendingProfileReplacingEngineWork {
             reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
         } else if engine.updateDSP(profile: profile) {
-            confirmedEngineProfileState.confirm(profileRollback())
+            confirmedEngineProfileState.confirm(EngineProfileConfirmation(profileRollback()))
             statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
         } else {
             restartEngineWithActiveProfile(rollback: rollback)
@@ -1246,7 +1390,9 @@ final class GlassEQAppModel {
         guard profileStore.profiles.count > 1 else {
             throw SettingsCommandFailure(message: localized("At least one profile is required."))
         }
-        guard id != activeProfile.id else {
+        guard id != activeProfile.id,
+              id != previewReturnProfile?.id,
+              id != confirmedEngineProfileState.activeProfileID() else {
             throw SettingsCommandFailure(message: localized("Switch to another profile before deleting the active profile"))
         }
 
@@ -1460,12 +1606,19 @@ final class GlassEQAppModel {
         let engine = engine
         let defaultOutputLookup = defaultOutputLookup
         let engineWorkExecutor = engineWorkExecutor
-        let confirmation = profileRollback()
+        let attemptedRollback = profileRollback()
+        let confirmation = EngineProfileConfirmation(attemptedRollback)
+        let failedAttempt = FailedEngineProfileAttempt(
+            profileID: work.profile.id,
+            previous: work.rollback,
+            attempted: attemptedRollback
+        )
         let confirmedEngineProfileState = confirmedEngineProfileState
         let workTask = engineWorkExecutor.enqueue(priority: .userInitiated) {
             Self.performEngineWork(
                 work,
                 confirmation: confirmation,
+                failedAttempt: failedAttempt,
                 confirmedState: confirmedEngineProfileState,
                 engine: engine,
                 defaultOutputLookup: defaultOutputLookup
@@ -1510,7 +1663,7 @@ final class GlassEQAppModel {
         startObserver(sendInitialValue: false)
         if isRunning {
             if engine.updateDSP(profile: activeProfile) {
-                confirmedEngineProfileState.confirm(profileRollback())
+                confirmedEngineProfileState.confirm(EngineProfileConfirmation(profileRollback()))
                 statusMessage = processingStatus(outputName: currentOutputName, profileName: activeProfile.name)
             } else {
                 restartEngineWithActiveProfile(rollback: rollback)
@@ -1582,7 +1735,8 @@ final class GlassEQAppModel {
 
     nonisolated private static func performEngineWork(
         _ work: EngineWork,
-        confirmation: ProfileRollback,
+        confirmation: EngineProfileConfirmation,
+        failedAttempt: FailedEngineProfileAttempt,
         confirmedState: ConfirmedEngineProfileState,
         engine: any AudioEngineControlling,
         defaultOutputLookup: any DefaultOutputLookingUp
@@ -1593,6 +1747,7 @@ final class GlassEQAppModel {
             switch work {
             case .start(let requestedOutput, let profile, let rollback):
                 guard !Task.isCancelled else {
+                    confirmedState.recordCancelledAttempt(failedAttempt)
                     return .cancelled
                 }
                 attemptedOutput = requestedOutput
@@ -1603,7 +1758,10 @@ final class GlassEQAppModel {
                         return .profileChangeNotApplied(
                             error,
                             activeOutput,
-                            confirmedState.current() ?? rollback
+                            confirmedState.reconciliation(
+                                after: failedAttempt,
+                                fallback: rollback.map(EngineProfileConfirmation.init)
+                            )
                         )
                     }
                     throw error
@@ -1617,6 +1775,7 @@ final class GlassEQAppModel {
                 switch engine.state {
                 case .running(let runningOutput):
                     guard !Task.isCancelled else {
+                        confirmedState.recordCancelledAttempt(failedAttempt)
                         return .cancelled
                     }
                     attemptedOutput = runningOutput
@@ -1627,7 +1786,10 @@ final class GlassEQAppModel {
                             return .profileChangeNotApplied(
                                 error,
                                 activeOutput,
-                                confirmedState.current() ?? rollback
+                                confirmedState.reconciliation(
+                                    after: failedAttempt,
+                                    fallback: rollback.map(EngineProfileConfirmation.init)
+                                )
                             )
                         }
                         throw error
@@ -1643,6 +1805,7 @@ final class GlassEQAppModel {
                     let defaultOutput = try defaultOutputLookup.defaultOutputDevice()
                     attemptedOutput = defaultOutput
                     if Task.isCancelled {
+                        confirmedState.recordCancelledAttempt(failedAttempt)
                         return .cancelled
                     }
                     try engine.start(output: defaultOutput, profile: profile)
@@ -1704,11 +1867,12 @@ final class GlassEQAppModel {
             wakeReconnectAttempts = 0
             wasRunningBeforeSleep = false
             statusMessage = processingStatus(outputName: output.name, profileName: activeProfile.name)
-        case .profileChangeNotApplied(_, let output, let rollback):
+        case .profileChangeNotApplied(_, let output, let reconciliation):
             refreshCurrentOutputMetadata(from: output)
-            if let rollback {
-                restoreProfileRollback(rollback, persist: true)
-                statusMessage = localized("Profile change was not applied; audio is still running with \(rollback.activeProfile.name).")
+            if let reconciliation {
+                restoreEngineProfileReconciliation(reconciliation, persist: true)
+                confirmedEngineProfileState.acknowledge(reconciliation)
+                statusMessage = localized("Profile change was not applied; audio is still running with \(reconciliation.confirmation.activeProfile.name).")
             } else {
                 statusMessage = localized("Profile change was not applied; audio is still running with \(activeProfile.name).")
             }
@@ -1739,6 +1903,81 @@ final class GlassEQAppModel {
         selectedProfileID = rollback.selectedProfileID
         draftProfile = rollback.draftProfile
         previewReturnProfile = rollback.previewReturnProfile
+        if persist {
+            saveStore()
+        }
+    }
+
+    private func restoreEngineProfileReconciliation(
+        _ reconciliation: EngineProfileReconciliation,
+        persist: Bool
+    ) {
+        for failedAttempt in reconciliation.failedAttempts.reversed() {
+            if failedAttempt.previousProfile != failedAttempt.attemptedProfile,
+               profileStore.profiles.first(where: { $0.id == failedAttempt.profileID }) == failedAttempt.attemptedProfile {
+                profileStore.profiles.removeAll { $0.id == failedAttempt.profileID }
+                if let previousProfile = failedAttempt.previousProfile {
+                    let insertionIndex = min(
+                        failedAttempt.previousProfileIndex ?? profileStore.profiles.endIndex,
+                        profileStore.profiles.endIndex
+                    )
+                    profileStore.profiles.insert(
+                        previousProfile,
+                        at: insertionIndex
+                    )
+                }
+            }
+            for mappingChange in failedAttempt.mappingChanges.reversed() {
+                let currentMapping = profileStore.outputMappings.first {
+                    $0.outputDeviceUID == mappingChange.outputUID
+                }
+                guard currentMapping == mappingChange.attempted else {
+                    continue
+                }
+                profileStore.outputMappings.removeAll {
+                    $0.outputDeviceUID == mappingChange.outputUID
+                }
+                if let previousMapping = mappingChange.previous {
+                    profileStore.outputMappings.insert(
+                        previousMapping,
+                        at: min(
+                            mappingChange.previousIndex ?? profileStore.outputMappings.endIndex,
+                            profileStore.outputMappings.endIndex
+                        )
+                    )
+                }
+            }
+            if selectedProfileID == failedAttempt.attemptedSelectedProfileID {
+                selectedProfileID = failedAttempt.previousSelectedProfileID
+            }
+            if draftProfile == failedAttempt.attemptedDraftProfile {
+                draftProfile = failedAttempt.previousDraftProfile
+            }
+            if previewReturnProfile == failedAttempt.attemptedPreviewReturnProfile {
+                previewReturnProfile = failedAttempt.previousPreviewReturnProfile
+            }
+        }
+        let confirmation = reconciliation.confirmation
+        let profileIDs = Set(profileStore.profiles.map(\.id))
+        let storedConfirmation = profileStore.profiles.first {
+            $0.id == confirmation.activeProfile.id
+        } ?? profileStore.profiles[0]
+        profileStore.outputMappings.removeAll { !profileIDs.contains($0.profileID) }
+        if !profileIDs.contains(profileStore.fallbackProfileID) {
+            profileStore.fallbackProfileID = storedConfirmation.id
+        }
+        activeProfile = confirmation.activeProfile
+        if !profileStore.profiles.contains(where: { $0.id == selectedProfileID }) {
+            selectedProfileID = storedConfirmation.id
+        }
+        if !profileStore.profiles.contains(where: { $0.id == draftProfile.id }) {
+            draftProfile = profileStore.profiles.first(where: { $0.id == selectedProfileID })
+                ?? storedConfirmation
+        }
+        if let previewReturnProfile,
+           !profileStore.profiles.contains(where: { $0.id == previewReturnProfile.id }) {
+            self.previewReturnProfile = nil
+        }
         if persist {
             saveStore()
         }

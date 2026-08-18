@@ -33,6 +33,48 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func preservingRetryFailureDoesNotMutateTheProfileStore() async {
+        let running = makeProfile(name: "Retry Running")
+        let inactive = makeProfile(name: "Retry Inactive")
+        let output = makeOutput(uid: "retry-preserved-output", name: "Retry Preserved Output")
+        let store = ProfileStore(
+            profiles: [running, inactive],
+            outputMappings: [OutputDeviceProfileMapping(
+                outputDeviceUID: output.uid,
+                profileID: running.id
+            )],
+            fallbackProfileID: inactive.id
+        )
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output)),
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        engine.updateError = TestAudioError.updateFailed
+        engine.updateErrorPreservesRunningState = true
+
+        model.retryAudioEngine()
+
+        await waitUntil {
+            engine.updateCalls.count == 1 && model.statusMessage.contains("not applied")
+        }
+
+        #expect(model.profileStore == store)
+        #expect(model.activeProfile == running)
+        #expect(engine.state == .running(output: output))
+    }
+
+    @Test
     func retryStoppedEngineQueriesDefaultOutputAndStarts() async {
         let output = makeOutput(uid: "default-output", name: "Default Output")
         let engine = FakeAudioEngine()
@@ -458,6 +500,9 @@ struct GlassEQAppModelLifecycleTests {
             model.lifecycleState == .running && engine.startCalls.count == 1
         }
 
+        try model.createProfile(kind: .graphic10)
+        let createdProfile = model.draftProfile
+
         engine.updateDSPResult = false
         engine.updateError = TestAudioError.updateFailed
         engine.updateErrorPreservesRunningState = true
@@ -485,9 +530,130 @@ struct GlassEQAppModelLifecycleTests {
         #expect(engine.state == .running(output: firstOutput))
         #expect(model.currentOutputUID == firstOutput.uid)
         #expect(model.activeProfile == confirmedProfile)
-        #expect(model.selectedProfileID == confirmedProfile.id)
-        #expect(model.draftProfile == confirmedProfile)
+        #expect(model.selectedProfileID == createdProfile.id)
+        #expect(model.draftProfile == createdProfile)
+        #expect(model.profileStore.profiles.contains(createdProfile))
+        #expect(model.profileStore.profiles.count == store.profiles.count + 1)
+        #expect(model.profileStore.outputMappings == store.outputMappings)
+        #expect(model.profileStore.fallbackProfileID == store.fallbackProfileID)
+    }
+
+    @Test
+    func cancelledQueuedProfileChangeStillRollsBackIfItsReplacementFails() async throws {
+        let firstOutput = makeOutput(uid: "queued-first", name: "Queued First", id: 200)
+        let secondOutput = makeOutput(uid: "queued-second", name: "Queued Second", id: 300)
+        let confirmed = makeProfile(name: "Queued Confirmed")
+        var intermediate = confirmed
+        intermediate.name = "Queued Intermediate"
+        var final = confirmed
+        final.name = "Queued Final"
+        let store = ProfileStore(profiles: [confirmed], fallbackProfileID: confirmed.id)
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        engine.blockStart(for: secondOutput.uid)
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil { engine.startCalls.count == 2 }
+        #expect(engine.waitUntilStartIsBlocked(for: secondOutput.uid, timeout: .now() + 1))
+
+        try model.apply(profile: intermediate)
+        await settleAsyncWork()
+        #expect(engine.startCalls.count == 2)
+        try model.apply(profile: final)
+        engine.startError = TestAudioError.startFailed
+        engine.startErrorProfileID = final.id
+        engine.startErrorPreservesRunningState = true
+        engine.unblockStart(for: secondOutput.uid)
+
+        await waitUntil {
+            engine.startCalls.count == 3
+                && model.lifecycleState == .running
+                && model.statusMessage.contains("not applied")
+        }
+
+        #expect(engine.startCalls.map(\.profile.name) == [confirmed.name, confirmed.name, final.name])
+        #expect(engine.state == .running(output: secondOutput))
+        #expect(model.activeProfile == confirmed)
         #expect(model.profileStore == store)
+    }
+
+    @Test
+    func chainedMappingRollbackPassesThroughADeletedIntermediateProfile() async throws {
+        let firstOutput = makeOutput(uid: "mapping-chain-first", name: "Mapping Chain First", id: 200)
+        let secondOutput = makeOutput(uid: "mapping-chain-second", name: "Mapping Chain Second", id: 300)
+        let confirmed = makeProfile(name: "Mapping Chain Confirmed")
+        let intermediate = makeProfile(name: "Mapping Chain Intermediate")
+        let final = makeProfile(name: "Mapping Chain Final")
+        let originalMapping = OutputDeviceProfileMapping(
+            outputDeviceUID: secondOutput.uid,
+            profileID: confirmed.id
+        )
+        let store = ProfileStore(
+            profiles: [confirmed, intermediate, final],
+            outputMappings: [originalMapping],
+            fallbackProfileID: confirmed.id
+        )
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        engine.blockStart(for: secondOutput.uid)
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil { engine.startCalls.count == 2 }
+        #expect(engine.waitUntilStartIsBlocked(for: secondOutput.uid, timeout: .now() + 1))
+
+        try model.useForCurrentOutput(profile: intermediate)
+        await settleAsyncWork()
+        #expect(engine.startCalls.count == 2)
+        try model.useForCurrentOutput(profile: final)
+        try model.deleteProfile(id: intermediate.id)
+        engine.startError = TestAudioError.startFailed
+        engine.startErrorProfileID = final.id
+        engine.startErrorPreservesRunningState = true
+        engine.unblockStart(for: secondOutput.uid)
+
+        await waitUntil {
+            engine.startCalls.count == 3
+                && model.lifecycleState == .running
+                && model.statusMessage.contains("not applied")
+        }
+
+        #expect(model.activeProfile == confirmed)
+        #expect(model.profileStore.outputMappings == [originalMapping])
+        #expect(!model.profileStore.profiles.contains(where: { $0.id == intermediate.id }))
+        #expect(model.profileStore.profile(forOutputUID: secondOutput.uid) == confirmed)
+        #expect(engine.state == .running(output: secondOutput))
     }
 
     @Test
@@ -953,6 +1119,23 @@ struct GlassEQAppModelLifecycleTests {
         #expect(engine.startCalls.isEmpty)
         #expect(lookup.defaultOutputCalls == 0)
         #expect(model.lifecycleState == .stopped)
+    }
+
+    @Test
+    func staleDeletedProfileCannotBePreviewed() {
+        let running = makeProfile(name: "Preview Current")
+        let stale = makeProfile(name: "Preview Deleted")
+        let store = ProfileStore(profiles: [running], fallbackProfileID: running.id)
+        let engine = FakeAudioEngine()
+        let model = makeModel(store: store, engine: engine)
+
+        model.preview(profile: stale)
+
+        #expect(model.activeProfile == running)
+        #expect(model.profileStore == store)
+        #expect(model.previewReturnProfile == nil)
+        #expect(engine.updateDSPCalls.isEmpty)
+        #expect(model.statusMessage.contains("no longer exists"))
     }
 
     @Test
@@ -1644,6 +1827,278 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.activeProfile == running)
         #expect(model.selectedProfileID == running.id)
         #expect(model.draftProfile == running)
+        #expect(model.profileStore == store)
+        #expect(engine.state == .running(output: output))
+    }
+
+    @Test
+    func failedCurrentOutputProfileChangeRestoresOnlyItsMapping() async throws {
+        let running = makeProfile(name: "Mapped Running")
+        let requested = makeProfile(name: "Mapped Requested")
+        let unrelated = makeProfile(name: "Unrelated")
+        let output = makeOutput(uid: "mapping-failure-output", name: "Mapping Failure Output")
+        let unrelatedOutputUID = "unrelated-output"
+        let store = ProfileStore(
+            profiles: [running, requested, unrelated],
+            outputMappings: [
+                OutputDeviceProfileMapping(outputDeviceUID: output.uid, profileID: running.id),
+                OutputDeviceProfileMapping(outputDeviceUID: unrelatedOutputUID, profileID: unrelated.id),
+            ],
+            fallbackProfileID: running.id
+        )
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output)),
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        engine.updateDSPResult = false
+        engine.updateError = TestAudioError.updateFailed
+        engine.updateErrorPreservesRunningState = true
+
+        try model.useForCurrentOutput(profile: requested)
+
+        await waitUntil {
+            engine.updateCalls.count == 1 && model.statusMessage.contains("not applied")
+        }
+
+        #expect(model.activeProfile == running)
+        #expect(model.profileStore.outputMappings == store.outputMappings)
+        #expect(model.profileStore.profiles.contains(requested))
+        #expect(engine.state == .running(output: output))
+    }
+
+    @Test
+    func confirmedRunningProfileCannotBeDeletedDuringPendingSwitch() async throws {
+        let running = makeProfile(name: "Delete Guard Running")
+        let requested = makeProfile(name: "Delete Guard Requested")
+        let output = makeOutput(uid: "delete-guard-output", name: "Delete Guard Output")
+        let store = ProfileStore(
+            profiles: [running, requested],
+            outputMappings: [OutputDeviceProfileMapping(
+                outputDeviceUID: output.uid,
+                profileID: running.id
+            )],
+            fallbackProfileID: running.id
+        )
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output)),
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        engine.updateDSPResult = false
+        engine.updateError = TestAudioError.updateFailed
+        engine.updateErrorPreservesRunningState = true
+        engine.blockUpdate(for: requested.id)
+
+        try model.useForCurrentOutput(profile: requested)
+        await waitUntil { engine.updateCalls.count == 1 }
+        #expect(engine.waitUntilUpdateIsBlocked(for: requested.id, timeout: .now() + 1))
+
+        #expect(throws: SettingsCommandFailure.self) {
+            try model.deleteProfile(id: running.id)
+        }
+        engine.unblockUpdate(for: requested.id)
+        await waitUntil { model.statusMessage.contains("not applied") }
+
+        #expect(model.activeProfile == running)
+        #expect(model.profileStore == store)
+        #expect(engine.state == .running(output: output))
+    }
+
+    @Test
+    func failedProfileChangeDoesNotRestoreADeletedSelection() async throws {
+        let running = makeProfile(name: "Selection Running")
+        let deleted = makeProfile(name: "Selection Deleted")
+        let requested = makeProfile(name: "Selection Requested")
+        let output = makeOutput(uid: "selection-delete-output", name: "Selection Delete Output")
+        let store = ProfileStore(
+            profiles: [running, deleted, requested],
+            fallbackProfileID: running.id
+        )
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output)),
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        model.selectProfile(deleted.id)
+        engine.updateDSPResult = false
+        engine.updateError = TestAudioError.updateFailed
+        engine.updateErrorPreservesRunningState = true
+        engine.blockUpdate(for: requested.id)
+
+        try model.apply(profile: requested)
+        await waitUntil { engine.updateCalls.count == 1 }
+        #expect(engine.waitUntilUpdateIsBlocked(for: requested.id, timeout: .now() + 1))
+        try model.deleteProfile(id: deleted.id)
+        engine.unblockUpdate(for: requested.id)
+        await waitUntil { model.statusMessage.contains("not applied") }
+
+        #expect(model.activeProfile == running)
+        #expect(model.selectedProfileID == running.id)
+        #expect(model.draftProfile == running)
+        #expect(!model.profileStore.profiles.contains(where: { $0.id == deleted.id }))
+        #expect(engine.state == .running(output: output))
+    }
+
+    @Test
+    func failedCurrentOutputChangeDoesNotRestoreMappingToDeletedProfile() async throws {
+        let mapped = makeProfile(name: "Deleted Mapping")
+        let running = makeProfile(name: "Mapping Confirmed")
+        let requested = makeProfile(name: "Mapping Requested")
+        let output = makeOutput(uid: "deleted-mapping-output", name: "Deleted Mapping Output")
+        let store = ProfileStore(
+            profiles: [mapped, running, requested],
+            outputMappings: [OutputDeviceProfileMapping(
+                outputDeviceUID: output.uid,
+                profileID: mapped.id
+            )],
+            fallbackProfileID: running.id
+        )
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output)),
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        try model.apply(profile: running)
+        #expect(model.activeProfile == running)
+
+        engine.updateDSPResult = false
+        engine.updateError = TestAudioError.updateFailed
+        engine.updateErrorPreservesRunningState = true
+        engine.blockUpdate(for: requested.id)
+        try model.useForCurrentOutput(profile: requested)
+        await waitUntil { engine.updateCalls.count == 1 }
+        #expect(engine.waitUntilUpdateIsBlocked(for: requested.id, timeout: .now() + 1))
+
+        try model.deleteProfile(id: mapped.id)
+        engine.unblockUpdate(for: requested.id)
+        await waitUntil { model.statusMessage.contains("not applied") }
+
+        #expect(model.activeProfile == running)
+        #expect(model.profileStore.profiles == [running, requested])
+        #expect(model.profileStore.outputMappings.isEmpty)
+        #expect(model.profileStore.profile(forOutputUID: output.uid) == running)
+        #expect(engine.state == .running(output: output))
+    }
+
+    @Test
+    func failedProfileChangePreservesLaterSavedEditToTheSameProfile() async throws {
+        let running = makeProfile(name: "Initially Running")
+        var attempted = running
+        attempted.name = "Attempted Apply"
+        var laterSaved = running
+        laterSaved.name = "Saved While Apply Was Pending"
+        let output = makeOutput(uid: "later-edit-output", name: "Later Edit Output")
+        let store = ProfileStore(profiles: [running], fallbackProfileID: running.id)
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output)),
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        engine.updateDSPResult = false
+        engine.updateError = TestAudioError.updateFailed
+        engine.updateErrorPreservesRunningState = true
+        engine.blockUpdate(for: attempted.id)
+
+        try model.apply(profile: attempted)
+        await waitUntil { engine.updateCalls.count == 1 }
+        #expect(engine.waitUntilUpdateIsBlocked(for: attempted.id, timeout: .now() + 1))
+
+        try model.setFallback(profile: laterSaved)
+        engine.unblockUpdate(for: attempted.id)
+
+        await waitUntil { model.statusMessage.contains("not applied") }
+
+        #expect(model.activeProfile == running)
+        #expect(model.profileStore.profiles == [laterSaved])
+        #expect(model.profileStore.fallbackProfileID == laterSaved.id)
+        #expect(engine.state == .running(output: output))
+    }
+
+    @Test
+    func failedNewProfileChangeDoesNotLeaveDanglingFallback() async throws {
+        let running = makeProfile(name: "Fallback Running")
+        let requested = makeProfile(name: "Fallback Requested")
+        let output = makeOutput(uid: "fallback-failure-output", name: "Fallback Failure Output")
+        let store = ProfileStore(profiles: [running], fallbackProfileID: running.id)
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output)),
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        engine.updateDSPResult = false
+        engine.updateError = TestAudioError.updateFailed
+        engine.updateErrorPreservesRunningState = true
+        engine.blockUpdate(for: requested.id)
+
+        try model.apply(profile: requested)
+        await waitUntil { engine.updateCalls.count == 1 }
+        #expect(engine.waitUntilUpdateIsBlocked(for: requested.id, timeout: .now() + 1))
+        try model.setFallback(profile: requested)
+        engine.unblockUpdate(for: requested.id)
+        await waitUntil { model.statusMessage.contains("not applied") }
+
+        #expect(model.activeProfile == running)
         #expect(model.profileStore == store)
         #expect(engine.state == .running(output: output))
     }
