@@ -57,6 +57,74 @@ private func localizedDecimal(
     return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
 }
 
+func editableNumberText(_ value: Double, locale: Locale = .autoupdatingCurrent) -> String {
+    let formatter = NumberFormatter()
+    formatter.locale = locale
+    formatter.numberStyle = .decimal
+    formatter.usesGroupingSeparator = false
+    formatter.usesSignificantDigits = true
+    formatter.minimumSignificantDigits = 1
+    formatter.maximumSignificantDigits = 17
+    return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+}
+
+func parseEditableNumber(_ text: String, locale: Locale = .autoupdatingCurrent) -> Double? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+        return nil
+    }
+
+    let formatter = NumberFormatter()
+    formatter.locale = locale
+    formatter.numberStyle = .decimal
+    if let groupingSeparator = formatter.groupingSeparator,
+       !groupingSeparator.isEmpty,
+       groupingSeparator != formatter.decimalSeparator,
+       trimmed.contains(groupingSeparator) {
+        return nil
+    }
+
+    var normalized = trimmed
+    if let decimalSeparator = formatter.decimalSeparator,
+       decimalSeparator != "." {
+        normalized = normalized.replacingOccurrences(of: decimalSeparator, with: ".")
+    }
+    if let minusSign = formatter.minusSign,
+       minusSign != "-" {
+        normalized = normalized.replacingOccurrences(of: minusSign, with: "-")
+    }
+    if let plusSign = formatter.plusSign,
+       plusSign != "+" {
+        normalized = normalized.replacingOccurrences(of: plusSign, with: "+")
+    }
+    var asciiNormalized = ""
+    for scalar in normalized.unicodeScalars {
+        if scalar.properties.numericType == .decimal,
+           let numericValue = scalar.properties.numericValue,
+           let asciiDigit = UnicodeScalar(Int(numericValue) + 48) {
+            asciiNormalized.unicodeScalars.append(asciiDigit)
+        } else {
+            asciiNormalized.unicodeScalars.append(scalar)
+        }
+    }
+    let parsed = Double(asciiNormalized)
+    guard let parsed, parsed.isFinite else {
+        return nil
+    }
+    return parsed
+}
+
+func clampedEditableNumber(
+    _ text: String,
+    range: ClosedRange<Double>,
+    locale: Locale = .autoupdatingCurrent
+) -> Double? {
+    guard let parsed = parseEditableNumber(text, locale: locale) else {
+        return nil
+    }
+    return min(max(parsed, range.lowerBound), range.upperBound)
+}
+
 private func localizedInteger(_ value: Int) -> String {
     value.formatted(.number.locale(.autoupdatingCurrent))
 }
@@ -98,6 +166,37 @@ private func localizedFrameCount(_ value: UInt32) -> String {
     return value == 1 ? localized("\(number) frame") : localized("\(number) frames")
 }
 
+func settingsSnapshotPreservingLocalDraft(
+    current: SettingsSnapshot,
+    latest: SettingsSnapshot
+) -> SettingsSnapshot {
+    guard latest.profiles.contains(where: { $0.id == current.selectedProfileID }) else {
+        return latest
+    }
+
+    let selectedProfile = current.profiles.first(where: { $0.id == current.selectedProfileID })
+        ?? current.draftProfile
+    let hasUnsavedDraft = current.draftProfile != selectedProfile
+    var merged = latest
+    merged.selectedProfileID = current.selectedProfileID
+    merged.draftProfile = hasUnsavedDraft
+        ? current.draftProfile
+        : latest.profiles.first(where: { $0.id == current.selectedProfileID }) ?? current.draftProfile
+    return merged
+}
+
+func settingsSnapshotAfterCommand(
+    current: SettingsSnapshot,
+    dispatched: SettingsSnapshot,
+    latest: SettingsSnapshot
+) -> SettingsSnapshot {
+    guard current.selectedProfileID == dispatched.selectedProfileID,
+          current.draftProfile == dispatched.draftProfile else {
+        return settingsSnapshotPreservingLocalDraft(current: current, latest: latest)
+    }
+    return latest
+}
+
 private func localizedLatency(milliseconds: Double) -> String {
     let number = localizedDecimal(milliseconds, minimumFractionDigits: 2, maximumFractionDigits: 2)
     return localized("\(number) ms")
@@ -118,6 +217,7 @@ public struct SettingsView: View {
     @Bindable var model: GlassEQSettingsViewModel
     @State private var snapshot: SettingsSnapshot
     @State private var tab = EditorSection.editor
+    @State private var draftEditGeneration = 0
 
     public init(model: GlassEQSettingsViewModel) {
         self._model = Bindable(wrappedValue: model)
@@ -145,6 +245,7 @@ public struct SettingsView: View {
                 snapshot: snapshot,
                 draftProfile: $snapshot.draftProfile,
                 tab: $tab,
+                draftEditGeneration: draftEditGeneration,
                 hasUnsavedDraft: hasUnsavedDraft,
                 onApply: applyDraft,
                 onRevert: revertDraft,
@@ -225,6 +326,7 @@ public struct SettingsView: View {
 
     private func revertDraft() {
         snapshot.draftProfile = selectedProfile
+        draftEditGeneration &+= 1
     }
 
     private func useDraftForCurrentOutput() {
@@ -236,8 +338,9 @@ public struct SettingsView: View {
     }
 
     private func importProfile(format: ImportFormat, name: String, text: String) async -> Bool {
+        let dispatchedSnapshot = snapshot
         let response = await model.perform(.importProfile(format: format, name: name, text: text))
-        syncFromModel()
+        refreshSnapshotFromModel(afterCommandDispatchedFrom: dispatchedSnapshot)
         return response?.importSucceeded ?? false
     }
 
@@ -285,29 +388,20 @@ public struct SettingsView: View {
         perform(.deleteProfile(snapshot.selectedProfileID))
     }
 
-    private func syncFromModel() {
-        snapshot = model.snapshot
-    }
-
     private func refreshMetricsFromModel() {
         snapshot.metrics = model.snapshot.metrics
     }
 
     private func refreshSnapshotFromModel() {
-        let latest = model.snapshot
+        snapshot = settingsSnapshotPreservingLocalDraft(current: snapshot, latest: model.snapshot)
+    }
 
-        guard latest.profiles.contains(where: { $0.id == snapshot.selectedProfileID }) else {
-            snapshot = latest
-            return
-        }
-
-        let selectedProfileID = snapshot.selectedProfileID
-        let draftProfile = hasUnsavedDraft
-            ? snapshot.draftProfile
-            : latest.profiles.first(where: { $0.id == selectedProfileID }) ?? snapshot.draftProfile
-        snapshot = latest
-        snapshot.selectedProfileID = selectedProfileID
-        snapshot.draftProfile = draftProfile
+    private func refreshSnapshotFromModel(afterCommandDispatchedFrom dispatchedSnapshot: SettingsSnapshot) {
+        snapshot = settingsSnapshotAfterCommand(
+            current: snapshot,
+            dispatched: dispatchedSnapshot,
+            latest: model.snapshot
+        )
     }
 
     private func updateMetricsPolling() {
@@ -324,9 +418,10 @@ public struct SettingsView: View {
     }
 
     private func perform(_ command: SettingsCommand) {
+        let dispatchedSnapshot = snapshot
         Task { @MainActor in
             await model.perform(command)
-            syncFromModel()
+            refreshSnapshotFromModel(afterCommandDispatchedFrom: dispatchedSnapshot)
         }
     }
 }
@@ -788,6 +883,7 @@ private struct ProfileDetail: View {
     var snapshot: SettingsSnapshot
     @Binding var draftProfile: EQProfile
     @Binding var tab: EditorSection
+    var draftEditGeneration: Int
     var hasUnsavedDraft: Bool
     var onApply: () -> Void
     var onRevert: () -> Void
@@ -829,7 +925,8 @@ private struct ProfileDetail: View {
                         case .editor:
                             EditorTab(
                                 draftProfile: $draftProfile,
-                                sampleRate: snapshot.currentOutputSampleRate
+                                sampleRate: snapshot.currentOutputSampleRate,
+                                draftEditGeneration: draftEditGeneration
                             )
                             .disabled(isProfileStoreProtected)
                         case .importer:
@@ -1043,13 +1140,15 @@ private extension EQChannelMode {
 private struct EditorTab: View {
     @Binding var draftProfile: EQProfile
     var sampleRate: Double
+    var draftEditGeneration: Int
     @State private var editChannel = EQEditChannel.left
     @State private var analysis: EQAnalysisSnapshot
     @State private var analysisTask: Task<Void, Never>?
 
-    init(draftProfile: Binding<EQProfile>, sampleRate: Double) {
+    init(draftProfile: Binding<EQProfile>, sampleRate: Double, draftEditGeneration: Int) {
         self._draftProfile = draftProfile
         self.sampleRate = sampleRate
+        self.draftEditGeneration = draftEditGeneration
         self._analysis = State(
             initialValue: EQAnalysisSnapshot(
                 profile: draftProfile.wrappedValue,
@@ -1117,11 +1216,13 @@ private struct EditorTab: View {
                     title: localized("Preamp"),
                     value: activePreampBinding,
                     range: -24...12,
+                    validationRange: ProfilePersistence.preampRange,
                     step: 0.1,
                     suffix: "dB"
                 )
+                .id("preamp:\(activeEditContextID)")
 
-                    SettingRow(title: localized("Bypass")) {
+                SettingRow(title: localized("Bypass")) {
                     Toggle(localized("Bypass"), isOn: $draftProfile.isBypassed)
                         .labelsHidden()
                         .accessibilityLabel(Text(localized("Bypass")))
@@ -1153,8 +1254,10 @@ private struct EditorTab: View {
 
             if draftProfile.mode == .parametric {
                 ParametricFilterEditor(filters: activeFiltersBinding)
+                    .id("parametric:\(activeEditContextID)")
             } else {
                 GraphicFilterEditor(filters: activeFiltersBinding)
+                    .id("graphic:\(activeEditContextID)")
                     .cardPanel(padding: 16)
             }
 
@@ -1245,6 +1348,11 @@ private struct EditorTab: View {
         default:
             $draftProfile.filters
         }
+    }
+
+    private var activeEditContextID: String {
+        let channel = draftProfile.channelMode == .stereo ? editChannel.rawValue : "linked"
+        return "\(draftProfile.id.uuidString):\(channel):\(draftEditGeneration)"
     }
 
     private func setChannelMode(_ mode: EQChannelMode) {
@@ -1511,14 +1619,24 @@ private struct GraphicFilterEditor: View {
                     Text(filter.frequency.frequencyLabel)
                         .font(.caption.monospacedDigit())
                         .frame(width: 64, alignment: .trailing)
-                    Slider(value: $filter.gainDB, in: -12...12, step: 0.1)
+                    Slider(
+                        value: Binding(
+                            get: { filter.gainDB },
+                            set: { filter.gainDB = quantized($0, step: 0.1) }
+                        ),
+                        in: -12...12
+                    )
                         .frame(maxWidth: 640)
                         .accessibilityLabel(Text(localized("Gain at \(filter.frequency.frequencyLabel)")))
                         .accessibilityValue(Text(filter.gainDB.dbLabel))
                         .accessibilityHint(Text(localized("Adjusts this graphic EQ band")))
-                    Text(filter.gainDB.dbLabel)
-                        .font(.caption.monospacedDigit())
-                        .frame(width: 56, alignment: .trailing)
+                    EditableValueText(
+                        title: localized("Gain"),
+                        value: $filter.gainDB,
+                        range: ProfilePersistence.gainRange,
+                        display: filter.gainDB.dbLabel,
+                        width: 56
+                    )
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(Text(localized("Graphic filter row")))
@@ -1579,6 +1697,7 @@ private struct ParametricFilterEditor: View {
                         selectedFilterID = filters.first?.id
                     }
                 )
+                .id(binding.wrappedValue.id)
                 .frame(minWidth: 260, maxWidth: .infinity, alignment: .topLeading)
             } else {
                 ContentUnavailableView(localized("No Filter Selected"), systemImage: "slider.horizontal.3")
@@ -1735,20 +1854,59 @@ private struct ParametricFilterInspector: View {
                 .accessibilityHint(Text(localized("Changes the selected filter type")))
             }
 
-            SliderRow(title: localized("Frequency"), value: $filter.frequency, range: 20...20_000, step: 1, suffix: "Hz")
-            SliderRow(title: localized("Gain"), value: $filter.gainDB, range: -24...24, step: 0.1, suffix: "dB")
-            SliderRow(title: localized("Q"), value: $filter.q, range: 0.1...10, step: 0.01, suffix: "")
+            SliderRow(
+                title: localized("Frequency"),
+                value: $filter.frequency,
+                range: 20...20_000,
+                validationRange: ProfilePersistence.frequencyRange,
+                step: 1,
+                suffix: "Hz",
+                scale: .logarithmic
+            )
+            SliderRow(
+                title: localized("Gain"),
+                value: $filter.gainDB,
+                range: -24...24,
+                validationRange: ProfilePersistence.gainRange,
+                step: 0.1,
+                suffix: "dB"
+            )
+            SliderRow(
+                title: localized("Q"),
+                value: $filter.q,
+                range: 0.1...10,
+                validationRange: ProfilePersistence.qRange,
+                step: 0.01,
+                suffix: ""
+            )
         }
         .cardPanel(padding: 16)
     }
+}
+
+// Quantizes slider output in the binding instead of passing `step:` to Slider — stepped macOS
+// sliders render a tick mark per step, which draws a dense line of dots under the track.
+func quantized(_ value: Double, step: Double) -> Double {
+    guard step > 0 else {
+        return value
+    }
+    let scale = 1 / step
+    return (value * scale).rounded() / scale
+}
+
+private enum SliderScale {
+    case linear
+    case logarithmic
 }
 
 private struct SliderRow: View {
     var title: String
     @Binding var value: Double
     var range: ClosedRange<Double>
+    var validationRange: ClosedRange<Double>? = nil
     var step: Double
     var suffix: String
+    var scale = SliderScale.linear
 
     var body: some View {
         HStack(spacing: 12) {
@@ -1756,15 +1914,45 @@ private struct SliderRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(width: 88, alignment: .leading)
-            Slider(value: $value, in: range, step: step)
+            Slider(value: sliderValue, in: sliderRange)
                 .frame(minWidth: 80)
                 .frame(maxWidth: 640)
                 .accessibilityLabel(Text(title))
                 .accessibilityValue(Text(label))
                 .accessibilityHint(Text(localized("Adjusts \(title.lowercased())")))
-            Text(label)
-                .font(.caption.monospacedDigit())
-                .frame(width: 64, alignment: .trailing)
+            EditableValueText(
+                title: title,
+                value: $value,
+                range: validationRange ?? range,
+                display: label
+            )
+        }
+    }
+
+    private var sliderValue: Binding<Double> {
+        switch scale {
+        case .linear:
+            Binding(
+                get: { value },
+                set: { value = quantized($0, step: step) }
+            )
+        case .logarithmic:
+            Binding(
+                get: { log10(min(max(value, range.lowerBound), range.upperBound)) },
+                set: {
+                    let restored = min(max(pow(10, $0), range.lowerBound), range.upperBound)
+                    value = quantized(restored, step: step)
+                }
+            )
+        }
+    }
+
+    private var sliderRange: ClosedRange<Double> {
+        switch scale {
+        case .linear:
+            range
+        case .logarithmic:
+            log10(range.lowerBound)...log10(range.upperBound)
         }
     }
 
@@ -1776,6 +1964,139 @@ private struct SliderRow: View {
             return value.dbLabel
         }
         return localizedDecimal(value, minimumFractionDigits: 2, maximumFractionDigits: 2)
+    }
+}
+
+// Value readout that becomes a text field on click, so exact values can be typed instead of
+// approximated by dragging the slider.
+private struct EditableValueText: View {
+    var title: String
+    @Binding var value: Double
+    var range: ClosedRange<Double>
+    var display: String
+    var width: CGFloat = 64
+
+    @State private var isEditing = false
+    @State private var editText = ""
+    @State private var editSession = EditableValueEditSession()
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Group {
+            if isEditing {
+                TextField(title, text: $editText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption.monospacedDigit())
+                    .multilineTextAlignment(.trailing)
+                    .focused($isFocused)
+                    .onAppear {
+                        isFocused = true
+                    }
+                    .onSubmit(commit)
+                    .onExitCommand(perform: cancel)
+                    .onChange(of: editText) { _, text in
+                        updateValue(from: text)
+                    }
+                    .onChange(of: value) { _, newValue in
+                        guard isEditing,
+                              editSession.valueChanged(newValue) else {
+                            return
+                        }
+                        editText = editableNumberText(newValue)
+                        isEditing = false
+                    }
+                    .onChange(of: isFocused) { _, focused in
+                        if !focused {
+                            commit()
+                        }
+                    }
+            } else {
+                Button {
+                    editText = editableText
+                    editSession.begin(value: value)
+                    isEditing = true
+                } label: {
+                    Text(display)
+                        .font(.caption.monospacedDigit())
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .help(localized("Click to type a value"))
+            }
+        }
+        .frame(width: width)
+        .accessibilityLabel(Text(localized("\(title) value")))
+        .accessibilityValue(Text(display))
+        .accessibilityHint(Text(localized("Edits \(title.lowercased()) as text")))
+    }
+
+    private var editableText: String {
+        editableNumberText(value)
+    }
+
+    private func commit() {
+        guard isEditing else {
+            return
+        }
+        guard updateValue(from: editText) else {
+            cancel()
+            return
+        }
+        editSession.finish()
+        isEditing = false
+    }
+
+    private func cancel() {
+        if let originalValue = editSession.cancel() {
+            value = originalValue
+        }
+        isEditing = false
+    }
+
+    @discardableResult
+    private func updateValue(from text: String) -> Bool {
+        guard isEditing,
+              let parsed = clampedEditableNumber(text, range: range) else {
+            return false
+        }
+        editSession.recordTextDrivenValue(parsed)
+        value = parsed
+        return true
+    }
+}
+
+struct EditableValueEditSession: Equatable {
+    private var originalValue: Double?
+    private var textDrivenValue: Double?
+
+    mutating func begin(value: Double) {
+        originalValue = value
+        textDrivenValue = nil
+    }
+
+    mutating func recordTextDrivenValue(_ value: Double) {
+        textDrivenValue = value
+    }
+
+    mutating func valueChanged(_ value: Double) -> Bool {
+        if textDrivenValue == value {
+            textDrivenValue = nil
+            return false
+        }
+        finish()
+        return true
+    }
+
+    mutating func cancel() -> Double? {
+        let value = originalValue
+        finish()
+        return value
+    }
+
+    mutating func finish() {
+        originalValue = nil
+        textDrivenValue = nil
     }
 }
 

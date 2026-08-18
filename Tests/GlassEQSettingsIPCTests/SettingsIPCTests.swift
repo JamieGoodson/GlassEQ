@@ -7,6 +7,185 @@ import Testing
 
 @Suite
 struct SettingsIPCTests {
+    @Test(arguments: [0.707, 0.12345678901234567, 20_000.125])
+    func editableNumberTextRoundTripsTypedPrecision(_ value: Double) {
+        let locale = Locale(identifier: "en_US_POSIX")
+
+        let text = editableNumberText(value, locale: locale)
+
+        #expect(parseEditableNumber(text, locale: locale) == value)
+    }
+
+    @Test
+    func editableNumberParsingSupportsLocaleDecimalSeparator() {
+        #expect(parseEditableNumber("0,707", locale: Locale(identifier: "fi_FI")) == 0.707)
+    }
+
+    @Test
+    func editableNumberParsingSupportsLocalizedDecimalDigits() {
+        let locale = Locale(identifier: "ar_EG")
+        let text = editableNumberText(-6.5, locale: locale)
+
+        #expect(parseEditableNumber(text, locale: locale) == -6.5)
+        #expect(parseEditableNumber("١٢٫٥", locale: locale) == 12.5)
+    }
+
+    @Test
+    func editableNumberParsingRejectsLocaleGroupingSeparators() {
+        #expect(parseEditableNumber("1.234", locale: Locale(identifier: "de_DE")) == nil)
+        #expect(parseEditableNumber("1,234", locale: Locale(identifier: "de_DE")) == 1.234)
+    }
+
+    @Test
+    func editableNumberUpdatesClampValidDraftText() {
+        let range = -24.0...24.0
+
+        #expect(clampedEditableNumber("-12.345", range: range, locale: Locale(identifier: "en_US_POSIX")) == -12.345)
+        #expect(clampedEditableNumber("30", range: range, locale: Locale(identifier: "en_US_POSIX")) == 24)
+        #expect(clampedEditableNumber("-", range: range, locale: Locale(identifier: "en_US_POSIX")) == nil)
+    }
+
+    @Test
+    func editableNumberPreservesPersistableValuesOutsideSliderRanges() {
+        let locale = Locale(identifier: "en_US_POSIX")
+
+        #expect(clampedEditableNumber("24000", range: ProfilePersistence.frequencyRange, locale: locale) == 24_000)
+        #expect(clampedEditableNumber("120", range: ProfilePersistence.gainRange, locale: locale) == 120)
+        #expect(clampedEditableNumber("-30", range: ProfilePersistence.preampRange, locale: locale) == -30)
+        #expect(clampedEditableNumber("20", range: ProfilePersistence.qRange, locale: locale) == 20)
+    }
+
+    @Test
+    func editableValueCancellationRestoresTheValueFromTheStartOfEditing() {
+        var session = EditableValueEditSession()
+        session.begin(value: -3)
+        session.recordTextDrivenValue(-6)
+
+        let textChangeWasExternal = session.valueChanged(-6)
+        let restoredValue = session.cancel()
+
+        #expect(!textChangeWasExternal)
+        #expect(restoredValue == -3)
+    }
+
+    @Test
+    func editableValueInvalidCommitRestoresTheValueFromTheStartOfEditing() {
+        var session = EditableValueEditSession()
+        session.begin(value: 10)
+        session.recordTextDrivenValue(2)
+        _ = session.valueChanged(2)
+
+        let finalValue: Double?
+        if let parsed = clampedEditableNumber("", range: 0...20) {
+            finalValue = parsed
+        } else {
+            finalValue = session.cancel()
+        }
+
+        #expect(finalValue == 10)
+    }
+
+    @Test
+    func editableValueExternalChangesResetTheActiveSession() {
+        var session = EditableValueEditSession()
+        session.begin(value: -3)
+        session.recordTextDrivenValue(-6)
+
+        let textChangeWasExternal = session.valueChanged(-6)
+        let headroomChangeWasExternal = session.valueChanged(-12)
+        let restoredValue = session.cancel()
+
+        #expect(!textChangeWasExternal)
+        #expect(headroomChangeWasExternal)
+        #expect(restoredValue == nil)
+    }
+
+    @Test
+    func delayedSnapshotPreservesNewerLocalDraftAndSelection() {
+        let first = EQProfile(name: "First", mode: .parametric, filters: [])
+        let second = EQProfile(name: "Second", mode: .parametric, filters: [])
+        var editedSecond = second
+        editedSecond.preampDB = -3.25
+        var current = SettingsSnapshotDTO.disconnected
+        current.profiles = [first, second]
+        current.selectedProfileID = second.id
+        current.draftProfile = editedSecond
+        var latest = current
+        latest.selectedProfileID = first.id
+        latest.draftProfile = first
+        latest.statusMessage = "Command completed"
+
+        let merged = settingsSnapshotPreservingLocalDraft(current: current, latest: latest)
+
+        #expect(merged.selectedProfileID == second.id)
+        #expect(merged.draftProfile == editedSecond)
+        #expect(merged.statusMessage == "Command completed")
+    }
+
+    @Test
+    func commandSnapshotAdoptsIntentionalSelectionChangeWhenLocalDraftIsUnchanged() {
+        let original = EQProfile(name: "Original", mode: .parametric, filters: [])
+        let duplicate = EQProfile(name: "Duplicate", mode: .parametric, filters: [])
+        var dispatched = SettingsSnapshotDTO.disconnected
+        dispatched.profiles = [original]
+        dispatched.selectedProfileID = original.id
+        dispatched.draftProfile = original
+        var latest = dispatched
+        latest.profiles = [original, duplicate]
+        latest.selectedProfileID = duplicate.id
+        latest.draftProfile = duplicate
+
+        let merged = settingsSnapshotAfterCommand(
+            current: dispatched,
+            dispatched: dispatched,
+            latest: latest
+        )
+
+        #expect(merged.selectedProfileID == duplicate.id)
+        #expect(merged.draftProfile == duplicate)
+    }
+
+    @Test
+    func commandSnapshotPreservesEditsMadeWhileCommandWasPending() {
+        let first = EQProfile(name: "First", mode: .parametric, filters: [])
+        let second = EQProfile(name: "Second", mode: .parametric, filters: [])
+        var dispatched = SettingsSnapshotDTO.disconnected
+        dispatched.profiles = [first, second]
+        dispatched.selectedProfileID = first.id
+        dispatched.draftProfile = first
+        var current = dispatched
+        current.selectedProfileID = second.id
+        current.draftProfile = second
+        var latest = dispatched
+        latest.statusMessage = "Command completed"
+
+        let merged = settingsSnapshotAfterCommand(
+            current: current,
+            dispatched: dispatched,
+            latest: latest
+        )
+
+        #expect(merged.selectedProfileID == second.id)
+        #expect(merged.draftProfile == second)
+        #expect(merged.statusMessage == "Command completed")
+    }
+
+    @Test
+    func sliderQuantizationDoesNotIntroduceDisplayNoise() {
+        let locale = Locale(identifier: "en_US_POSIX")
+
+        for tenth in -240...240 {
+            let expected = Double(tenth) / 10
+            let value = quantized(expected, step: 0.1)
+            #expect(editableNumberText(value, locale: locale) == editableNumberText(expected, locale: locale))
+        }
+    }
+
+    @Test(arguments: ["nan", "inf", "-inf", "infinity", "-infinity"])
+    func editableNumberParsingRejectsNonFiniteValues(_ text: String) {
+        #expect(parseEditableNumber(text, locale: Locale(identifier: "en_US_POSIX")) == nil)
+    }
+
     @Test
     func pipeMessageRoundTripsConnectRequest() throws {
         let message = SettingsPipeMessage.request(sessionToken: "token", id: "request-1", kind: .connect, command: nil)
