@@ -182,6 +182,10 @@ func canResetPlaybackBufferCalibration(isRunning: Bool, outputUID: String) -> Bo
     isRunning && !outputUID.isEmpty
 }
 
+func sampleRateConversionIsActive(isRunning: Bool, metricsActive: Bool) -> Bool {
+    isRunning && metricsActive
+}
+
 private func localizedLatency(milliseconds: Double) -> String {
     let number = localizedDecimal(milliseconds, minimumFractionDigits: 2, maximumFractionDigits: 2)
     return localized("\(number) ms")
@@ -2341,7 +2345,10 @@ private struct OutputTab: View {
                     LabeledContent(localized("Adaptive Render Failures"), value: localizedInteger(snapshot.metrics.adaptivePlaybackRenderFailures))
                     LabeledContent(
                         localized("Sample Rate Conversion"),
-                        value: snapshot.metrics.playbackSampleRateConversionActive
+                        value: sampleRateConversionIsActive(
+                            isRunning: snapshot.isRunning,
+                            metricsActive: snapshot.metrics.playbackSampleRateConversionActive
+                        )
                             ? localized("Active")
                             : localized("Inactive")
                     )

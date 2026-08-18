@@ -38,6 +38,13 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func sampleRateConversionRequiresARunningEngineAndActiveMetrics() {
+        #expect(sampleRateConversionIsActive(isRunning: true, metricsActive: true))
+        #expect(!sampleRateConversionIsActive(isRunning: false, metricsActive: true))
+        #expect(!sampleRateConversionIsActive(isRunning: true, metricsActive: false))
+    }
+
+    @Test
     func editableNumberParsingRejectsLocaleGroupingSeparators() {
         #expect(parseEditableNumber("1.234", locale: Locale(identifier: "de_DE")) == nil)
         #expect(parseEditableNumber("1,234", locale: Locale(identifier: "de_DE")) == 1.234)
