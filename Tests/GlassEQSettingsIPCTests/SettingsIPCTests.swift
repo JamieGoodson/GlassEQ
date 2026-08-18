@@ -22,6 +22,15 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func editableNumberParsingSupportsLocalizedDecimalDigits() {
+        let locale = Locale(identifier: "ar_EG")
+        let text = editableNumberText(-6.5, locale: locale)
+
+        #expect(parseEditableNumber(text, locale: locale) == -6.5)
+        #expect(parseEditableNumber("١٢٫٥", locale: locale) == 12.5)
+    }
+
+    @Test
     func editableNumberParsingRejectsLocaleGroupingSeparators() {
         #expect(parseEditableNumber("1.234", locale: Locale(identifier: "de_DE")) == nil)
         #expect(parseEditableNumber("1,234", locale: Locale(identifier: "de_DE")) == 1.234)

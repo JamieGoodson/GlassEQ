@@ -1393,6 +1393,48 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func malformedSettingsIPCBeforeConnectingRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        try launcher.writeHelperOutput(Data("not-json\n".utf8))
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("IPC failed before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
+    func settingsBootstrapWriteFailureRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: ClosedInputSettingsHelperLauncher(),
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("IPC failed before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
     func activeInProcessSettingsFallbackIsReusedWithoutLaunchingHelper() {
         let model = makeModel()
 
@@ -1772,6 +1814,36 @@ private struct PermissionDeniedSettingsHelperLauncher: SettingsHelperLaunching {
         terminationHandler: @escaping @Sendable (Process) -> Void
     ) throws -> SettingsHelperLaunch {
         throw POSIXError(.EPERM)
+    }
+}
+
+private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching {
+    private let input = Pipe()
+    private let output = Pipe()
+    private let error = Pipe()
+
+    func launch(
+        executableURL: URL,
+        arguments: [String],
+        terminationHandler: @escaping @Sendable (Process) -> Void
+    ) throws -> SettingsHelperLaunch {
+        SettingsHelperLaunch(process: Process(), input: input, output: output, error: error)
+    }
+
+    func writeHelperOutput(_ data: Data) throws {
+        try output.fileHandleForWriting.write(contentsOf: data)
+    }
+}
+
+private struct ClosedInputSettingsHelperLauncher: SettingsHelperLaunching {
+    func launch(
+        executableURL: URL,
+        arguments: [String],
+        terminationHandler: @escaping @Sendable (Process) -> Void
+    ) throws -> SettingsHelperLaunch {
+        let input = Pipe()
+        try input.fileHandleForReading.close()
+        return SettingsHelperLaunch(process: Process(), input: input, output: Pipe(), error: Pipe())
     }
 }
 
