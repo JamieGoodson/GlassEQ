@@ -1755,6 +1755,62 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsReadyAcknowledgmentFailureRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "connect",
+            kind: .connect,
+            command: nil
+        ))
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .response(_, "connect", _, _) = message {
+                    return true
+                }
+                return false
+            }
+        }
+
+        try launcher.closeHelperInput()
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "ready",
+            kind: .ready,
+            command: nil
+        ))
+
+        await waitUntil {
+            model.inProcessSettingsPresentationGeneration == 1
+        }
+        #expect(model.statusMessage.contains("IPC failed before connecting"))
+        #expect(!coordinator.isHelperReadyForTesting)
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
     func settingsBootstrapWriteFailureRequestsInProcessFallback() async throws {
         let model = makeModel()
         let coordinator = SettingsCoordinator(
@@ -2241,6 +2297,12 @@ private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching,
 
     func closeHelperOutput() throws {
         try output.fileHandleForWriting.close()
+    }
+
+    func closeHelperInput() throws {
+        appReadPump?.invalidate(handle: input.fileHandleForReading)
+        appReadPump = nil
+        try input.fileHandleForReading.close()
     }
 
 }
