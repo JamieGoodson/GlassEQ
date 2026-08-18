@@ -975,7 +975,9 @@ struct GlassEQAppModelLifecycleTests {
         observers.observers.last?.emit(.success(output))
 
         await waitUntil {
-            engine.stopCallCount == 1 && engine.startCalls.count == 2
+            engine.stopCallCount == 1
+                && engine.startCalls.count == 2
+                && model.lifecycleState == .running
         }
 
         #expect(engine.events == ["start:\(output.uid)", "stop", "start:\(output.uid)"])
