@@ -29,6 +29,12 @@ struct GlassEQApp: App {
         Window(localized("Configure GlassEQ"), id: GlassEQWindowID.inProcessSettings) {
             SettingsView(model: model.inProcessSettingsViewModel())
                 .frame(minWidth: 760, minHeight: 500)
+                .onAppear {
+                    model.inProcessSettingsDidAppear()
+                }
+                .onDisappear {
+                    model.inProcessSettingsDidDisappear()
+                }
         }
         .defaultSize(width: 1180, height: 720)
         .windowResizability(.contentMinSize)
@@ -392,6 +398,7 @@ final class GlassEQAppModel {
     @ObservationIgnored private let engineWorkExecutor = EngineWorkExecutor()
     @ObservationIgnored lazy var settingsCoordinator = SettingsCoordinator(model: self)
     @ObservationIgnored var inProcessSettingsViewModelStorage: GlassEQSettingsViewModel?
+    @ObservationIgnored var inProcessSettingsIsPresented = false
 
     private enum ProfilePersistenceMode: Equatable, Sendable {
         case normal
@@ -1928,7 +1935,10 @@ private struct MenuBarView: View {
 
                 Button {
                     dismiss()
-                    if case .inProcessFallback = model.openSettings() {
+                    switch model.openSettings() {
+                    case .helper:
+                        break
+                    case .inProcessFallback, .activeInProcessFallback:
                         openWindow(id: GlassEQWindowID.inProcessSettings)
                         NSApplication.shared.activate(ignoringOtherApps: true)
                     }

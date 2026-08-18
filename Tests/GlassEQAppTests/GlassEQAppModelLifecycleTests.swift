@@ -1343,6 +1343,16 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func activeInProcessSettingsFallbackIsReusedWithoutLaunchingHelper() {
+        let model = makeModel()
+
+        model.inProcessSettingsDidAppear()
+        #expect(model.openSettings() == .activeInProcessFallback)
+
+        model.inProcessSettingsDidDisappear()
+    }
+
+    @Test
     func inProcessSettingsFallbackPerformsCommandsAndTracksModelChanges() async throws {
         let model = makeModel()
         let settingsModel = model.inProcessSettingsViewModel()
