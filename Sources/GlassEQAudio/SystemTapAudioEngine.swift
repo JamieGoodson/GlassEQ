@@ -176,6 +176,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         var outputIOProcID: AudioDeviceIOProcID?
         var activeOutput: AudioOutputDevice?
         var activeProfile: EQProfile?
+        var profileRevision: UInt64 = 0
         var bufferFrameSizeRestorations: [String: BufferFrameSizeRestoration] = [:]
         var sampleRateRestorations: [String: SampleRateRestoration] = [:]
         var outputRebuildGeneration = 0
@@ -195,6 +196,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         var runtime: AudioRuntime
         var tapSampleRate: Double
         var originalBufferFrameSize: UInt32
+        var profileRevision: UInt64
     }
 
     private struct PlaybackBufferRenegotiationPreparation {
@@ -218,11 +220,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     }
 
     private enum AdaptivePlaybackRenderRecoveryAction {
-        case restart(output: AudioOutputDevice, profile: EQProfile)
+        case restart(output: AudioOutputDevice, profile: EQProfile, profileRevision: UInt64)
         case fail(AudioEngineFailure)
     }
 
     private struct StaleOutputRebuild: Error {}
+    private struct StaleProfileRequest: Error {}
 
     struct BufferFrameSizeRestoration: Equatable, Sendable {
         var uid: String
@@ -1439,6 +1442,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     }
 
     public func start(output: AudioOutputDevice, profile: EQProfile) throws {
+        try start(output: output, profile: profile, expectedProfileRevision: nil)
+    }
+
+    private func start(
+        output: AudioOutputDevice,
+        profile: EQProfile,
+        expectedProfileRevision: UInt64?
+    ) throws {
         pausePlaybackBufferAdaptation()
         defer {
             updatePlaybackBufferAdaptationTimer()
@@ -1449,6 +1460,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
         do {
             var preparation = try control.withLock { state in
+                if let expectedProfileRevision,
+                   state.profileRevision != expectedProfileRevision {
+                    throw StaleProfileRequest()
+                }
                 previousState = state.state
                 previousStatus = state.status
                 state.status = .starting
@@ -1456,12 +1471,31 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 // refreshes it under the same mute guard used for topology changes so normal
                 // outputs regain their full capture bandwidth without leaking dry audio.
                 try ensureCaptureHalfLocked(&state, output: output, profile: profile)
-                return try prepareOutputRebuildLocked(&state, output: output, profile: profile)
+                state.profileRevision &+= 1
+                return try prepareOutputRebuildLocked(
+                    &state,
+                    output: output,
+                    profile: profile,
+                    profileRevision: state.profileRevision
+                )
             }
             let refreshedOutput = try CoreAudioDeviceQuery.outputDevice(id: preparation.output.id)
             preparation.output = refreshedOutput
             preparation.originalBufferFrameSize = refreshedOutput.bufferFrameSize
             activePreparation = preparation
+            try control.withLock { state in
+                guard state.outputRebuildGeneration == preparation.generation,
+                      state.runtime === preparation.runtime,
+                      state.captureRunning else {
+                    throw StaleOutputRebuild()
+                }
+                if Self.shouldRecordSampleRateRestoration(
+                    tapSampleRate: preparation.tapSampleRate,
+                    output: refreshedOutput
+                ) {
+                    try recordSampleRateRestorationIfNeeded(for: refreshedOutput, state: &state)
+                }
+            }
             let matchedOutput = try preparePlaybackOutput(
                 tapSampleRate: preparation.tapSampleRate,
                 output: preparation.output
@@ -1485,6 +1519,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             }
         } catch is StaleOutputRebuild {
             return
+        } catch is StaleProfileRequest {
+            return
         } catch {
             var shouldRethrow = true
             control.withLock { state in
@@ -1496,9 +1532,6 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 if error is TopologyRebuildMuteGuardUnavailable {
                     state.state = previousState
                     state.status = previousStatus
-                    if case .running = previousState {
-                        shouldRethrow = false
-                    }
                     return
                 }
                 let failure = audioEngineFailure(from: error)
@@ -1547,7 +1580,11 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
     }
 
-    private func updateDSPLocked(_ state: inout ControlState, profile: EQProfile) -> Bool {
+    private func updateDSPLocked(
+        _ state: inout ControlState,
+        profile: EQProfile,
+        incrementsProfileRevision: Bool = true
+    ) -> Bool {
         guard let runtime = state.runtime,
               let activeProfile = state.activeProfile else {
             return false
@@ -1576,6 +1613,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         runtime.publishPendingDSPConfig(preparedConfig)
         runtime.setBypassed(profile.isBypassed)
         state.activeProfile = profile
+        if incrementsProfileRevision {
+            state.profileRevision &+= 1
+        }
         return true
     }
 
@@ -1610,6 +1650,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         control.withLock { state in
             state.runtime?.setBypassed(isBypassed)
             state.activeProfile?.isBypassed = isBypassed
+            state.profileRevision &+= 1
         }
     }
 
@@ -1649,7 +1690,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             outputUID: outputUID,
             at: playbackBufferCalibrationStoreURL
         )
-        let activeOutputAndProfile = control.withLock { state -> (AudioOutputDevice, EQProfile)? in
+        let activeOutputAndProfile = control.withLock { state -> (AudioOutputDevice, EQProfile, UInt64)? in
             if state.playbackBufferCalibrationProbe?.outputUID == outputUID {
                 state.playbackBufferCalibrationProbe = nil
             }
@@ -1665,11 +1706,15 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                   let profile = state.activeProfile else {
                 return nil
             }
-            return (output, profile)
+            return (output, profile, state.profileRevision)
         }
-        if let (activeOutput, activeProfile) = activeOutputAndProfile {
+        if let (activeOutput, activeProfile, profileRevision) = activeOutputAndProfile {
             let freshOutput = try CoreAudioDeviceQuery.outputDevice(id: activeOutput.id)
-            try start(output: freshOutput, profile: activeProfile)
+            try start(
+                output: freshOutput,
+                profile: activeProfile,
+                expectedProfileRevision: profileRevision
+            )
         }
     }
 
@@ -1694,6 +1739,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         stopOutputHalfLocked(&state)
         stopCaptureHalfLocked(&state)
         state.activeProfile = nil
+        state.profileRevision &+= 1
         state.handledPlaybackInstabilityGeneration = 0
         state.adaptivePlaybackRenderRecoveryAttempts = 0
         state.adaptivePlaybackRenderRecoveryHealthGeneration = nil
@@ -1716,7 +1762,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 tapSampleRate: state.tapSampleRate,
                 output: output
             )
-            if !shouldRefreshCapture, updateDSPLocked(&state, profile: profile) {
+            if !shouldRefreshCapture,
+               updateDSPLocked(&state, profile: profile, incrementsProfileRevision: false) {
                 return
             }
             // Hold a second global muted tap while capture is recreated, so HAL-level muting
@@ -1803,7 +1850,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     private func prepareOutputRebuildLocked(
         _ state: inout ControlState,
         output: AudioOutputDevice,
-        profile: EQProfile
+        profile: EQProfile,
+        profileRevision: UInt64
     ) throws -> OutputRebuildPreparation {
         guard let runtime = state.runtime else {
             throw CoreAudioError(operation: "rebuildOutputHalf(missing runtime)", status: kAudioHardwareNotRunningError)
@@ -1813,21 +1861,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         let originalBufferFrameSize = output.bufferFrameSize
         _ = try Self.supportedRuntimeChannelCount(for: output)
         stopOutputHalfLocked(&state)
-        if state.tapSampleRate > 0,
-           abs(output.nominalSampleRate - state.tapSampleRate) >= 1,
-           !Self.shouldUseSampleRateConversion(
-               tapSampleRate: state.tapSampleRate,
-               output: output
-           ) {
-            try recordSampleRateRestorationIfNeeded(for: output, state: &state)
-        }
         return OutputRebuildPreparation(
             generation: state.outputRebuildGeneration,
             output: output,
             profile: profile,
             runtime: runtime,
             tapSampleRate: state.tapSampleRate,
-            originalBufferFrameSize: originalBufferFrameSize
+            originalBufferFrameSize: originalBufferFrameSize,
+            profileRevision: profileRevision
         )
     }
 
@@ -1843,6 +1884,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
         let runtime = preparation.runtime
         let output = preparation.output
+        let effectiveProfile = Self.effectiveOutputRebuildProfile(
+            preparedProfile: preparation.profile,
+            preparedProfileRevision: preparation.profileRevision,
+            activeProfile: state.activeProfile,
+            activeProfileRevision: state.profileRevision
+        )
         _ = try Self.supportedRuntimeChannelCount(for: matchedOutput)
         if state.bufferFrameSizeRestorations[output.uid] == nil {
             let restoration = BufferFrameSizeRestoration(
@@ -1923,7 +1970,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         // control-path opportunity to release those boxes before publishing the next config.
         runtime.drainDSPConfigBoxes()
         runtime.publishPendingDSPConfig(EQRenderConfiguration(
-            profile: Self.dspProfile(from: preparation.profile),
+            profile: Self.dspProfile(from: effectiveProfile),
             sampleRate: runtime.sampleRate,
             channelCount: runtime.channelCount,
             maximumUsableFrequency: EQRouteFrequencyPolicy.maximumUsableFrequency(
@@ -1947,7 +1994,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         // Unmute and re-anchor playback to the freshest captured audio on the new device.
         runtime.reprimePlayback()
 
-        state.activeProfile = preparation.profile
+        state.activeProfile = effectiveProfile
     }
 
     private func stopOutputHalfLocked(_ state: inout ControlState) {
@@ -2889,7 +2936,11 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 state.adaptivePlaybackRenderRecoveryAttempts += 1
                 state.adaptivePlaybackRenderRecoveryHealthGeneration = preparation.runtime
                     .playbackRenderHealthGeneration()
-                return .restart(output: preparation.output, profile: profile)
+                return .restart(
+                    output: preparation.output,
+                    profile: profile,
+                    profileRevision: state.profileRevision
+                )
             }
 
             let failure = AudioEngineFailure(
@@ -2907,9 +2958,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
 
         switch action {
-        case .restart(let output, let profile):
+        case .restart(let output, let profile, let profileRevision):
             do {
-                try start(output: output, profile: profile)
+                try start(
+                    output: output,
+                    profile: profile,
+                    expectedProfileRevision: profileRevision
+                )
             } catch {
                 let failure = control.withLock { state in
                     if case .failed(let failure) = state.status {
@@ -3018,11 +3073,34 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             && hasLowSampleRateEndpoint(tapSampleRate: tapSampleRate, output: output)
     }
 
+    static func shouldRecordSampleRateRestoration(
+        tapSampleRate: Double,
+        output: AudioOutputDevice
+    ) -> Bool {
+        tapSampleRate > 0
+            && abs(output.nominalSampleRate - tapSampleRate) >= 1
+            && !shouldUseSampleRateConversion(tapSampleRate: tapSampleRate, output: output)
+    }
+
+    static func effectiveOutputRebuildProfile(
+        preparedProfile: EQProfile,
+        preparedProfileRevision: UInt64,
+        activeProfile: EQProfile?,
+        activeProfileRevision: UInt64
+    ) -> EQProfile {
+        guard activeProfileRevision != preparedProfileRevision,
+              let activeProfile else {
+            return preparedProfile
+        }
+        return activeProfile
+    }
+
     static func shouldRefreshCaptureForOutput(
         tapSampleRate: Double,
         output: AudioOutputDevice
     ) -> Bool {
-        isLowSampleRate(tapSampleRate) && !isLowSampleRateRoute(output)
+        isLowSampleRate(tapSampleRate)
+            && output.nominalSampleRate - tapSampleRate >= 1
     }
 
     static func maximumPlaybackReservoirFrames(

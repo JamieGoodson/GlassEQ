@@ -209,6 +209,18 @@ func settingsSnapshotPreservingLocalDraft(
     return merged
 }
 
+func settingsSnapshotAfterCommand(
+    current: SettingsSnapshot,
+    dispatched: SettingsSnapshot,
+    latest: SettingsSnapshot
+) -> SettingsSnapshot {
+    guard current.selectedProfileID == dispatched.selectedProfileID,
+          current.draftProfile == dispatched.draftProfile else {
+        return settingsSnapshotPreservingLocalDraft(current: current, latest: latest)
+    }
+    return latest
+}
+
 private func localizedLatency(milliseconds: Double) -> String {
     let number = localizedDecimal(milliseconds, minimumFractionDigits: 2, maximumFractionDigits: 2)
     return localized("\(number) ms")
@@ -351,8 +363,9 @@ public struct SettingsView: View {
     }
 
     private func importProfile(format: ImportFormat, name: String, text: String) async -> Bool {
+        let dispatchedSnapshot = snapshot
         let response = await model.perform(.importProfile(format: format, name: name, text: text))
-        refreshSnapshotFromModel()
+        refreshSnapshotFromModel(afterCommandDispatchedFrom: dispatchedSnapshot)
         return response?.importSucceeded ?? false
     }
 
@@ -412,6 +425,14 @@ public struct SettingsView: View {
         snapshot = settingsSnapshotPreservingLocalDraft(current: snapshot, latest: model.snapshot)
     }
 
+    private func refreshSnapshotFromModel(afterCommandDispatchedFrom dispatchedSnapshot: SettingsSnapshot) {
+        snapshot = settingsSnapshotAfterCommand(
+            current: snapshot,
+            dispatched: dispatchedSnapshot,
+            latest: model.snapshot
+        )
+    }
+
     private func updateMetricsPolling() {
         if tab == .output {
             perform(.startMetricsPolling)
@@ -426,9 +447,10 @@ public struct SettingsView: View {
     }
 
     private func perform(_ command: SettingsCommand) {
+        let dispatchedSnapshot = snapshot
         Task { @MainActor in
             await model.perform(command)
-            refreshSnapshotFromModel()
+            refreshSnapshotFromModel(afterCommandDispatchedFrom: dispatchedSnapshot)
         }
     }
 }

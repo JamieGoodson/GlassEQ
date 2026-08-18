@@ -144,6 +144,54 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func commandSnapshotAdoptsIntentionalSelectionChangeWhenLocalDraftIsUnchanged() {
+        let original = EQProfile(name: "Original", mode: .parametric, filters: [])
+        let duplicate = EQProfile(name: "Duplicate", mode: .parametric, filters: [])
+        var dispatched = SettingsSnapshotDTO.disconnected
+        dispatched.profiles = [original]
+        dispatched.selectedProfileID = original.id
+        dispatched.draftProfile = original
+        var latest = dispatched
+        latest.profiles = [original, duplicate]
+        latest.selectedProfileID = duplicate.id
+        latest.draftProfile = duplicate
+
+        let merged = settingsSnapshotAfterCommand(
+            current: dispatched,
+            dispatched: dispatched,
+            latest: latest
+        )
+
+        #expect(merged.selectedProfileID == duplicate.id)
+        #expect(merged.draftProfile == duplicate)
+    }
+
+    @Test
+    func commandSnapshotPreservesEditsMadeWhileCommandWasPending() {
+        let first = EQProfile(name: "First", mode: .parametric, filters: [])
+        let second = EQProfile(name: "Second", mode: .parametric, filters: [])
+        var dispatched = SettingsSnapshotDTO.disconnected
+        dispatched.profiles = [first, second]
+        dispatched.selectedProfileID = first.id
+        dispatched.draftProfile = first
+        var current = dispatched
+        current.selectedProfileID = second.id
+        current.draftProfile = second
+        var latest = dispatched
+        latest.statusMessage = "Command completed"
+
+        let merged = settingsSnapshotAfterCommand(
+            current: current,
+            dispatched: dispatched,
+            latest: latest
+        )
+
+        #expect(merged.selectedProfileID == second.id)
+        #expect(merged.draftProfile == second)
+        #expect(merged.statusMessage == "Command completed")
+    }
+
+    @Test
     func sliderQuantizationDoesNotIntroduceDisplayNoise() {
         let locale = Locale(identifier: "en_US_POSIX")
 

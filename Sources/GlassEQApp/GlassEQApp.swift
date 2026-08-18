@@ -84,9 +84,12 @@ final class GlassEQAppDelegate: NSObject, NSApplicationDelegate {
                 sender.reply(toApplicationShouldTerminate: true)
                 return
             }
+            await model.stopAcceptingSettingsCommandsAndWait()
             let shouldTerminate = await model.flushStoreBeforeQuit()
             if shouldTerminate {
                 await model.cleanupForTerminationAndWait()
+            } else {
+                model.resumeSettingsCommandsAfterCancelledQuit()
             }
             sender.reply(toApplicationShouldTerminate: shouldTerminate)
         }
@@ -507,6 +510,7 @@ final class GlassEQAppModel {
     private let observerFactory: any DefaultOutputObservingMaking
     private let workspaceOpener: any WorkspaceOpening
     private let playbackBufferRenegotiationNotifier: any PlaybackBufferRenegotiationNotifying
+    private let profileImportOperation: @Sendable (ImportFormat, String, String) async -> Result<EQProfile, any Error>
     private let outputChangeSettlingDelayOverride: Duration?
     private let wakeReconnectDelayOverride: Duration?
     private let saveDebounceDelay: Duration
@@ -514,6 +518,9 @@ final class GlassEQAppModel {
     private var metricsTask: Task<Void, Never>?
     private var outputChangeTask: Task<Void, Never>?
     private var engineStartTask: Task<Void, Never>?
+    private var activeSettingsCommandCount = 0
+    private var acceptsSettingsCommands = true
+    private var settingsCommandDrainWaiters: [CheckedContinuation<Void, Never>] = []
     private var pendingSaveTask: Task<Void, Never>?
     private var lifecycleObserverTokens: [NSObjectProtocol] = []
     private var wasRunningBeforeSleep = false
@@ -587,6 +594,7 @@ final class GlassEQAppModel {
         registerAppDelegate: Bool = true,
         workspaceOpener: any WorkspaceOpening = NSWorkspace.shared,
         playbackBufferRenegotiationNotifier: any PlaybackBufferRenegotiationNotifying = SystemPlaybackBufferRenegotiationNotifier(),
+        profileImportOperation: (@Sendable (ImportFormat, String, String) async -> Result<EQProfile, any Error>)? = nil,
         saveDebounceDelay: Duration = .milliseconds(250),
         outputChangeSettlingDelayOverride: Duration? = nil,
         wakeReconnectDelayOverride: Duration? = nil
@@ -617,6 +625,18 @@ final class GlassEQAppModel {
         self.observerFactory = observerFactory
         self.workspaceOpener = workspaceOpener
         self.playbackBufferRenegotiationNotifier = playbackBufferRenegotiationNotifier
+        self.profileImportOperation = profileImportOperation ?? { format, name, text in
+            await Task.detached(priority: .userInitiated) {
+                Result<EQProfile, Error> {
+                    switch format {
+                    case .autoEQ:
+                        try EQProfileTextImporter.importAutoEQ(text, profileName: name)
+                    case .rew:
+                        try EQProfileTextImporter.importREW(text, profileName: name)
+                    }
+                }
+            }.value
+        }
         self.saveDebounceDelay = saveDebounceDelay
         self.outputChangeSettlingDelayOverride = outputChangeSettlingDelayOverride
         self.wakeReconnectDelayOverride = wakeReconnectDelayOverride
@@ -960,18 +980,11 @@ final class GlassEQAppModel {
         statusMessage = localized("Importing \(format.title)...")
         notifyModelDidChange()
 
-        let result = await Task.detached(priority: .userInitiated) {
-            Result<EQProfile, Error> {
-                let imported: EQProfile
-            switch format {
-            case .autoEQ:
-                imported = try EQProfileTextImporter.importAutoEQ(text, profileName: name)
-            case .rew:
-                imported = try EQProfileTextImporter.importREW(text, profileName: name)
-            }
-                return imported
-            }
-        }.value
+        let result = await profileImportOperation(format, name, text)
+        try Task.checkCancellation()
+        guard lifecycleState != .terminating else {
+            throw CancellationError()
+        }
 
         switch result {
         case .success(let imported):
@@ -1746,6 +1759,41 @@ final class GlassEQAppModel {
         }
     }
 
+    func beginSettingsCommand() throws {
+        guard acceptsSettingsCommands,
+              lifecycleState != .terminating else {
+            throw SettingsCommandFailure(message: localized("GlassEQ is shutting down."))
+        }
+        activeSettingsCommandCount += 1
+    }
+
+    func finishSettingsCommand() {
+        activeSettingsCommandCount -= 1
+        guard activeSettingsCommandCount == 0 else {
+            return
+        }
+        let waiters = settingsCommandDrainWaiters
+        settingsCommandDrainWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func stopAcceptingSettingsCommandsAndWait() async {
+        acceptsSettingsCommands = false
+        guard activeSettingsCommandCount > 0 else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            settingsCommandDrainWaiters.append(continuation)
+        }
+    }
+
+    func resumeSettingsCommandsAfterCancelledQuit() {
+        guard lifecycleState != .terminating else {
+            return
+        }
+        acceptsSettingsCommands = true
+    }
+
     func resetUnsupportedProfileStore() async throws {
         guard profilePersistenceMode.isProtected else {
             throw SettingsCommandFailure(message: localized("Profile store reset is only available for stores written by a newer GlassEQ."))
@@ -1771,7 +1819,9 @@ final class GlassEQAppModel {
                 NSApplication.shared.terminate(nil)
                 return
             }
+            await self.stopAcceptingSettingsCommandsAndWait()
             guard await self.flushStoreBeforeQuit() else {
+                self.resumeSettingsCommandsAfterCancelledQuit()
                 return
             }
             await self.cleanupForTerminationAndWait()
@@ -2032,6 +2082,7 @@ final class GlassEQAppModel {
     }
 
     func cleanupForTerminationAndWait() async {
+        await stopAcceptingSettingsCommandsAndWait()
         guard prepareForTermination(shutdownSettings: false) else {
             return
         }
@@ -2045,6 +2096,7 @@ final class GlassEQAppModel {
         }
         lifecycleState = .terminating
         engine.setPlaybackBufferRenegotiationHandler(nil)
+        acceptsSettingsCommands = false
         wasRunningBeforeSleep = false
         invalidatePendingOutputChange()
         invalidatePendingEngineStart()

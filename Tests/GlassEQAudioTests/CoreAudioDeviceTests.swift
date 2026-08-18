@@ -233,6 +233,59 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
+    func sameOutputRebuildReinstallsRestorationFromFreshDeviceRate() throws {
+        let uid = "same-output"
+        let objectID = AudioObjectID(9_003)
+        var currentSampleRate = 48_000.0
+        let originalRestoration = SystemTapAudioEngine.SampleRateRestoration(
+            uid: uid,
+            originalSampleRate: 44_100
+        )
+        let outputForUID: (String) throws -> AudioOutputDevice? = { requestedUID in
+            #expect(requestedUID == uid)
+            return output(
+                id: objectID,
+                uid: uid,
+                channelCount: 2,
+                sampleRate: currentSampleRate
+            )
+        }
+        let setSampleRate: (Double, AudioObjectID) throws -> Void = { sampleRate, requestedID in
+            #expect(requestedID == objectID)
+            currentSampleRate = sampleRate
+        }
+
+        #expect(SystemTapAudioEngine.restoreSampleRateRestoration(
+            originalRestoration,
+            outputForUID: outputForUID,
+            setSampleRate: setSampleRate
+        ))
+        let refreshedOutput = try #require(try outputForUID(uid))
+        #expect(refreshedOutput.nominalSampleRate == 44_100)
+        #expect(SystemTapAudioEngine.shouldRecordSampleRateRestoration(
+            tapSampleRate: 48_000,
+            output: refreshedOutput
+        ))
+
+        var replacementRestoration: SystemTapAudioEngine.SampleRateRestoration?
+        try SystemTapAudioEngine.setSampleRateAfterRecordingRestoration(
+            48_000,
+            on: refreshedOutput,
+            needsRestoration: true,
+            recordRestoration: { replacementRestoration = $0 },
+            installRestoration: { _ in },
+            setSampleRate: setSampleRate
+        )
+        #expect(currentSampleRate == 48_000)
+        #expect(SystemTapAudioEngine.restoreSampleRateRestoration(
+            try #require(replacementRestoration),
+            outputForUID: outputForUID,
+            setSampleRate: setSampleRate
+        ))
+        #expect(currentSampleRate == 44_100)
+    }
+
+    @Test
     func sampleRateRestorationIsRetainedWhenDeviceIsAbsentOrWriteCannotBeVerified() {
         var setCallCount = 0
         let restoration = SystemTapAudioEngine.SampleRateRestoration(
@@ -541,6 +594,19 @@ struct CoreAudioDeviceTests {
             tapSampleRate: 24_000,
             output: normalOutput
         ))
+        #expect(SystemTapAudioEngine.shouldRefreshCaptureForOutput(
+            tapSampleRate: 16_000,
+            output: headsetOutput
+        ))
+        #expect(!SystemTapAudioEngine.shouldRefreshCaptureForOutput(
+            tapSampleRate: 24_000,
+            output: output(
+                channelCount: 2,
+                sampleRate: 16_000,
+                bufferFrameSize: 1_024,
+                transportType: kAudioDeviceTransportTypeBluetooth
+            )
+        ))
         #expect(!SystemTapAudioEngine.shouldRefreshCaptureForOutput(
             tapSampleRate: 48_000,
             output: headsetOutput
@@ -555,6 +621,25 @@ struct CoreAudioDeviceTests {
             tapSampleRate: 48_000,
             maximumObservedCaptureCallbackFrames: 768
         ) == AdaptivePlaybackBufferPolicy.maximumReservoirFrames)
+    }
+
+    @Test
+    func outputRebuildUsesAProfileHotSwappedAfterPreparation() {
+        let prepared = EQProfile(name: "Prepared", mode: .parametric, filters: [])
+        let hotSwapped = EQProfile(name: "Hot Swapped", mode: .parametric, filters: [])
+
+        #expect(SystemTapAudioEngine.effectiveOutputRebuildProfile(
+            preparedProfile: prepared,
+            preparedProfileRevision: 1,
+            activeProfile: prepared,
+            activeProfileRevision: 1
+        ) == prepared)
+        #expect(SystemTapAudioEngine.effectiveOutputRebuildProfile(
+            preparedProfile: prepared,
+            preparedProfileRevision: 1,
+            activeProfile: hotSwapped,
+            activeProfileRevision: 2
+        ) == hotSwapped)
     }
 
     @Test
