@@ -662,6 +662,16 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
+    func profileUpdateRejectsTheTemporaryGapInAnOutputRebuild() throws {
+        #expect(throws: AudioEngineProfileUpdateUnavailable.self) {
+            _ = try SystemTapAudioEngine.profileUpdateOutput(nil)
+        }
+
+        let activeOutput = output(uid: "profile-update-output", channelCount: 2)
+        #expect(try SystemTapAudioEngine.profileUpdateOutput(activeOutput) == activeOutput)
+    }
+
+    @Test
     func adaptivePlaybackBufferAppliesToEveryValidOutputRate() {
         #expect(SystemTapAudioEngine.shouldAdaptPlaybackBuffer(
             for: output(channelCount: 2, bufferFrameSize: 64)
