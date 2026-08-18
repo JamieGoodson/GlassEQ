@@ -1445,10 +1445,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 previousState = state.state
                 previousStatus = state.status
                 state.status = .starting
-                // The capture half (one global muted tap @ the tap rate) is created once and
-                // kept alive across output switches, so dry audio never leaks to a newly
-                // selected device. Only the output half is (re)built for `output`.
-                try ensureCaptureHalfLocked(&state, profile: profile)
+                // Keep capture alive across ordinary output switches. Leaving a low-rate route
+                // refreshes it under the same mute guard used for topology changes so normal
+                // outputs regain their full capture bandwidth without leaking dry audio.
+                try ensureCaptureHalfLocked(&state, output: output, profile: profile)
                 return try prepareOutputRebuildLocked(&state, output: output, profile: profile)
             }
             let refreshedOutput = try CoreAudioDeviceQuery.outputDevice(id: preparation.output.id)
@@ -1698,13 +1698,21 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     // MARK: - Capture half (persistent global muted tap @ the tap rate)
 
-    private func ensureCaptureHalfLocked(_ state: inout ControlState, profile: EQProfile) throws {
+    private func ensureCaptureHalfLocked(
+        _ state: inout ControlState,
+        output: AudioOutputDevice,
+        profile: EQProfile
+    ) throws {
         if state.captureRunning, state.runtime != nil {
-            if updateDSPLocked(&state, profile: profile) {
+            let shouldRefreshCapture = Self.shouldRefreshCaptureForOutput(
+                tapSampleRate: state.tapSampleRate,
+                output: output
+            )
+            if !shouldRefreshCapture, updateDSPLocked(&state, profile: profile) {
                 return
             }
-            // Topology-incompatible DSP change: hold a second global muted tap while the
-            // capture half is torn down and recreated, so HAL-level muting never lapses.
+            // Hold a second global muted tap while capture is recreated, so HAL-level muting
+            // never lapses during topology changes or low-rate capture refreshes.
             try Self.performTopologyRebuild(
                 acquireMuteGuard: { try createTopologyRebuildMuteGuard() }
             ) {
@@ -1792,8 +1800,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         guard let runtime = state.runtime else {
             throw CoreAudioError(operation: "rebuildOutputHalf(missing runtime)", status: kAudioHardwareNotRunningError)
         }
-        // Normal outputs follow the tap rate; low-rate headset modes keep their device-owned rate
-        // and receive realtime sample-rate conversion in the playback callback.
+        // Mismatched low-rate endpoints keep their device-owned rates and receive realtime
+        // sample-rate conversion in the playback callback.
         let originalBufferFrameSize = output.bufferFrameSize
         _ = try Self.supportedRuntimeChannelCount(for: output)
         stopOutputHalfLocked(&state)
@@ -2726,12 +2734,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                     tapSampleRate: preparation.runtime.sampleRate
                 ),
                 after: previousTargetFrames,
-                maximumReservoirFrames: Self.isLowSampleRateRoute(preparation.output)
-                    ? max(
-                        Self.preferredLowSampleRatePlaybackReservoirFrames,
-                        preparation.runtime.maximumObservedCaptureCallbackFrames()
-                    )
-                    : AdaptivePlaybackBufferPolicy.maximumReservoirFrames
+                maximumReservoirFrames: Self.maximumPlaybackReservoirFrames(
+                    for: preparation.output,
+                    tapSampleRate: preparation.runtime.sampleRate,
+                    maximumObservedCaptureCallbackFrames: preparation.runtime
+                        .maximumObservedCaptureCallbackFrames()
+                )
             ) else {
                 return nil
             }
@@ -2931,7 +2939,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         tapSampleRate: Double? = nil
     ) -> Int {
         let outputCallbackFrames = max(Int(output.bufferFrameSize), 1)
-        if isLowSampleRateRoute(output) {
+        if hasLowSampleRateEndpoint(
+            tapSampleRate: tapSampleRate ?? output.nominalSampleRate,
+            output: output
+        ) {
             let sampleRatePlan = PlaybackSampleRatePlan(
                 inputSampleRate: tapSampleRate ?? output.nominalSampleRate,
                 outputSampleRate: output.nominalSampleRate
@@ -2973,7 +2984,28 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         output: AudioOutputDevice
     ) -> Bool {
         abs(tapSampleRate - output.nominalSampleRate) >= 1
-            && (isLowSampleRate(tapSampleRate) || isLowSampleRateRoute(output))
+            && hasLowSampleRateEndpoint(tapSampleRate: tapSampleRate, output: output)
+    }
+
+    static func shouldRefreshCaptureForOutput(
+        tapSampleRate: Double,
+        output: AudioOutputDevice
+    ) -> Bool {
+        isLowSampleRate(tapSampleRate) && !isLowSampleRateRoute(output)
+    }
+
+    static func maximumPlaybackReservoirFrames(
+        for output: AudioOutputDevice,
+        tapSampleRate: Double,
+        maximumObservedCaptureCallbackFrames: Int
+    ) -> Int {
+        guard hasLowSampleRateEndpoint(tapSampleRate: tapSampleRate, output: output) else {
+            return AdaptivePlaybackBufferPolicy.maximumReservoirFrames
+        }
+        return max(
+            Self.preferredLowSampleRatePlaybackReservoirFrames,
+            maximumObservedCaptureCallbackFrames
+        )
     }
 
     private static func isLowSampleRateRoute(_ output: AudioOutputDevice) -> Bool {
@@ -2982,6 +3014,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     private static func isLowSampleRate(_ sampleRate: Double) -> Bool {
         sampleRate > 0 && sampleRate <= Self.lowSampleRateThreshold
+    }
+
+    private static func hasLowSampleRateEndpoint(
+        tapSampleRate: Double,
+        output: AudioOutputDevice
+    ) -> Bool {
+        isLowSampleRate(tapSampleRate) || isLowSampleRateRoute(output)
     }
 
     private func createTopologyRebuildMuteGuard() throws -> any TopologyRebuildMuteGuarding {
