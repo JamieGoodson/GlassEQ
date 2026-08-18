@@ -1805,10 +1805,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             throw error
         }
         state.outputIOProcID = outputIOProcID
+        // Keep IOProc ownership paired with its device so failure cleanup can stop it.
+        state.activeOutput = matchedOutput
 
         // Now that our output owns the device, apply the low-latency buffer size. The stream
         // restart it triggers happens under our muted IOProc, so it plays silence, not dry audio.
         let tunedOutput = tuneBufferFrameSize(for: matchedOutput)
+        state.activeOutput = tunedOutput
         let operatingPointKey = PlaybackBufferOperatingPointKey(output: tunedOutput)
         let allowsDownwardProbe = state.attemptedPlaybackTargetDownProbes.insert(
             operatingPointKey
@@ -1842,7 +1845,6 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         // Unmute and re-anchor playback to the freshest captured audio on the new device.
         runtime.reprimePlayback()
 
-        state.activeOutput = tunedOutput
         state.activeProfile = preparation.profile
     }
 
