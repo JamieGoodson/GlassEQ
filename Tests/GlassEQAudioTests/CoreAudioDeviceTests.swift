@@ -503,7 +503,7 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
-    func headsetSampleRateConversionEntersAndExitsWithBidirectionalMode() {
+    func headsetSampleRateConversionHandlesBothTransitionDirections() {
         let headsetOutput = output(
             channelCount: 2,
             sampleRate: 24_000,
@@ -523,6 +523,10 @@ struct CoreAudioDeviceTests {
         ))
         #expect(!SystemTapAudioEngine.shouldUseSampleRateConversion(
             tapSampleRate: 48_000,
+            output: normalOutput
+        ))
+        #expect(SystemTapAudioEngine.shouldUseSampleRateConversion(
+            tapSampleRate: 24_000,
             output: normalOutput
         ))
         #expect(!SystemTapAudioEngine.shouldUseSampleRateConversion(

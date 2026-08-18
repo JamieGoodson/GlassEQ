@@ -83,6 +83,23 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func editableValueInvalidCommitRestoresTheValueFromTheStartOfEditing() {
+        var session = EditableValueEditSession()
+        session.begin(value: 10)
+        session.recordTextDrivenValue(2)
+        _ = session.valueChanged(2)
+
+        let finalValue: Double?
+        if let parsed = clampedEditableNumber("", range: 0...20) {
+            finalValue = parsed
+        } else {
+            finalValue = session.cancel()
+        }
+
+        #expect(finalValue == 10)
+    }
+
+    @Test
     func editableValueExternalChangesResetTheActiveSession() {
         var session = EditableValueEditSession()
         session.begin(value: -3)

@@ -2043,12 +2043,7 @@ private struct EditableValueText: View {
                         isFocused = true
                     }
                     .onSubmit(commit)
-                    .onExitCommand {
-                        if let originalValue = editSession.cancel() {
-                            value = originalValue
-                        }
-                        isEditing = false
-                    }
+                    .onExitCommand(perform: cancel)
                     .onChange(of: editText) { _, text in
                         updateValue(from: text)
                     }
@@ -2094,18 +2089,30 @@ private struct EditableValueText: View {
         guard isEditing else {
             return
         }
-        updateValue(from: editText)
+        guard updateValue(from: editText) else {
+            cancel()
+            return
+        }
         editSession.finish()
         isEditing = false
     }
 
-    private func updateValue(from text: String) {
+    private func cancel() {
+        if let originalValue = editSession.cancel() {
+            value = originalValue
+        }
+        isEditing = false
+    }
+
+    @discardableResult
+    private func updateValue(from text: String) -> Bool {
         guard isEditing,
               let parsed = clampedEditableNumber(text, range: range) else {
-            return
+            return false
         }
         editSession.recordTextDrivenValue(parsed)
         value = parsed
+        return true
     }
 }
 

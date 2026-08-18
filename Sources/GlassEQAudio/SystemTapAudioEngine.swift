@@ -2972,11 +2972,16 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         tapSampleRate: Double,
         output: AudioOutputDevice
     ) -> Bool {
-        abs(tapSampleRate - output.nominalSampleRate) >= 1 && isLowSampleRateRoute(output)
+        abs(tapSampleRate - output.nominalSampleRate) >= 1
+            && (isLowSampleRate(tapSampleRate) || isLowSampleRateRoute(output))
     }
 
     private static func isLowSampleRateRoute(_ output: AudioOutputDevice) -> Bool {
-        output.nominalSampleRate > 0 && output.nominalSampleRate <= Self.lowSampleRateThreshold
+        isLowSampleRate(output.nominalSampleRate)
+    }
+
+    private static func isLowSampleRate(_ sampleRate: Double) -> Bool {
+        sampleRate > 0 && sampleRate <= Self.lowSampleRateThreshold
     }
 
     private func createTopologyRebuildMuteGuard() throws -> any TopologyRebuildMuteGuarding {
