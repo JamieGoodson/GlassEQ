@@ -1858,6 +1858,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             tapSampleRate: runtime.sampleRate,
             allowsDownwardProbe: allowsDownwardProbe
         )
+        // Capture applies prepared configs and retires their boxes. Output switches are a safe
+        // control-path opportunity to release those boxes before publishing the next config.
+        runtime.drainDSPConfigBoxes()
         runtime.publishPendingDSPConfig(EQRenderConfiguration(
             profile: Self.dspProfile(from: preparation.profile),
             sampleRate: runtime.sampleRate,
