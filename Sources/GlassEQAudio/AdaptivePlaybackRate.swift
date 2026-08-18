@@ -38,6 +38,7 @@ struct PlaybackOccupancyRecoveryPolicy {
 struct PlaybackRateServo: Sendable {
     private static let filterTimeSeconds = 1.0
     private static let proportionalTimeSeconds = 20.0
+    private static let integralTimeSeconds = 25.0
     private static let maximumCorrection = 500e-6
     private static let maximumSlewPerSecond = 100e-6
 
@@ -104,6 +105,12 @@ struct PlaybackRateServo: Sendable {
 
         let errorFrames = filteredOccupancyFrames - targetFrames
         // A positive occupancy error means capture is running faster, so consume input faster.
+        correctionBias = clamp(
+            correctionBias + errorFrames * duration
+                / (sampleRate * Self.integralTimeSeconds * Self.integralTimeSeconds),
+            minimum: -Self.maximumCorrection,
+            maximum: Self.maximumCorrection
+        )
         let unconstrainedCorrection = correctionBias + errorFrames / (sampleRate * Self.proportionalTimeSeconds)
         correctionIsSaturated = abs(unconstrainedCorrection) >= Self.maximumCorrection
         let desiredCorrection = clamp(
