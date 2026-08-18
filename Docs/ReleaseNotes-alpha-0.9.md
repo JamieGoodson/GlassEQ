@@ -17,20 +17,6 @@ This build is ad hoc-signed, not Developer ID signed, and not notarized. macOS G
 - Exact EQ values can be typed directly, and the parametric frequency control now uses a logarithmic scale.
 - If the separate Settings helper cannot be launched, GlassEQ opens the same Settings interface inside the menu bar process.
 
-## Included
-
-- Menu bar app shell.
-- Core Audio system output tap.
-- Playback of processed audio to the current default output.
-- Parametric EQ, 10-band graphic EQ, and 31-band graphic EQ profiles.
-- AutoEQ / EqualizerAPO and REW text import.
-- Per-output profile mappings by Core Audio device UID.
-- Profile persistence under the GlassEQ sandbox container, with migration from legacy `~/Library/Application Support/GlassEQ` data.
-- Settings helper app and local IPC for editing profiles from the menu bar app, with an in-process fallback.
-- Audio route recovery after system sleep, screen wake, session unlock, and Bluetooth route teardown while the screen is locked.
-- Route-specific playback buffering, clock correction, and local calibration history.
-- Callback, frame-loss, occupancy, clock-correction, and latency diagnostics.
-
 ## Supported Alpha Target
 
 - macOS 26.0 or newer.
