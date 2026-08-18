@@ -529,6 +529,7 @@ final class GlassEQAppModel {
     private var outputChangeGeneration = 0
     private var engineStartGeneration = 0
     private var pendingEngineStartOutput: AudioOutputDevice?
+    private var playbackBufferCalibrationResetCount = 0
     private let storeWriter: ProfileStoreWriter
     private var profilePersistenceMode: ProfilePersistenceMode = .normal
     @ObservationIgnored private let engineWorkExecutor = EngineWorkExecutor()
@@ -559,7 +560,7 @@ final class GlassEQAppModel {
     }
 
     private enum EngineWork: Sendable {
-        case start(output: AudioOutputDevice, profile: EQProfile)
+        case start(output: AudioOutputDevice, profile: EQProfile, rollback: ProfileRollback?)
         case restart(profile: EQProfile, rollback: ProfileRollback?)
     }
 
@@ -1049,6 +1050,8 @@ final class GlassEQAppModel {
         draftProfile = profile
         if activeProfile.isBypassed {
             disableActiveProfileProcessing(updateMetrics: true)
+        } else if hasPendingProfileReplacingEngineWork {
+            reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
         } else if engine.updateDSP(profile: profile) {
             statusMessage = localized("Previewing settings for \(profile.name)")
         } else {
@@ -1073,6 +1076,8 @@ final class GlassEQAppModel {
         draftProfile = profile
         if activeProfile.isBypassed {
             disableActiveProfileProcessing(updateMetrics: true)
+        } else if hasPendingProfileReplacingEngineWork {
+            reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
         } else if engine.updateDSP(profile: profile) {
             statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
         } else {
@@ -1099,6 +1104,10 @@ final class GlassEQAppModel {
         let generation = engineStartGeneration
         let outputUID = currentOutputUID
         let outputName = currentOutputName
+        playbackBufferCalibrationResetCount += 1
+        defer {
+            playbackBufferCalibrationResetCount -= 1
+        }
         statusMessage = localized("Recalibrating the audio buffer for \(outputName)...")
         notifyModelDidChange()
 
@@ -1391,7 +1400,7 @@ final class GlassEQAppModel {
             if activeProfile.isBypassed {
                 disableActiveProfileProcessing(updateMetrics: false)
             } else {
-                scheduleEngineWork(.start(output: output, profile: activeProfile))
+                scheduleEngineWork(.start(output: output, profile: activeProfile, rollback: nil))
             }
         case .failure(let error):
             if lifecycleState == .waking {
@@ -1417,7 +1426,7 @@ final class GlassEQAppModel {
         let generation = engineStartGeneration
         engineStartTask?.cancel()
         switch work {
-        case .start(let output, _):
+        case .start(let output, _, _):
             pendingEngineStartOutput = output
         case .restart:
             pendingEngineStartOutput = nil
@@ -1455,7 +1464,7 @@ final class GlassEQAppModel {
             return
         }
 
-        if engineStartTask != nil {
+        if hasPendingProfileReplacingEngineWork {
             reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
             return
         }
@@ -1544,12 +1553,19 @@ final class GlassEQAppModel {
         do {
             let output: AudioOutputDevice
             switch work {
-            case .start(let requestedOutput, let profile):
+            case .start(let requestedOutput, let profile, let rollback):
                 guard !Task.isCancelled else {
                     return .cancelled
                 }
                 attemptedOutput = requestedOutput
-                try engine.start(output: requestedOutput, profile: profile)
+                do {
+                    try engine.start(output: requestedOutput, profile: profile)
+                } catch {
+                    if case .running(let activeOutput) = engine.state {
+                        return .profileChangeNotApplied(error, activeOutput, rollback)
+                    }
+                    throw error
+                }
                 if case .running(let activeOutput) = engine.state {
                     output = activeOutput
                 } else {
@@ -1676,14 +1692,18 @@ final class GlassEQAppModel {
     }
 
     private func reschedulePendingEngineStartWithActiveProfile(rollback: ProfileRollback? = nil) {
-        guard engineStartTask != nil else {
+        guard hasPendingProfileReplacingEngineWork else {
             return
         }
         if let output = pendingEngineStartOutput {
-            scheduleEngineWork(.start(output: output, profile: activeProfile))
+            scheduleEngineWork(.start(output: output, profile: activeProfile, rollback: rollback))
         } else {
             scheduleEngineWork(.restart(profile: activeProfile, rollback: rollback))
         }
+    }
+
+    private var hasPendingProfileReplacingEngineWork: Bool {
+        engineStartTask != nil || playbackBufferCalibrationResetCount > 0
     }
 
     private func scheduleWakeReconnectRetry(status: String) {

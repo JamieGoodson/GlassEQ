@@ -209,6 +209,113 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func profilePreviewedDuringRouteStartIsRepublishedAfterTheRouteSettles() async {
+        let firstOutput = makeOutput(uid: "preview-first", name: "Preview First", id: 200)
+        let secondOutput = makeOutput(uid: "preview-second", name: "Preview Second", id: 300)
+        let initialProfile = makeProfile(name: "Initial")
+        let previewProfile = makeProfile(name: "Preview During Route Start")
+        let store = ProfileStore(
+            profiles: [initialProfile, previewProfile],
+            fallbackProfileID: initialProfile.id
+        )
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        engine.blockStart(for: secondOutput.uid)
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil {
+            engine.startCalls.count == 2
+        }
+        #expect(engine.waitUntilStartIsBlocked(for: secondOutput.uid, timeout: .now() + 1))
+
+        model.preview(profile: previewProfile)
+        #expect(engine.updateDSPCalls.isEmpty)
+
+        engine.unblockStart(for: secondOutput.uid)
+        await waitUntil {
+            model.lifecycleState == .running
+                && model.currentOutputUID == secondOutput.uid
+                && engine.startCalls.count == 3
+        }
+
+        #expect(engine.startCalls.last?.profile == previewProfile)
+        #expect(model.activeProfile == previewProfile)
+        #expect(model.previewReturnProfile == initialProfile)
+    }
+
+    @Test
+    func profileStartFailureDuringPendingRouteRestoresTheRunningProfile() async throws {
+        let firstOutput = makeOutput(uid: "rollback-first", name: "Rollback First", id: 200)
+        let secondOutput = makeOutput(uid: "rollback-second", name: "Rollback Second", id: 300)
+        let initialProfile = makeProfile(name: "Initial")
+        let requestedProfile = makeProfile(name: "Requested During Route Start")
+        let store = ProfileStore(
+            profiles: [initialProfile, requestedProfile],
+            fallbackProfileID: initialProfile.id
+        )
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        engine.blockStart(for: secondOutput.uid)
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil {
+            engine.startCalls.count == 2
+        }
+        #expect(engine.waitUntilStartIsBlocked(for: secondOutput.uid, timeout: .now() + 1))
+
+        engine.startError = TestAudioError.startFailed
+        engine.startErrorProfileID = requestedProfile.id
+        engine.startErrorPreservesRunningState = true
+        try model.apply(profile: requestedProfile)
+        engine.unblockStart(for: secondOutput.uid)
+
+        await waitUntil {
+            engine.startCalls.count == 3
+                && model.lifecycleState == .running
+                && model.statusMessage.contains("not applied")
+        }
+
+        #expect(engine.startCalls.last?.profile == requestedProfile)
+        #expect(engine.state == .running(output: secondOutput))
+        #expect(model.activeProfile == initialProfile)
+        #expect(model.selectedProfileID == initialProfile.id)
+        #expect(model.draftProfile == initialProfile)
+        #expect(model.profileStore == store)
+    }
+
+    @Test
     func staleRuntimeFailureDoesNotStopCompletedNewerRoute() async {
         let firstOutput = makeOutput(uid: "stale-runtime-first", name: "Stale Runtime First", id: 200)
         let secondOutput = makeOutput(uid: "stale-runtime-second", name: "Stale Runtime Second", id: 300)
@@ -1436,6 +1543,95 @@ struct GlassEQAppModelLifecycleTests {
         #expect(engine.resetPlaybackBufferCalibrationUIDs == [output.uid])
         #expect(response.snapshot?.statusMessage == localized("Processing Scarlett Solo USB with Fallback"))
         #expect(model.isRunning)
+        #expect(model.lifecycleState == .running)
+    }
+
+    @Test
+    func profileAppliedDuringPlaybackBufferCalibrationResetIsRepublished() async throws {
+        let output = makeOutput(uid: "apply-during-reset", name: "Apply During Reset")
+        let initialProfile = makeProfile(name: "Initial")
+        let appliedProfile = makeProfile(name: "Applied During Reset")
+        let store = ProfileStore(
+            profiles: [initialProfile, appliedProfile],
+            fallbackProfileID: initialProfile.id
+        )
+        let engine = FakeAudioEngine()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output))
+        )
+
+        model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        engine.blockPlaybackBufferCalibrationReset()
+
+        let resetTask = Task {
+            try await model.performSettingsCommand(.resetPlaybackBufferCalibration)
+        }
+        await waitUntil {
+            engine.resetPlaybackBufferCalibrationUIDs == [output.uid]
+        }
+        #expect(engine.waitUntilPlaybackBufferCalibrationResetIsBlocked(timeout: .now() + 1))
+
+        try model.apply(profile: appliedProfile)
+        #expect(engine.updateDSPCalls.isEmpty)
+
+        engine.unblockPlaybackBufferCalibrationReset()
+        _ = try await resetTask.value
+        await waitUntil {
+            engine.updateCalls.last == appliedProfile
+        }
+
+        #expect(model.activeProfile == appliedProfile)
+        #expect(model.lifecycleState == .running)
+    }
+
+    @Test
+    func stoppingPreviewDuringPlaybackBufferCalibrationResetRepublishesReturnProfile() async throws {
+        let output = makeOutput(uid: "stop-preview-reset", name: "Stop Preview Reset")
+        let initialProfile = makeProfile(name: "Initial")
+        let previewProfile = makeProfile(name: "Preview")
+        let store = ProfileStore(
+            profiles: [initialProfile, previewProfile],
+            fallbackProfileID: initialProfile.id
+        )
+        let engine = FakeAudioEngine()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output))
+        )
+
+        model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+        model.preview(profile: previewProfile)
+        #expect(engine.updateDSPCalls == [previewProfile])
+        engine.blockPlaybackBufferCalibrationReset()
+
+        let resetTask = Task {
+            try await model.performSettingsCommand(.resetPlaybackBufferCalibration)
+        }
+        await waitUntil {
+            engine.resetPlaybackBufferCalibrationUIDs == [output.uid]
+        }
+        #expect(engine.waitUntilPlaybackBufferCalibrationResetIsBlocked(timeout: .now() + 1))
+
+        model.stopPreview()
+        #expect(engine.updateDSPCalls == [previewProfile])
+
+        engine.unblockPlaybackBufferCalibrationReset()
+        _ = try await resetTask.value
+        await waitUntil {
+            engine.updateCalls.last == initialProfile
+        }
+
+        #expect(model.activeProfile == initialProfile)
+        #expect(model.previewReturnProfile == nil)
         #expect(model.lifecycleState == .running)
     }
 
@@ -2771,6 +2967,8 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
     private let lock = NSLock()
     private var _state: AudioEngineState = .stopped
     private var _startError: Error?
+    private var _startErrorProfileID: UUID?
+    private var _startErrorPreservesRunningState = false
     private var _updateError: Error?
     private var _updateErrorPreservesRunningState = false
     private var _updateDSPResult = true
@@ -2800,6 +2998,16 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
     var startError: Error? {
         get { withLock { _startError } }
         set { withLock { _startError = newValue } }
+    }
+
+    var startErrorProfileID: UUID? {
+        get { withLock { _startErrorProfileID } }
+        set { withLock { _startErrorProfileID = newValue } }
+    }
+
+    var startErrorPreservesRunningState: Bool {
+        get { withLock { _startErrorPreservesRunningState } }
+        set { withLock { _startErrorPreservesRunningState = newValue } }
     }
 
     var updateError: Error? {
@@ -2937,16 +3145,22 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
             _startCalls.append(StartCall(output: output, profile: profile))
             return (
                 delay: _startDelaySecondsByUID[output.uid] ?? _startDelaySeconds,
-                blocker: _startBlockersByUID[output.uid]
+                blocker: _startBlockersByUID[output.uid],
+                error: _startErrorProfileID == nil || _startErrorProfileID == profile.id
+                    ? _startError
+                    : nil,
+                preservesRunningState: _startErrorPreservesRunningState
             )
         }
         startControl.blocker?.waitUntilUnblocked()
         if startControl.delay > 0 {
             Thread.sleep(forTimeInterval: startControl.delay)
         }
-        if let startError = withLock({ _startError }) {
-            withLock {
-                _state = .failed("Start failed")
+        if let startError = startControl.error {
+            if !startControl.preservesRunningState {
+                withLock {
+                    _state = .failed("Start failed")
+                }
             }
             throw startError
         }
