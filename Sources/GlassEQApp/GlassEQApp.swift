@@ -1389,7 +1389,7 @@ final class GlassEQAppModel {
             return
         }
 
-        let rollback = isRunning ? profileRollback() : nil
+        let rollback = profileRollback()
         previewReturnProfile = nil
         switch result {
         case .success(let output):
