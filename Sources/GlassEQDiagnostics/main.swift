@@ -252,6 +252,7 @@ private func printMetrics(_ metrics: AudioEngineMetrics, fallbackSampleRate: Dou
     print("Playback underrun frames: \(metrics.playbackUnderrunFrames)")
     print("Dropped input frames: \(metrics.droppedInputFrames)")
     print("Dropped buffered frames: \(metrics.droppedBufferedFrames)")
+    print("Ring gate contention failures: \(metrics.ringGateContentionFailures)")
     print("Saturated samples: \(metrics.saturatedSamples)")
     print("Buffered frames at stop: \(metrics.currentBufferedFrames)")
     print("Max ring buffered frames: \(metrics.maxBufferedFrames)")
