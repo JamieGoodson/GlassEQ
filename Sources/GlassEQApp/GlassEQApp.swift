@@ -4,6 +4,7 @@ import GlassEQCore
 import GlassEQSettingsIPC
 import GlassEQSettingsUI
 import SwiftUI
+import UserNotifications
 
 private enum GlassEQWindowID {
     static let inProcessSettings = "in-process-settings"
@@ -228,6 +229,16 @@ protocol AudioEngineControlling: AnyObject, Sendable {
     func stop()
     func snapshotMetrics() -> AudioEngineMetrics
     func resetDiagnostics()
+    func resetPlaybackBufferCalibration(forOutputUID outputUID: String) throws
+    func setPlaybackBufferRenegotiationHandler(
+        _ handler: (@Sendable (PlaybackBufferRenegotiation) -> Void)?
+    )
+}
+
+extension AudioEngineControlling {
+    func setPlaybackBufferRenegotiationHandler(
+        _ handler: (@Sendable (PlaybackBufferRenegotiation) -> Void)?
+    ) {}
 }
 
 extension SystemTapAudioEngine: AudioEngineControlling {}
@@ -280,6 +291,86 @@ protocol WorkspaceOpening {
 
 extension NSWorkspace: WorkspaceOpening {}
 
+@MainActor
+protocol PlaybackBufferRenegotiationNotifying {
+    func prepare()
+    func notify(_ renegotiation: PlaybackBufferRenegotiation)
+}
+
+extension PlaybackBufferRenegotiationNotifying {
+    func prepare() {}
+}
+
+private final class GlassEQUserNotificationDelegate: NSObject, UNUserNotificationCenterDelegate, @unchecked Sendable {
+    static let shared = GlassEQUserNotificationDelegate()
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
+    }
+}
+
+@MainActor
+struct SystemPlaybackBufferRenegotiationNotifier: PlaybackBufferRenegotiationNotifying {
+    func prepare() {
+        guard Bundle.main.bundleURL.pathExtension == "app" else {
+            return
+        }
+        let center = UNUserNotificationCenter.current()
+        center.delegate = GlassEQUserNotificationDelegate.shared
+        Task {
+            let settings = await center.notificationSettings()
+            if settings.authorizationStatus == .notDetermined {
+                _ = try? await center.requestAuthorization(options: [.alert, .sound])
+            }
+        }
+    }
+
+    func notify(_ renegotiation: PlaybackBufferRenegotiation) {
+        guard Bundle.main.bundleURL.pathExtension == "app" else {
+            return
+        }
+        let reason = switch renegotiation.reason {
+        case .underrun:
+            localized("an audio underrun")
+        case .outputTimestampDiscontinuity:
+            localized("an output timing discontinuity")
+        case .excessiveBacklog:
+            localized("an excessive playback backlog")
+        }
+        let targetLatency = renegotiation.sampleRate > 0
+            ? localizedLatency(milliseconds: Double(renegotiation.playbackTargetFrames) / renegotiation.sampleRate * 1_000)
+            : localizedFrameCount(renegotiation.playbackTargetFrames)
+        let title = localized("GlassEQ increased the audio buffer")
+        let body = localized(
+            "\(renegotiation.outputName): \(renegotiation.previousFrameSize) to \(renegotiation.frameSize) callback frames after \(reason). Target latency is now \(targetLatency)."
+        )
+
+        Task {
+            let center = UNUserNotificationCenter.current()
+            center.delegate = GlassEQUserNotificationDelegate.shared
+            let settings = await center.notificationSettings()
+            guard settings.authorizationStatus == .authorized
+                    || settings.authorizationStatus == .provisional else {
+                return
+            }
+
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.sound = .default
+            let request = UNNotificationRequest(
+                identifier: "playback-buffer-\(renegotiation.outputUID)-\(renegotiation.frameSize)-\(UUID().uuidString)",
+                content: content,
+                trigger: nil
+            )
+            try? await center.add(request)
+        }
+    }
+}
+
 extension SettingsAudioMetricsDTO {
     init(_ metrics: AudioEngineMetrics) {
         self.init(
@@ -296,7 +387,16 @@ extension SettingsAudioMetricsDTO {
             averagePlaybackBufferedFrames: metrics.averagePlaybackBufferedFrames,
             playbackBufferObservations: metrics.playbackBufferObservations,
             maximumCaptureCallbackFrames: metrics.maximumCaptureCallbackFrames,
-            maximumPlaybackCallbackFrames: metrics.maximumPlaybackCallbackFrames
+            maximumPlaybackCallbackFrames: metrics.maximumPlaybackCallbackFrames,
+            playbackTimestampDiscontinuities: metrics.playbackTimestampDiscontinuities,
+            playbackBufferRenegotiations: metrics.playbackBufferRenegotiations,
+            adaptivePlaybackRenderFailures: metrics.adaptivePlaybackRenderFailures,
+            ringGateContentionFailures: metrics.ringGateContentionFailures,
+            playbackRateCorrectionPPM: metrics.playbackRateCorrectionPPM,
+            playbackOccupancyTargetFrames: metrics.playbackOccupancyTargetFrames,
+            filteredPlaybackOccupancyFrames: metrics.filteredPlaybackOccupancyFrames,
+            playbackBufferSampleRate: metrics.playbackBufferSampleRate,
+            playbackSampleRateConversionActive: metrics.playbackSampleRateConversionActive
         )
     }
 }
@@ -374,6 +474,7 @@ final class GlassEQAppModel {
     private let defaultOutputLookup: any DefaultOutputLookingUp
     private let observerFactory: any DefaultOutputObservingMaking
     private let workspaceOpener: any WorkspaceOpening
+    private let playbackBufferRenegotiationNotifier: any PlaybackBufferRenegotiationNotifying
     private let outputChangeSettlingDelayOverride: Duration?
     private let wakeReconnectDelayOverride: Duration?
     private let saveDebounceDelay: Duration
@@ -445,6 +546,7 @@ final class GlassEQAppModel {
         installLifecycleObservers shouldInstallLifecycleObservers: Bool = true,
         registerAppDelegate: Bool = true,
         workspaceOpener: any WorkspaceOpening = NSWorkspace.shared,
+        playbackBufferRenegotiationNotifier: any PlaybackBufferRenegotiationNotifying = SystemPlaybackBufferRenegotiationNotifier(),
         saveDebounceDelay: Duration = .milliseconds(250),
         outputChangeSettlingDelayOverride: Duration? = nil,
         wakeReconnectDelayOverride: Duration? = nil
@@ -474,6 +576,7 @@ final class GlassEQAppModel {
         self.defaultOutputLookup = defaultOutputLookup
         self.observerFactory = observerFactory
         self.workspaceOpener = workspaceOpener
+        self.playbackBufferRenegotiationNotifier = playbackBufferRenegotiationNotifier
         self.saveDebounceDelay = saveDebounceDelay
         self.outputChangeSettlingDelayOverride = outputChangeSettlingDelayOverride
         self.wakeReconnectDelayOverride = wakeReconnectDelayOverride
@@ -502,6 +605,12 @@ final class GlassEQAppModel {
                 self?.start()
             }
         }
+        engine.setPlaybackBufferRenegotiationHandler { [weak self] renegotiation in
+            Task { @MainActor [weak self] in
+                self?.processPlaybackBufferRenegotiation(renegotiation)
+            }
+        }
+        playbackBufferRenegotiationNotifier.prepare()
     }
 
     var hasUnsavedDraft: Bool {
@@ -539,6 +648,7 @@ final class GlassEQAppModel {
             fallbackProfileID: profileStore.fallbackProfileID,
             statusMessage: statusMessage,
             metrics: SettingsAudioMetricsDTO(engineMetrics),
+            isRunning: isRunning,
             isPreviewing: previewReturnProfile != nil,
             profileStoreProtection: profileStoreProtectionSnapshot()
         )
@@ -916,6 +1026,47 @@ final class GlassEQAppModel {
     func resetDiagnostics() {
         engine.resetDiagnostics()
         engineMetrics = engine.snapshotMetrics()
+        notifyModelDidChange()
+    }
+
+    func resetPlaybackBufferCalibrationForCurrentOutput() async throws {
+        guard !currentOutputUID.isEmpty else {
+            throw SettingsCommandFailure(message: localized("No output is available to recalibrate."))
+        }
+        let outputUID = currentOutputUID
+        let outputName = currentOutputName
+        statusMessage = localized("Recalibrating the audio buffer for \(outputName)...")
+        notifyModelDidChange()
+
+        let engine = engine
+        let resetTask = engineWorkExecutor.enqueue(priority: .userInitiated) {
+            do {
+                try engine.resetPlaybackBufferCalibration(forOutputUID: outputUID)
+                return Result<AudioEngineState, any Error>.success(engine.state)
+            } catch {
+                return Result<AudioEngineState, any Error>.failure(error)
+            }
+        }
+
+        do {
+            switch try await resetTask.value.get() {
+            case .running(let output):
+                refreshCurrentOutputMetadata(from: output)
+                lifecycleState = .running
+                isRunning = true
+                statusMessage = processingStatus(outputName: output.name, profileName: activeProfile.name)
+            case .stopped:
+                statusMessage = localized("Buffer calibration reset for \(outputName)")
+            case .failed(let message):
+                lifecycleState = .stopped
+                isRunning = false
+                statusMessage = message
+            }
+        } catch {
+            statusMessage = localized("Buffer calibration reset failed: \(error.localizedDescription)")
+            notifyModelDidChange()
+            throw error
+        }
         notifyModelDidChange()
     }
 
@@ -1616,6 +1767,14 @@ final class GlassEQAppModel {
         }
     }
 
+    func processPlaybackBufferRenegotiation(_ renegotiation: PlaybackBufferRenegotiation) {
+        if renegotiation.outputUID == currentOutputUID {
+            currentOutputBufferFrameSize = renegotiation.frameSize
+        }
+        playbackBufferRenegotiationNotifier.notify(renegotiation)
+        notifyModelDidChange()
+    }
+
     func stopMetricsPolling() {
         metricsTask?.cancel()
         metricsTask = nil
@@ -1801,6 +1960,7 @@ final class GlassEQAppModel {
             return false
         }
         lifecycleState = .terminating
+        engine.setPlaybackBufferRenegotiationHandler(nil)
         wasRunningBeforeSleep = false
         invalidatePendingOutputChange()
         invalidatePendingEngineStart()

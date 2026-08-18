@@ -65,7 +65,8 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("SwiftUI"),
                 .linkedFramework("AppKit"),
-                .linkedFramework("Security")
+                .linkedFramework("Security"),
+                .linkedFramework("UserNotifications")
             ]
         ),
         .executableTarget(

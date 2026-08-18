@@ -408,6 +408,10 @@ final class SettingsCoordinator: NSObject {
             patch.statusMessage = snapshot.statusMessage
             didPatch = true
         }
+        if previous.isRunning != snapshot.isRunning {
+            patch.isRunning = snapshot.isRunning
+            didPatch = true
+        }
         if previous.isPreviewing != snapshot.isPreviewing {
             patch.isPreviewing = snapshot.isPreviewing
             didPatch = true
@@ -896,6 +900,10 @@ extension GlassEQAppModel {
 
         case .resetDiagnostics:
             resetDiagnostics()
+            return SettingsCommandResponse(snapshot: settingsSnapshot())
+
+        case .resetPlaybackBufferCalibration:
+            try await resetPlaybackBufferCalibrationForCurrentOutput()
             return SettingsCommandResponse(snapshot: settingsSnapshot())
 
         case .retryAudioEngine:

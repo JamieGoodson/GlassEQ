@@ -150,14 +150,15 @@ public struct SettingsView: View {
                 onRevert: revertDraft,
                 onUseForCurrentOutput: useDraftForCurrentOutput,
                 onSetFallback: setFallbackToDraft,
-                                onImport: importProfile,
-                                onPreview: previewDraft,
-                                onStopPreview: stopPreview,
-                                onResetDiagnostics: resetDiagnostics,
-                                onRetryAudioEngine: retryAudioEngine,
-                                onOpenPrivacySettings: openPrivacySettings,
-                                onResetUnsupportedProfileStore: resetUnsupportedProfileStore
-                            )
+                onImport: importProfile,
+                onPreview: previewDraft,
+                onStopPreview: stopPreview,
+                onResetDiagnostics: resetDiagnostics,
+                onResetPlaybackBufferCalibration: resetPlaybackBufferCalibration,
+                onRetryAudioEngine: retryAudioEngine,
+                onOpenPrivacySettings: openPrivacySettings,
+                onResetUnsupportedProfileStore: resetUnsupportedProfileStore
+            )
                 .frame(minWidth: 640, maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -251,6 +252,10 @@ public struct SettingsView: View {
 
     private func resetDiagnostics() {
         perform(.resetDiagnostics)
+    }
+
+    private func resetPlaybackBufferCalibration() {
+        perform(.resetPlaybackBufferCalibration)
     }
 
     private func retryAudioEngine() {
@@ -572,6 +577,8 @@ struct EQAnalysisSnapshot: Equatable, Sendable {
     var signature: EQAnalysisSignature
     var channelMode: EQChannelMode
     var recommendedPreampDB: Double
+    var maximumUsableFrequency: Double
+    var inactiveEnabledFilterCount: Int
     var linkedPoints: [FrequencyResponsePoint]
     var leftPoints: [FrequencyResponsePoint]
     var rightPoints: [FrequencyResponsePoint]
@@ -581,6 +588,11 @@ struct EQAnalysisSnapshot: Equatable, Sendable {
         self.signature = EQAnalysisSignature(profile: profile, sampleRate: sampleRate)
         self.channelMode = profile.channelMode
         self.recommendedPreampDB = EQProfileAnalysis.recommendedPreampDB(profile: profile, sampleRate: sampleRate)
+        self.maximumUsableFrequency = EQRouteFrequencyPolicy.maximumUsableFrequency(sampleRate: sampleRate)
+        self.inactiveEnabledFilterCount = EQRouteFrequencyPolicy.inactiveEnabledFilterCount(
+            profile: profile,
+            sampleRate: sampleRate
+        )
 
         switch profile.channelMode {
         case .linked:
@@ -607,16 +619,33 @@ struct EQAnalysisSnapshot: Equatable, Sendable {
     }
 
     var accessibilitySummary: String {
+        let curveSummary: String
         switch channelMode {
         case .linked:
-            return localized(
+            curveSummary = localized(
                 "Linked curve from \(localizedDecibels(minMagnitude(in: linkedPoints))) to \(localizedDecibels(maxMagnitude(in: linkedPoints))); recommended preamp \(localizedDecibels(recommendedPreampDB))"
             )
         case .stereo:
-            return localized(
+            curveSummary = localized(
                 "Left curve from \(localizedDecibels(minMagnitude(in: leftPoints))) to \(localizedDecibels(maxMagnitude(in: leftPoints))); right curve from \(localizedDecibels(minMagnitude(in: rightPoints))) to \(localizedDecibels(maxMagnitude(in: rightPoints))); recommended preamp \(localizedDecibels(recommendedPreampDB))"
             )
         }
+        guard let inactiveFilterSummary else {
+            return curveSummary
+        }
+        return localized("\(curveSummary). \(inactiveFilterSummary)")
+    }
+
+    var inactiveFilterSummary: String? {
+        guard inactiveEnabledFilterCount > 0 else {
+            return nil
+        }
+        let count = localizedInteger(inactiveEnabledFilterCount)
+        let ceiling = localizedFrequency(maximumUsableFrequency)
+        if inactiveEnabledFilterCount == 1 {
+            return localized("\(count) enabled filter above \(ceiling) is inactive on this route")
+        }
+        return localized("\(count) enabled filters above \(ceiling) are inactive on this route")
     }
 
     private func minMagnitude(in points: [FrequencyResponsePoint]) -> Double {
@@ -797,6 +826,7 @@ private struct ProfileDetail: View {
     var onPreview: () -> Void
     var onStopPreview: () -> Void
     var onResetDiagnostics: () -> Void
+    var onResetPlaybackBufferCalibration: () -> Void
     var onRetryAudioEngine: () -> Void
     var onOpenPrivacySettings: () -> Void
     var onResetUnsupportedProfileStore: () -> Void
@@ -845,6 +875,7 @@ private struct ProfileDetail: View {
                                 onUseForCurrentOutput: onUseForCurrentOutput,
                                 onSetFallback: onSetFallback,
                                 onResetDiagnostics: onResetDiagnostics,
+                                onResetPlaybackBufferCalibration: onResetPlaybackBufferCalibration,
                                 onRetryAudioEngine: onRetryAudioEngine,
                                 onOpenPrivacySettings: onOpenPrivacySettings
                             )
@@ -1147,7 +1178,12 @@ private struct EditorTab: View {
                     .frame(height: 165)
                     .accessibilityLabel(Text(localized("Frequency response graph")))
                     .accessibilityValue(Text(analysis.accessibilitySummary))
-                    .accessibilityHint(Text(localized("Shows the estimated gain curve from 20 Hz to 20 kHz")))
+                    .accessibilityHint(Text(localized("Shows the estimated gain curve from 20 Hz to \(localizedFrequency(analysis.maximumUsableFrequency))")))
+                if let inactiveFilterSummary = analysis.inactiveFilterSummary {
+                    Label(inactiveFilterSummary, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
             .cardPanel(padding: 16)
 
@@ -1433,7 +1469,7 @@ private struct FrequencyResponseGraph: View {
             path.move(to: CGPoint(x: rect.minX, y: y))
             path.addLine(to: CGPoint(x: rect.maxX, y: y))
         }
-        for frequency in [20.0, 100.0, 1_000.0, 10_000.0, 20_000.0] {
+        for frequency in axisFrequencies {
             let x = xPosition(for: frequency, in: rect)
             path.move(to: CGPoint(x: x, y: rect.minY))
             path.addLine(to: CGPoint(x: x, y: rect.maxY))
@@ -1458,9 +1494,9 @@ private struct FrequencyResponseGraph: View {
             )
         }
 
-        for frequency in [20.0, 100.0, 1_000.0, 10_000.0, 20_000.0] {
+        for frequency in axisFrequencies {
             context.draw(
-                Text(frequency.axisFrequencyLabel)
+                Text(axisLabel(for: frequency))
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary),
                 at: CGPoint(x: xPosition(for: frequency, in: rect), y: bounds.maxY - 10),
@@ -1488,9 +1524,27 @@ private struct FrequencyResponseGraph: View {
 
     private func xPosition(for frequency: Double, in rect: CGRect) -> CGFloat {
         let lower = log10(20.0)
-        let upper = log10(20_000.0)
+        let upper = log10(max(analysis.maximumUsableFrequency, 20.000_1))
         let fraction = (log10(frequency) - lower) / (upper - lower)
         return rect.minX + rect.width * fraction
+    }
+
+    private var axisFrequencies: [Double] {
+        let maximum = analysis.maximumUsableFrequency
+        var frequencies = [20.0, 100.0, 1_000.0, 10_000.0, 20_000.0]
+            .filter { $0 <= maximum }
+        if frequencies.last != maximum {
+            frequencies.append(maximum)
+        }
+        return frequencies
+    }
+
+    private func axisLabel(for frequency: Double) -> String {
+        if frequency == analysis.maximumUsableFrequency,
+           frequency != EQRouteFrequencyPolicy.maximumProfileFrequency {
+            return frequency.frequencyLabel
+        }
+        return frequency.axisFrequencyLabel
     }
 
     private func yPosition(for magnitudeDB: Double, in rect: CGRect) -> CGFloat {
@@ -2050,6 +2104,7 @@ private struct OutputTab: View {
     var onUseForCurrentOutput: () -> Void
     var onSetFallback: () -> Void
     var onResetDiagnostics: () -> Void
+    var onResetPlaybackBufferCalibration: () -> Void
     var onRetryAudioEngine: () -> Void
     var onOpenPrivacySettings: () -> Void
 
@@ -2115,26 +2170,46 @@ private struct OutputTab: View {
                 .cardPanel(padding: 16)
 
                 VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text(localized("Diagnostics"))
-                            .font(.headline)
-                        Spacer()
-                        Button(localized("Reset")) {
-                            onResetDiagnostics()
-                        }
-                        .controlSize(.large)
-                    }
+                    Text(localized("Diagnostics"))
+                        .font(.headline)
                     LabeledContent(localized("Captured"), value: localizedInteger(snapshot.metrics.capturedFrames))
                     LabeledContent(localized("Played"), value: localizedInteger(snapshot.metrics.playedFrames))
                     LabeledContent(localized("Underruns"), value: localizedInteger(snapshot.metrics.playbackUnderrunFrames))
+                    LabeledContent(localized("Dropped Input"), value: localizedInteger(snapshot.metrics.droppedInputFrames))
+                    LabeledContent(localized("Dropped Buffered"), value: localizedInteger(snapshot.metrics.droppedBufferedFrames))
+                    LabeledContent(localized("Ring Gate Failures"), value: localizedInteger(snapshot.metrics.ringGateContentionFailures))
                     LabeledContent(localized("Saturated Samples"), value: localizedInteger(snapshot.metrics.saturatedSamples))
                     LabeledContent(localized("Buffered"), value: localizedFrameCount(snapshot.metrics.currentBufferedFrames))
                     LabeledContent(localized("Peak Buffer"), value: localizedFrameCount(snapshot.metrics.maximumPlaybackBufferedFrames))
                     LabeledContent(localized("Ring Peak"), value: localizedFrameCount(snapshot.metrics.maxBufferedFrames))
                     LabeledContent(localized("Capture Callback Peak"), value: localizedFrameCount(snapshot.metrics.maximumCaptureCallbackFrames))
                     LabeledContent(localized("Output Callback Peak"), value: localizedFrameCount(snapshot.metrics.maximumPlaybackCallbackFrames))
+                    LabeledContent(localized("Output Timing Gaps"), value: localizedInteger(snapshot.metrics.playbackTimestampDiscontinuities))
+                    LabeledContent(localized("Buffer Renegotiations"), value: localizedInteger(snapshot.metrics.playbackBufferRenegotiations))
+                    LabeledContent(localized("Adaptive Render Failures"), value: localizedInteger(snapshot.metrics.adaptivePlaybackRenderFailures))
+                    LabeledContent(
+                        localized("Sample Rate Conversion"),
+                        value: snapshot.metrics.playbackSampleRateConversionActive
+                            ? localized("Active")
+                            : localized("Inactive")
+                    )
+                    LabeledContent(localized("Clock Correction"), value: playbackRateCorrectionLabel)
+                    LabeledContent(localized("Servo Buffer"), value: servoBufferLabel)
                     LabeledContent(localized("Added Latency"), value: averageAddedLatencyLabel)
                     LabeledContent(localized("Latency Range"), value: addedLatencyRangeLabel)
+                    HStack {
+                        Button(localized("Reset metrics")) {
+                            onResetDiagnostics()
+                        }
+                        .controlSize(.large)
+
+                        Button(localized("Reset buffer calibration for this device")) {
+                            onResetPlaybackBufferCalibration()
+                        }
+                        .disabled(snapshot.currentOutputUID.isEmpty)
+                        .controlSize(.large)
+                        .help(localized("Forget the learned callback size for this output device and calibrate it again"))
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
                 .cardPanel(padding: 16)
@@ -2161,25 +2236,54 @@ private struct OutputTab: View {
 
     private var averageAddedLatencyLabel: String {
         guard snapshot.metrics.playbackBufferObservations > 0 else {
-            return "No samples"
+            return localized("No samples")
         }
         return formatLatency(milliseconds: framesToMilliseconds(snapshot.metrics.averagePlaybackBufferedFrames))
     }
 
     private var addedLatencyRangeLabel: String {
         guard snapshot.metrics.playbackBufferObservations > 0 else {
-            return "No samples"
+            return localized("No samples")
         }
         let minimum = formatLatency(milliseconds: framesToMilliseconds(Double(snapshot.metrics.minimumPlaybackBufferedFrames)))
         let maximum = formatLatency(milliseconds: framesToMilliseconds(Double(snapshot.metrics.maximumPlaybackBufferedFrames)))
         return "\(minimum)-\(maximum)"
     }
 
+    private var playbackRateCorrectionLabel: String {
+        guard snapshot.isRunning else {
+            return localized("Inactive")
+        }
+        let correction = localizedDecimal(
+            snapshot.metrics.playbackRateCorrectionPPM,
+            minimumFractionDigits: 1,
+            maximumFractionDigits: 1,
+            signed: true
+        )
+        return localized("\(correction) ppm")
+    }
+
+    private var servoBufferLabel: String {
+        guard snapshot.isRunning else {
+            return localized("Inactive")
+        }
+        let occupancy = localizedDecimal(
+            snapshot.metrics.filteredPlaybackOccupancyFrames,
+            minimumFractionDigits: 1,
+            maximumFractionDigits: 1
+        )
+        let target = localizedInteger(snapshot.metrics.playbackOccupancyTargetFrames)
+        return localized("\(occupancy) / \(target) frames")
+    }
+
     private func framesToMilliseconds(_ frames: Double) -> Double {
-        guard snapshot.currentOutputSampleRate > 0 else {
+        let sampleRate = snapshot.metrics.playbackBufferSampleRate > 0
+            ? snapshot.metrics.playbackBufferSampleRate
+            : snapshot.currentOutputSampleRate
+        guard sampleRate > 0 else {
             return 0
         }
-        return frames / snapshot.currentOutputSampleRate * 1_000
+        return frames / sampleRate * 1_000
     }
 
     private func formatLatency(milliseconds: Double) -> String {

@@ -1248,6 +1248,52 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func resettingPlaybackBufferCalibrationTargetsCurrentDeviceAndRebuildsIt() async throws {
+        let output = makeOutput(uid: "scarlett", name: "Scarlett Solo USB", bufferFrameSize: 1_024)
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(output))
+        let model = makeModel(engine: engine, lookup: lookup)
+
+        model.retryAudioEngine()
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        let response = try await model.performSettingsCommand(.resetPlaybackBufferCalibration)
+
+        #expect(engine.resetPlaybackBufferCalibrationUIDs == [output.uid])
+        #expect(response.snapshot?.statusMessage == localized("Processing Scarlett Solo USB with Fallback"))
+        #expect(model.isRunning)
+        #expect(model.lifecycleState == .running)
+    }
+
+    @Test
+    func bufferRenegotiationUpdatesOutputAndSendsNotification() async {
+        let engine = FakeAudioEngine()
+        let notifier = FakePlaybackBufferRenegotiationNotifier()
+        let output = makeOutput(bufferFrameSize: 64)
+        let renegotiation = PlaybackBufferRenegotiation(
+            outputName: output.name,
+            outputUID: output.uid,
+            sampleRate: output.nominalSampleRate,
+            previousFrameSize: 64,
+            frameSize: 128,
+            playbackTargetFrames: 192,
+            reason: .outputTimestampDiscontinuity
+        )
+        let model = makeModel(engine: engine, playbackBufferNotifier: notifier)
+        #expect(notifier.prepareCallCount == 1)
+        model.currentOutputUID = output.uid
+        model.currentOutputBufferFrameSize = 64
+
+        engine.emitBufferRenegotiation(renegotiation)
+        await Task.yield()
+
+        #expect(model.currentOutputBufferFrameSize == 128)
+        #expect(notifier.renegotiations == [renegotiation])
+    }
+
+    @Test
     func openPrivacySettingsReportsFailureWhenSystemSettingsCannotOpen() async throws {
         let opener = FakeWorkspaceOpener(results: [false, false])
         let model = makeModel(workspaceOpener: opener)
@@ -1514,6 +1560,20 @@ struct GlassEQAppModelLifecycleTests {
 }
 
 @MainActor
+private final class FakePlaybackBufferRenegotiationNotifier: PlaybackBufferRenegotiationNotifying {
+    private(set) var prepareCallCount = 0
+    private(set) var renegotiations: [PlaybackBufferRenegotiation] = []
+
+    func prepare() {
+        prepareCallCount += 1
+    }
+
+    func notify(_ renegotiation: PlaybackBufferRenegotiation) {
+        renegotiations.append(renegotiation)
+    }
+}
+
+@MainActor
 private func makeModel(
     store: ProfileStore? = nil,
     storeURL: URL = FileManager.default.temporaryDirectory
@@ -1522,6 +1582,7 @@ private func makeModel(
     lookup: FakeDefaultOutputLookup = FakeDefaultOutputLookup(.success(makeOutput())),
     observers: any DefaultOutputObservingMaking = FakeDefaultOutputObserverFactory(),
     workspaceOpener: any WorkspaceOpening = FakeWorkspaceOpener(results: []),
+    playbackBufferNotifier: any PlaybackBufferRenegotiationNotifying = FakePlaybackBufferRenegotiationNotifier(),
     saveDelay: Duration = .zero,
     outputDelay: Duration? = nil,
     wakeDelay: Duration? = nil
@@ -1537,6 +1598,7 @@ private func makeModel(
         installLifecycleObservers: false,
         registerAppDelegate: false,
         workspaceOpener: workspaceOpener,
+        playbackBufferRenegotiationNotifier: playbackBufferNotifier,
         saveDebounceDelay: saveDelay,
         outputChangeSettlingDelayOverride: outputDelay,
         wakeReconnectDelayOverride: wakeDelay
@@ -1925,7 +1987,9 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
     private var _stopCallCount = 0
     private var _muteOutputCallCount = 0
     private var _setBypassedCalls: [Bool] = []
+    private var _resetPlaybackBufferCalibrationUIDs: [String] = []
     private var _metrics = AudioEngineMetrics()
+    private var _bufferRenegotiationHandler: (@Sendable (PlaybackBufferRenegotiation) -> Void)?
     private var _events: [String] = []
 
     var state: AudioEngineState {
@@ -1991,6 +2055,11 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
     private(set) var setBypassedCalls: [Bool] {
         get { withLock { _setBypassedCalls } }
         set { withLock { _setBypassedCalls = newValue } }
+    }
+
+    private(set) var resetPlaybackBufferCalibrationUIDs: [String] {
+        get { withLock { _resetPlaybackBufferCalibrationUIDs } }
+        set { withLock { _resetPlaybackBufferCalibrationUIDs = newValue } }
     }
 
     var metrics: AudioEngineMetrics {
@@ -2106,6 +2175,25 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         withLock {
             _metrics = AudioEngineMetrics()
         }
+    }
+
+    func resetPlaybackBufferCalibration(forOutputUID outputUID: String) throws {
+        withLock {
+            _resetPlaybackBufferCalibrationUIDs.append(outputUID)
+        }
+    }
+
+    func setPlaybackBufferRenegotiationHandler(
+        _ handler: (@Sendable (PlaybackBufferRenegotiation) -> Void)?
+    ) {
+        withLock {
+            _bufferRenegotiationHandler = handler
+        }
+    }
+
+    func emitBufferRenegotiation(_ renegotiation: PlaybackBufferRenegotiation) {
+        let handler = withLock { _bufferRenegotiationHandler }
+        handler?(renegotiation)
     }
 
     private func withLock<T>(_ body: () -> T) -> T {
