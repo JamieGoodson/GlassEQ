@@ -56,6 +56,34 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func editableValueCancellationRestoresTheValueFromTheStartOfEditing() {
+        var session = EditableValueEditSession()
+        session.begin(value: -3)
+        session.recordTextDrivenValue(-6)
+
+        let textChangeWasExternal = session.valueChanged(-6)
+        let restoredValue = session.cancel()
+
+        #expect(!textChangeWasExternal)
+        #expect(restoredValue == -3)
+    }
+
+    @Test
+    func editableValueExternalChangesResetTheActiveSession() {
+        var session = EditableValueEditSession()
+        session.begin(value: -3)
+        session.recordTextDrivenValue(-6)
+
+        let textChangeWasExternal = session.valueChanged(-6)
+        let headroomChangeWasExternal = session.valueChanged(-12)
+        let restoredValue = session.cancel()
+
+        #expect(!textChangeWasExternal)
+        #expect(headroomChangeWasExternal)
+        #expect(restoredValue == nil)
+    }
+
+    @Test
     func sliderQuantizationDoesNotIntroduceDisplayNoise() {
         let locale = Locale(identifier: "en_US_POSIX")
 
