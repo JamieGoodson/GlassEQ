@@ -16,6 +16,7 @@ public final class RealtimeAudioRingBuffer: @unchecked Sendable {
     private let readFrame = Atomic<Int>(0)
     private let writeFrame = Atomic<Int>(0)
     private let overwriteGate = Atomic<Bool>(false)
+    private let overwriteGateContentionFailures = Atomic<UInt64>(0)
 
     public init(channelCount: Int, capacityFrames: Int) {
         self.channelCount = max(channelCount, 1)
@@ -182,6 +183,17 @@ public final class RealtimeAudioRingBuffer: @unchecked Sendable {
         return occupancyFrames(read: read, write: write)
     }
 
+    /// Times a caller exhausted its spin budget waiting for the overwrite gate. Any non-zero value
+    /// means a realtime callback lost a full buffer to contention rather than to a real over/underrun,
+    /// so this is the counter to check first when playback clicks under load.
+    public func overwriteGateContentionFailureCount() -> UInt64 {
+        overwriteGateContentionFailures.load(ordering: .relaxed)
+    }
+
+    func resetOverwriteGateContentionFailureCount() {
+        overwriteGateContentionFailures.store(0, ordering: .relaxed)
+    }
+
     @discardableResult
     func trimToLatestFrames(_ frames: Int) -> Bool {
         guard enterOverwriteGate() else {
@@ -219,12 +231,35 @@ public final class RealtimeAudioRingBuffer: @unchecked Sendable {
         (frame + distance) % storageFrameCapacity
     }
 
+    // `readFrame` has two writers: the playback thread consuming frames, and the capture thread
+    // dropping the oldest frames when the ring overflows. The gate serialises only that update.
+    //
+    // A holder never blocks, allocates, or makes a syscall — the capture side holds it for a few
+    // atomic ops, the playback side for a single memcpy — so contention always clears well inside
+    // a callback deadline and a bounded spin is safe on a realtime thread. Giving up costs a whole
+    // callback (silence out, or an incoming capture block dropped), which is why the spin exists
+    // rather than failing on the first missed exchange.
+    // A reader holds the gate across one callback-sized memcpy. Leave ample headroom over the
+    // normal 1,024–2,048-frame copy while keeping the wait bounded on a realtime thread.
+    private static let overwriteGateSpinLimit = 4_096
+
     private func enterOverwriteGate() -> Bool {
-        overwriteGate.compareExchange(
-            expected: false,
-            desired: true,
-            ordering: .acquiringAndReleasing
-        ).exchanged
+        for _ in 0..<Self.overwriteGateSpinLimit {
+            // Test-and-test-and-set: only attempt the exchange once the gate looks free, so a
+            // spinning thread stops stealing the cache line the holder needs in order to release.
+            guard !overwriteGate.load(ordering: .relaxed) else {
+                continue
+            }
+            if overwriteGate.compareExchange(
+                expected: false,
+                desired: true,
+                ordering: .acquiringAndReleasing
+            ).exchanged {
+                return true
+            }
+        }
+        overwriteGateContentionFailures.wrappingAdd(1, ordering: .relaxed)
+        return false
     }
 
     private func leaveOverwriteGate() {

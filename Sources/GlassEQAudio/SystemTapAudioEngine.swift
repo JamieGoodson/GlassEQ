@@ -13,6 +13,9 @@ public struct AudioEngineMetrics: Equatable, Sendable {
     public var capturedFrames: UInt64
     public var playedFrames: UInt64
     public var playbackUnderrunFrames: UInt64
+    public var droppedInputFrames: UInt64
+    public var droppedBufferedFrames: UInt64
+    public var ringGateContentionFailures: UInt64
     public var saturatedSamples: UInt64
     public var currentBufferedFrames: Int
     public var maxBufferedFrames: Int
@@ -27,6 +30,9 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         capturedFrames: UInt64 = 0,
         playedFrames: UInt64 = 0,
         playbackUnderrunFrames: UInt64 = 0,
+        droppedInputFrames: UInt64 = 0,
+        droppedBufferedFrames: UInt64 = 0,
+        ringGateContentionFailures: UInt64 = 0,
         saturatedSamples: UInt64 = 0,
         currentBufferedFrames: Int = 0,
         maxBufferedFrames: Int = 0,
@@ -40,6 +46,9 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         self.capturedFrames = capturedFrames
         self.playedFrames = playedFrames
         self.playbackUnderrunFrames = playbackUnderrunFrames
+        self.droppedInputFrames = droppedInputFrames
+        self.droppedBufferedFrames = droppedBufferedFrames
+        self.ringGateContentionFailures = ringGateContentionFailures
         self.saturatedSamples = saturatedSamples
         self.currentBufferedFrames = currentBufferedFrames
         self.maxBufferedFrames = maxBufferedFrames
@@ -187,6 +196,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         private let capturedFrames = Atomic<UInt64>(0)
         private let playedFrames = Atomic<UInt64>(0)
         private let playbackUnderrunFrames = Atomic<UInt64>(0)
+        private let droppedInputFrames = Atomic<UInt64>(0)
+        private let droppedBufferedFrames = Atomic<UInt64>(0)
         private let saturatedSamples = Atomic<UInt64>(0)
         private let maxBufferedFrames = Atomic<Int>(0)
         private let maxPlaybackBufferedFrames = Atomic<Int>(0)
@@ -276,6 +287,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             capturedFrames.store(0, ordering: .relaxed)
             playedFrames.store(0, ordering: .relaxed)
             playbackUnderrunFrames.store(0, ordering: .relaxed)
+            droppedInputFrames.store(0, ordering: .relaxed)
+            droppedBufferedFrames.store(0, ordering: .relaxed)
             saturatedSamples.store(0, ordering: .relaxed)
             maxBufferedFrames.store(0, ordering: .relaxed)
             maxPlaybackBufferedFrames.store(0, ordering: .relaxed)
@@ -284,6 +297,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             playbackBufferObservations.store(0, ordering: .relaxed)
             maxCaptureCallbackFrames.store(0, ordering: .relaxed)
             maxPlaybackCallbackFrames.store(0, ordering: .relaxed)
+            ringBuffer.resetOverwriteGateContentionFailureCount()
             playbackPriming.store(true, ordering: .releasing)
         }
 
@@ -294,6 +308,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 capturedFrames: capturedFrames.load(ordering: .relaxed),
                 playedFrames: playedFrames.load(ordering: .relaxed),
                 playbackUnderrunFrames: playbackUnderrunFrames.load(ordering: .relaxed),
+                droppedInputFrames: droppedInputFrames.load(ordering: .relaxed),
+                droppedBufferedFrames: droppedBufferedFrames.load(ordering: .relaxed),
+                ringGateContentionFailures: ringBuffer.overwriteGateContentionFailureCount(),
                 saturatedSamples: saturatedSamples.load(ordering: .relaxed),
                 currentBufferedFrames: ringBuffer.occupancyFrames(),
                 maxBufferedFrames: maxBufferedFrames.load(ordering: .relaxed),
@@ -379,10 +396,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                         frameCount: chunkFrames,
                         channelCount: channelCount
                     )
-                    ringBuffer.writeInterleaved(
-                        UnsafeBufferPointer(chunkSamples),
-                        frameCount: chunkFrames,
-                        sourceChannelCount: channelCount
+                    recordWriteResult(
+                        ringBuffer.writeInterleaved(
+                            UnsafeBufferPointer(chunkSamples),
+                            frameCount: chunkFrames,
+                            sourceChannelCount: channelCount
+                        )
                     )
                     frameOffset += chunkFrames
                 }
@@ -523,10 +542,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 frameCount: frameCount,
                 channelCount: channelCount
             ) {
-                ringBuffer.writeInterleaved(
-                    inputSamples,
-                    frameCount: frameCount,
-                    sourceChannelCount: channelCount
+                recordWriteResult(
+                    ringBuffer.writeInterleaved(
+                        inputSamples,
+                        frameCount: frameCount,
+                        sourceChannelCount: channelCount
+                    )
                 )
             } else {
                 captureScratchSamples.withUnsafeMutableBufferPointer { scratch in
@@ -545,10 +566,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                             frameCount: chunkFrames,
                             channelCount: channelCount
                         )
-                        ringBuffer.writeInterleaved(
-                            UnsafeBufferPointer(chunkSamples),
-                            frameCount: chunkFrames,
-                            sourceChannelCount: channelCount
+                        recordWriteResult(
+                            ringBuffer.writeInterleaved(
+                                UnsafeBufferPointer(chunkSamples),
+                                frameCount: chunkFrames,
+                                sourceChannelCount: channelCount
+                            )
                         )
                         frameOffset += chunkFrames
                     }
@@ -557,6 +580,15 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
             updateMaxBufferedFrames(ringBuffer.occupancyFrames())
             capturedFrames.wrappingAdd(UInt64(frameCount), ordering: .relaxed)
+        }
+
+        private func recordWriteResult(_ result: RingBufferWriteResult) {
+            if result.droppedInputFrames > 0 {
+                droppedInputFrames.wrappingAdd(UInt64(result.droppedInputFrames), ordering: .relaxed)
+            }
+            if result.droppedBufferedFrames > 0 {
+                droppedBufferedFrames.wrappingAdd(UInt64(result.droppedBufferedFrames), ordering: .relaxed)
+            }
         }
 
         private func applyPendingDSPConfig() {
