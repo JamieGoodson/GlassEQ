@@ -61,6 +61,7 @@ protocol SettingsPipeClientConnection: SettingsCommanding {
     var token: String? { get }
 
     func connect() async throws -> SettingsSnapshotDTO
+    func acknowledgeReady() async throws
     func disconnect()
 }
 
@@ -165,6 +166,7 @@ final class SettingsLaunchCoordinator {
             connectedToken = client.token
             connectedMainProcessIdentifier = launchInfo.mainProcessIdentifier
             model.attach(client: client, snapshot: snapshot)
+            try await client.acknowledgeReady()
         } catch {
             guard !Task.isCancelled else {
                 return
@@ -223,6 +225,10 @@ final class SettingsPipeClient: NSObject, SettingsPipeClientConnection, @uncheck
 
     func perform(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
         try await send(kind: .command, command: command)
+    }
+
+    func acknowledgeReady() async throws {
+        _ = try await send(kind: .ready)
     }
 
     func disconnect() {

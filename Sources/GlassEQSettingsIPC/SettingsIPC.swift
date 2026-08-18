@@ -319,6 +319,7 @@ public enum SettingsEvent: Codable, Equatable, Sendable {
 
 public enum SettingsPipeRequestKind: String, Codable, Equatable, Sendable {
     case connect
+    case ready
     case command
     case disconnect
 }

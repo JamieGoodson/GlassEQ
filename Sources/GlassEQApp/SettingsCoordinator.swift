@@ -266,6 +266,10 @@ final class SettingsCoordinator: NSObject {
             launchToken != nil ||
             runningApplication != nil
     }
+
+    var isHelperReadyForTesting: Bool {
+        settingsConnected
+    }
     #endif
 
     private func perform(_ command: SettingsCommand) async throws -> SettingsCommandResponse {
@@ -362,6 +366,8 @@ final class SettingsCoordinator: NSObject {
             break
         case let .request(_, id, .connect, _):
             handleConnect(requestID: id)
+        case let .request(_, id, .ready, _):
+            handleReady(requestID: id)
         case let .request(_, id, .command, command):
             guard let command else {
                 sendError("Settings IPC command payload was missing.", requestID: id)
@@ -380,10 +386,14 @@ final class SettingsCoordinator: NSObject {
             sendError("GlassEQ is shutting down.", requestID: requestID)
             return
         }
-        settingsConnected = true
         let snapshot = model.settingsSnapshot()
         lastSentSnapshot = snapshot
         sendResponse(SettingsCommandResponse(snapshot: snapshot), requestID: requestID)
+    }
+
+    private func handleReady(requestID: String) {
+        settingsConnected = true
+        sendResponse(SettingsCommandResponse(), requestID: requestID)
         if pendingFocusRequest {
             pendingFocusRequest = false
             send(.focusRequested)
