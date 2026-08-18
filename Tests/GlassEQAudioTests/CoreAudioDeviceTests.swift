@@ -867,6 +867,7 @@ struct CoreAudioDeviceTests {
         let queue = DispatchQueue(label: "com.glasseq.tests.refresh-coalescer")
         let coalescer = DispatchRefreshCoalescer(queue: queue, delay: .milliseconds(10))
         let counter = LockedCounter()
+        let completed = DispatchSemaphore(value: 0)
 
         queue.sync {
             coalescer.schedule {
@@ -877,10 +878,11 @@ struct CoreAudioDeviceTests {
             }
             coalescer.schedule {
                 counter.increment()
+                completed.signal()
             }
         }
 
-        Thread.sleep(forTimeInterval: 0.05)
+        #expect(completed.wait(timeout: .now() + 1) == .success)
         queue.sync {}
 
         #expect(counter.value == 1)
