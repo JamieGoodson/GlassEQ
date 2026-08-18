@@ -15,6 +15,7 @@ public struct AudioEngineMetrics: Equatable, Sendable {
     public var playbackUnderrunFrames: UInt64
     public var droppedInputFrames: UInt64
     public var droppedBufferedFrames: UInt64
+    public var ringGateContentionFailures: UInt64
     public var saturatedSamples: UInt64
     public var currentBufferedFrames: Int
     public var maxBufferedFrames: Int
@@ -31,6 +32,7 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         playbackUnderrunFrames: UInt64 = 0,
         droppedInputFrames: UInt64 = 0,
         droppedBufferedFrames: UInt64 = 0,
+        ringGateContentionFailures: UInt64 = 0,
         saturatedSamples: UInt64 = 0,
         currentBufferedFrames: Int = 0,
         maxBufferedFrames: Int = 0,
@@ -46,6 +48,7 @@ public struct AudioEngineMetrics: Equatable, Sendable {
         self.playbackUnderrunFrames = playbackUnderrunFrames
         self.droppedInputFrames = droppedInputFrames
         self.droppedBufferedFrames = droppedBufferedFrames
+        self.ringGateContentionFailures = ringGateContentionFailures
         self.saturatedSamples = saturatedSamples
         self.currentBufferedFrames = currentBufferedFrames
         self.maxBufferedFrames = maxBufferedFrames
@@ -294,6 +297,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             playbackBufferObservations.store(0, ordering: .relaxed)
             maxCaptureCallbackFrames.store(0, ordering: .relaxed)
             maxPlaybackCallbackFrames.store(0, ordering: .relaxed)
+            ringBuffer.resetOverwriteGateContentionFailureCount()
             playbackPriming.store(true, ordering: .releasing)
         }
 
@@ -306,6 +310,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 playbackUnderrunFrames: playbackUnderrunFrames.load(ordering: .relaxed),
                 droppedInputFrames: droppedInputFrames.load(ordering: .relaxed),
                 droppedBufferedFrames: droppedBufferedFrames.load(ordering: .relaxed),
+                ringGateContentionFailures: ringBuffer.overwriteGateContentionFailureCount(),
                 saturatedSamples: saturatedSamples.load(ordering: .relaxed),
                 currentBufferedFrames: ringBuffer.occupancyFrames(),
                 maxBufferedFrames: maxBufferedFrames.load(ordering: .relaxed),

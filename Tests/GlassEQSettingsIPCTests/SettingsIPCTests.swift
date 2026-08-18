@@ -118,6 +118,7 @@ struct SettingsIPCTests {
         #expect(metrics.maximumPlaybackBufferedFrames == 0)
         #expect(metrics.minimumPlaybackBufferedFrames == 0)
         #expect(metrics.averagePlaybackBufferedFrames == 0)
+        #expect(metrics.ringGateContentionFailures == 0)
         #expect(metrics.playbackBufferObservations == 0)
         #expect(metrics.maximumCaptureCallbackFrames == 0)
         #expect(metrics.maximumPlaybackCallbackFrames == 0)

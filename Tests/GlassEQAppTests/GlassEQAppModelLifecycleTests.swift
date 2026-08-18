@@ -1236,7 +1236,11 @@ struct GlassEQAppModelLifecycleTests {
     @Test
     func metricsPollingCommandReturnsNoSnapshotAndPublishesImmediateMetrics() async throws {
         let engine = FakeAudioEngine()
-        engine.metrics = AudioEngineMetrics(capturedFrames: 123, playedFrames: 100)
+        engine.metrics = AudioEngineMetrics(
+            capturedFrames: 123,
+            playedFrames: 100,
+            ringGateContentionFailures: 2
+        )
         let model = makeModel(engine: engine)
 
         let response = try await model.performSettingsCommand(.startMetricsPolling)
@@ -1244,6 +1248,7 @@ struct GlassEQAppModelLifecycleTests {
         #expect(response.snapshot == nil)
         #expect(model.engineMetrics.capturedFrames == 123)
         #expect(model.engineMetrics.playedFrames == 100)
+        #expect(model.engineMetrics.ringGateContentionFailures == 2)
         model.stopMetricsPolling()
     }
 
