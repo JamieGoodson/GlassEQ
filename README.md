@@ -25,7 +25,7 @@ GlassEQ takes a different route. It uses **Core Audio process taps**, Apple's mo
 
 ## Download & install
 
-Grab `GlassEQ-alpha-0.8.1-macos26-arm64.zip` from the [alpha-0.8.1 release](https://github.com/juhokoskela/GlassEQ/releases/tag/alpha-0.8.1), then:
+Grab `GlassEQ-alpha-0.9-macos26-arm64.zip` from the [alpha-0.9 release](https://github.com/juhokoskela/GlassEQ/releases/tag/alpha-0.9), then:
 
 1. Unzip it.
 2. Move `GlassEQ.app` to `/Applications`.
@@ -37,7 +37,7 @@ On first run GlassEQ asks for **system audio capture permission** — that's wha
 
 ### About this alpha
 
-GlassEQ is an early alpha: Apple Silicon only, tested on macOS 26, with no automatic updates or crash reporting yet. Expect the occasional rough edge, and please report any hardware-specific audio issues you run into. See [Docs/AlphaTesting.md](Docs/AlphaTesting.md), [Docs/Distribution.md](Docs/Distribution.md), and [Docs/ReleaseNotes-alpha-0.8.1.md](Docs/ReleaseNotes-alpha-0.8.1.md) before installing a build.
+GlassEQ is an early alpha: Apple Silicon only, tested on macOS 26, with no automatic updates or crash reporting yet. Expect the occasional rough edge, and please report any hardware-specific audio issues you run into. See [Docs/AlphaTesting.md](Docs/AlphaTesting.md), [Docs/Distribution.md](Docs/Distribution.md), and [Docs/ReleaseNotes-alpha-0.9.md](Docs/ReleaseNotes-alpha-0.9.md) before installing a build.
 
 ## How it works
 
@@ -58,7 +58,7 @@ The result is low, predictable latency. The built-in diagnostics report it direc
 - **Profile import** from AutoEQ / EqualizerAPO and REW text, allowing you to paste a headphone-correction curve straight in.
 - **Per-output profile mapping** by Core Audio device UID, with a fallback profile for unmapped devices.
 - **Soft-clip saturation** that tames overshoot instead of hard-clipping.
-- **Built-in diagnostics** (captured/played frames, underruns, buffer occupancy, latency).
+- **Built-in diagnostics** for frame loss, underruns, adaptive buffer occupancy, clock correction, and latency.
 
 ![GlassEQ settings — Editor tab, with the frequency-response graph and parametric filters](Docs/Screenshots/editor.png)
 
