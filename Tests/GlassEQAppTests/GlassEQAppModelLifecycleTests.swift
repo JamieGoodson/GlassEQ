@@ -1460,6 +1460,70 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsReadyPublishesChangesThatOccurredAfterConnect() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .bootstrap = message {
+                    return true
+                }
+                return false
+            }
+        }
+        let bootstrap = try #require(launcher.receivedAppMessages.first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "connect",
+            kind: .connect,
+            command: nil
+        ))
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                if case .response(_, "connect", _, _) = message {
+                    return true
+                }
+                return false
+            }
+        }
+
+        model.statusMessage = "Changed before ready"
+        model.engineMetrics = AudioEngineMetrics(capturedFrames: 42)
+        coordinator.modelDidChange()
+        coordinator.metricsDidChange()
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "ready",
+            kind: .ready,
+            command: nil
+        ))
+
+        await waitUntil {
+            launcher.receivedAppMessages.contains { message in
+                guard case .event(_, .snapshotChanged(let snapshot)) = message else {
+                    return false
+                }
+                return snapshot.statusMessage == "Changed before ready"
+                    && snapshot.metrics.capturedFrames == 42
+            }
+        }
+        #expect(coordinator.isHelperReadyForTesting)
+        coordinator.shutdown()
+    }
+
+    @Test
     func settingsBootstrapWriteFailureRequestsInProcessFallback() async throws {
         let model = makeModel()
         let coordinator = SettingsCoordinator(
