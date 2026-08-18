@@ -554,9 +554,22 @@ struct CoreAudioDeviceTests {
             tapSampleRate: 48_000
         ) == 4_096)
         #expect(SystemTapAudioEngine.preferredPlaybackPrimeFrames(
+            for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 1_024),
+            tapSampleRate: 48_000,
+            captureCallbackFrames: 8_192
+        ) == 11_264)
+        #expect(SystemTapAudioEngine.preferredPlaybackPrimeFrames(
             for: output(channelCount: 2, sampleRate: 48_000, bufferFrameSize: 64),
             tapSampleRate: 24_000
         ) == 1_056)
+    }
+
+    @Test
+    func startupCaptureCallbackUsesReportedSizeOrAdmittedMaximum() {
+        #expect(SystemTapAudioEngine.startupCaptureCallbackFrames(reportedFrames: 64) == 64)
+        #expect(SystemTapAudioEngine.startupCaptureCallbackFrames(reportedFrames: 8_192) == 8_192)
+        #expect(SystemTapAudioEngine.startupCaptureCallbackFrames(reportedFrames: nil) == 8_192)
+        #expect(SystemTapAudioEngine.startupCaptureCallbackFrames(reportedFrames: 8_193) == 8_192)
     }
 
     @Test
@@ -614,12 +627,12 @@ struct CoreAudioDeviceTests {
         #expect(SystemTapAudioEngine.maximumPlaybackReservoirFrames(
             for: normalOutput,
             tapSampleRate: 24_000,
-            maximumObservedCaptureCallbackFrames: 768
+            maximumKnownCaptureCallbackFrames: 768
         ) == 1_024)
         #expect(SystemTapAudioEngine.maximumPlaybackReservoirFrames(
             for: normalOutput,
             tapSampleRate: 48_000,
-            maximumObservedCaptureCallbackFrames: 768
+            maximumKnownCaptureCallbackFrames: 768
         ) == AdaptivePlaybackBufferPolicy.maximumReservoirFrames)
     }
 
