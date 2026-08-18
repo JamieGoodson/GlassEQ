@@ -7,6 +7,25 @@ import Testing
 
 @Suite
 struct SettingsIPCTests {
+    @Test(arguments: [0.707, 0.12345678901234567, 20_000.125])
+    func editableNumberTextRoundTripsTypedPrecision(_ value: Double) {
+        let locale = Locale(identifier: "en_US_POSIX")
+
+        let text = editableNumberText(value, locale: locale)
+
+        #expect(parseEditableNumber(text, locale: locale) == value)
+    }
+
+    @Test
+    func editableNumberParsingSupportsLocaleDecimalSeparator() {
+        #expect(parseEditableNumber("0,707", locale: Locale(identifier: "fi_FI")) == 0.707)
+    }
+
+    @Test(arguments: ["nan", "inf", "-inf", "infinity", "-infinity"])
+    func editableNumberParsingRejectsNonFiniteValues(_ text: String) {
+        #expect(parseEditableNumber(text, locale: Locale(identifier: "en_US_POSIX")) == nil)
+    }
+
     @Test
     func pipeMessageRoundTripsConnectRequest() throws {
         let message = SettingsPipeMessage.request(sessionToken: "token", id: "request-1", kind: .connect, command: nil)
