@@ -1368,6 +1368,36 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsHelperExitAfterConnectBeforeReadyRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        let bootstrap = try #require(launcher.readHostMessages().first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        try launcher.writeHelperOutput(try SettingsPipeCodec.encodeLine(
+            .request(sessionToken: token, id: "connect", kind: .connect, command: nil)
+        ))
+        try launcher.closeHelperOutput()
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("exited before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
     func malformedSettingsIPCBeforeConnectingRequestsInProcessFallback() async throws {
         let model = makeModel()
         let launcher = ControllableSettingsHelperLauncher()
@@ -1387,6 +1417,46 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.inProcessSettingsPresentationGeneration == 1)
         #expect(model.statusMessage.contains("IPC failed before connecting"))
         #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
+    func settingsModelNotificationPublishesMetricsOnlyChanges() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        let bootstrap = try #require(launcher.readHostMessages().first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        let requests = try SettingsPipeCodec.encodeLine(
+            .request(sessionToken: token, id: "connect", kind: .connect, command: nil)
+        ) + SettingsPipeCodec.encodeLine(
+            .request(sessionToken: token, id: "ready", kind: .ready, command: nil)
+        )
+        try launcher.writeHelperOutput(requests)
+        for _ in 0..<100 where !coordinator.isHelperReadyForTesting {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(coordinator.isHelperReadyForTesting)
+        _ = try launcher.readHostMessages()
+
+        model.engineMetrics = AudioEngineMetrics(capturedFrames: 42)
+        coordinator.modelDidChange()
+
+        let messages = try launcher.readHostMessages()
+        #expect(messages.contains(.event(
+            sessionToken: token,
+            event: .metricsChanged(SettingsAudioMetricsDTO(capturedFrames: 42))
+        )))
+        coordinator.shutdown()
     }
 
     @Test
@@ -1807,6 +1877,17 @@ private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching 
 
     func writeHelperOutput(_ data: Data) throws {
         try output.fileHandleForWriting.write(contentsOf: data)
+    }
+
+    func closeHelperOutput() throws {
+        try output.fileHandleForWriting.close()
+    }
+
+    func readHostMessages() throws -> [SettingsPipeMessage] {
+        let data = input.fileHandleForReading.availableData
+        return try data.split(separator: 0x0A).map { line in
+            try SettingsPipeCodec.decodeLine(Data(line))
+        }
     }
 }
 
