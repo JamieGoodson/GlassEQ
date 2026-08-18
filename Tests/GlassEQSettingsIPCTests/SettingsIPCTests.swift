@@ -53,6 +53,16 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func editableNumberPreservesPersistableValuesOutsideSliderRanges() {
+        let locale = Locale(identifier: "en_US_POSIX")
+
+        #expect(clampedEditableNumber("24000", range: ProfilePersistence.frequencyRange, locale: locale) == 24_000)
+        #expect(clampedEditableNumber("120", range: ProfilePersistence.gainRange, locale: locale) == 120)
+        #expect(clampedEditableNumber("-30", range: ProfilePersistence.preampRange, locale: locale) == -30)
+        #expect(clampedEditableNumber("20", range: ProfilePersistence.qRange, locale: locale) == 20)
+    }
+
+    @Test
     func sliderQuantizationDoesNotIntroduceDisplayNoise() {
         let locale = Locale(identifier: "en_US_POSIX")
 
@@ -165,6 +175,20 @@ struct SettingsIPCTests {
         #expect(metrics.filteredPlaybackOccupancyFrames == 0)
         #expect(metrics.playbackBufferSampleRate == 0)
         #expect(!metrics.playbackSampleRateConversionActive)
+    }
+
+    @Test
+    func playbackLatencyUsesTheBufferFrameRate() {
+        #expect(playbackFramesToMilliseconds(
+            480,
+            bufferSampleRate: 48_000,
+            fallbackSampleRate: 16_000
+        ) == 10)
+        #expect(playbackFramesToMilliseconds(
+            480,
+            bufferSampleRate: 0,
+            fallbackSampleRate: 16_000
+        ) == 30)
     }
 
     @Test

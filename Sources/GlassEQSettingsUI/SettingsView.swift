@@ -125,6 +125,18 @@ func clampedEditableNumber(
     return min(max(parsed, range.lowerBound), range.upperBound)
 }
 
+func playbackFramesToMilliseconds(
+    _ frames: Double,
+    bufferSampleRate: Double,
+    fallbackSampleRate: Double
+) -> Double {
+    let sampleRate = bufferSampleRate > 0 ? bufferSampleRate : fallbackSampleRate
+    guard sampleRate > 0 else {
+        return 0
+    }
+    return frames / sampleRate * 1_000
+}
+
 private func localizedInteger(_ value: Int) -> String {
     value.formatted(.number.locale(.autoupdatingCurrent))
 }
@@ -190,6 +202,7 @@ public struct SettingsView: View {
     @Bindable var model: GlassEQSettingsViewModel
     @State private var snapshot: SettingsSnapshot
     @State private var tab = EditorSection.editor
+    @State private var draftEditGeneration = 0
 
     public init(model: GlassEQSettingsViewModel) {
         self._model = Bindable(wrappedValue: model)
@@ -217,6 +230,7 @@ public struct SettingsView: View {
                 snapshot: snapshot,
                 draftProfile: $snapshot.draftProfile,
                 tab: $tab,
+                draftEditGeneration: draftEditGeneration,
                 hasUnsavedDraft: hasUnsavedDraft,
                 onApply: applyDraft,
                 onRevert: revertDraft,
@@ -298,6 +312,7 @@ public struct SettingsView: View {
 
     private func revertDraft() {
         snapshot.draftProfile = selectedProfile
+        draftEditGeneration &+= 1
     }
 
     private func useDraftForCurrentOutput() {
@@ -889,6 +904,7 @@ private struct ProfileDetail: View {
     var snapshot: SettingsSnapshot
     @Binding var draftProfile: EQProfile
     @Binding var tab: EditorSection
+    var draftEditGeneration: Int
     var hasUnsavedDraft: Bool
     var onApply: () -> Void
     var onRevert: () -> Void
@@ -931,7 +947,8 @@ private struct ProfileDetail: View {
                         case .editor:
                             EditorTab(
                                 draftProfile: $draftProfile,
-                                sampleRate: snapshot.currentOutputSampleRate
+                                sampleRate: snapshot.currentOutputSampleRate,
+                                draftEditGeneration: draftEditGeneration
                             )
                             .disabled(isProfileStoreProtected)
                         case .importer:
@@ -1146,13 +1163,15 @@ private extension EQChannelMode {
 private struct EditorTab: View {
     @Binding var draftProfile: EQProfile
     var sampleRate: Double
+    var draftEditGeneration: Int
     @State private var editChannel = EQEditChannel.left
     @State private var analysis: EQAnalysisSnapshot
     @State private var analysisTask: Task<Void, Never>?
 
-    init(draftProfile: Binding<EQProfile>, sampleRate: Double) {
+    init(draftProfile: Binding<EQProfile>, sampleRate: Double, draftEditGeneration: Int) {
         self._draftProfile = draftProfile
         self.sampleRate = sampleRate
+        self.draftEditGeneration = draftEditGeneration
         self._analysis = State(
             initialValue: EQAnalysisSnapshot(
                 profile: draftProfile.wrappedValue,
@@ -1220,6 +1239,7 @@ private struct EditorTab: View {
                     title: localized("Preamp"),
                     value: activePreampBinding,
                     range: -24...12,
+                    validationRange: ProfilePersistence.preampRange,
                     step: 0.1,
                     suffix: "dB"
                 )
@@ -1360,7 +1380,7 @@ private struct EditorTab: View {
 
     private var activeEditContextID: String {
         let channel = draftProfile.channelMode == .stereo ? editChannel.rawValue : "linked"
-        return "\(draftProfile.id.uuidString):\(channel)"
+        return "\(draftProfile.id.uuidString):\(channel):\(draftEditGeneration)"
     }
 
     private func setChannelMode(_ mode: EQChannelMode) {
@@ -1659,7 +1679,7 @@ private struct GraphicFilterEditor: View {
                     EditableValueText(
                         title: localized("Gain"),
                         value: $filter.gainDB,
-                        range: -12...12,
+                        range: ProfilePersistence.gainRange,
                         display: filter.gainDB.dbLabel,
                         width: 56
                     )
@@ -1880,9 +1900,31 @@ private struct ParametricFilterInspector: View {
                 .accessibilityHint(Text(localized("Changes the selected filter type")))
             }
 
-            SliderRow(title: localized("Frequency"), value: $filter.frequency, range: 20...20_000, step: 1, suffix: "Hz", scale: .logarithmic)
-            SliderRow(title: localized("Gain"), value: $filter.gainDB, range: -24...24, step: 0.1, suffix: "dB")
-            SliderRow(title: localized("Q"), value: $filter.q, range: 0.1...10, step: 0.01, suffix: "")
+            SliderRow(
+                title: localized("Frequency"),
+                value: $filter.frequency,
+                range: 20...20_000,
+                validationRange: ProfilePersistence.frequencyRange,
+                step: 1,
+                suffix: "Hz",
+                scale: .logarithmic
+            )
+            SliderRow(
+                title: localized("Gain"),
+                value: $filter.gainDB,
+                range: -24...24,
+                validationRange: ProfilePersistence.gainRange,
+                step: 0.1,
+                suffix: "dB"
+            )
+            SliderRow(
+                title: localized("Q"),
+                value: $filter.q,
+                range: 0.1...10,
+                validationRange: ProfilePersistence.qRange,
+                step: 0.01,
+                suffix: ""
+            )
         }
         .cardPanel(padding: 16)
     }
@@ -1907,6 +1949,7 @@ private struct SliderRow: View {
     var title: String
     @Binding var value: Double
     var range: ClosedRange<Double>
+    var validationRange: ClosedRange<Double>? = nil
     var step: Double
     var suffix: String
     var scale = SliderScale.linear
@@ -1926,7 +1969,7 @@ private struct SliderRow: View {
             EditableValueText(
                 title: title,
                 value: $value,
-                range: range,
+                range: validationRange ?? range,
                 display: label
             )
         }
@@ -2346,13 +2389,11 @@ private struct OutputTab: View {
     }
 
     private func framesToMilliseconds(_ frames: Double) -> Double {
-        let sampleRate = snapshot.metrics.playbackBufferSampleRate > 0
-            ? snapshot.metrics.playbackBufferSampleRate
-            : snapshot.currentOutputSampleRate
-        guard sampleRate > 0 else {
-            return 0
-        }
-        return frames / sampleRate * 1_000
+        playbackFramesToMilliseconds(
+            frames,
+            bufferSampleRate: snapshot.metrics.playbackBufferSampleRate,
+            fallbackSampleRate: snapshot.currentOutputSampleRate
+        )
     }
 
     private func formatLatency(milliseconds: Double) -> String {

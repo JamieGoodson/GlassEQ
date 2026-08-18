@@ -1885,6 +1885,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             allowsDownwardProbe: allowsFrameSizeDownwardProbe
         )
         try Self.validatePlaybackCallbackCapacity(for: tunedOutput)
+        try Self.validatePlaybackConversionCapacity(
+            for: tunedOutput,
+            tapSampleRate: runtime.sampleRate
+        )
         state.activeOutput = tunedOutput
         let operatingPointKey = PlaybackBufferOperatingPointKey(output: tunedOutput)
         let allowsDownwardProbe = state.attemptedPlaybackTargetDownProbes.insert(
@@ -2122,7 +2126,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
         if let availabilityError = error as? AudioDeviceAvailabilityError {
             switch availabilityError {
-            case .unsupportedOutputChannelCount, .unsupportedOutputBufferFrameSize:
+            case .unsupportedOutputChannelCount,
+                 .unsupportedOutputBufferFrameSize,
+                 .unsupportedPlaybackConversionBuffer:
                 return AudioEngineFailure(
                     category: .deviceFormatUnsupported,
                     userMessage: availabilityError.description,
@@ -2161,6 +2167,27 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 output.id,
                 output.bufferFrameSize,
                 maximum: UInt32(maximumSupportedCallbackFrames)
+            )
+        }
+    }
+
+    static func validatePlaybackConversionCapacity(
+        for output: AudioOutputDevice,
+        tapSampleRate: Double
+    ) throws {
+        guard shouldUseSampleRateConversion(tapSampleRate: tapSampleRate, output: output) else {
+            return
+        }
+        let requiredPrimeFrames = preferredPlaybackPrimeFrames(
+            for: output,
+            tapSampleRate: tapSampleRate
+        )
+        let maximumPrimeFrames = runtimeRingCapacityFrames / playbackRingPullCount
+        guard requiredPrimeFrames <= maximumPrimeFrames else {
+            throw AudioDeviceAvailabilityError.unsupportedPlaybackConversionBuffer(
+                output.id,
+                requiredPrimeFrames: requiredPrimeFrames,
+                maximumPrimeFrames: maximumPrimeFrames
             )
         }
     }
@@ -2572,10 +2599,21 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             continueCalibrationAfterUnresolvedInstability(preparation)
             return
         }
-        guard AdaptivePlaybackBufferPolicy.nextFrameSize(
+        guard let nextFrameSize = AdaptivePlaybackBufferPolicy.nextFrameSize(
             after: preparation.output.bufferFrameSize,
             supportedRange: range
-        ) != nil else {
+        ) else {
+            continueCalibrationAfterUnresolvedInstability(preparation)
+            return
+        }
+        var proposedOutput = preparation.output
+        proposedOutput.bufferFrameSize = nextFrameSize
+        do {
+            try Self.validatePlaybackConversionCapacity(
+                for: proposedOutput,
+                tapSampleRate: preparation.runtime.sampleRate
+            )
+        } catch {
             continueCalibrationAfterUnresolvedInstability(preparation)
             return
         }
