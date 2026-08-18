@@ -425,6 +425,72 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func chainedProfileAndRouteFailuresRestoreTheLastConfirmedProfile() async throws {
+        let firstOutput = makeOutput(uid: "confirmed-first", name: "Confirmed First", id: 200)
+        let secondOutput = makeOutput(uid: "confirmed-second", name: "Confirmed Second", id: 300)
+        let confirmedProfile = makeProfile(name: "Confirmed Profile")
+        var requestedProfile = confirmedProfile
+        requestedProfile.name = "Requested Profile"
+        let routeProfile = makeProfile(name: "Route Profile")
+        let store = ProfileStore(
+            profiles: [confirmedProfile, routeProfile],
+            outputMappings: [OutputDeviceProfileMapping(
+                outputDeviceUID: secondOutput.uid,
+                profileID: routeProfile.id
+            )],
+            fallbackProfileID: confirmedProfile.id
+        )
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        engine.updateDSPResult = false
+        engine.updateError = TestAudioError.updateFailed
+        engine.updateErrorPreservesRunningState = true
+        engine.blockUpdate(for: requestedProfile.id)
+        try model.apply(profile: requestedProfile)
+        await waitUntil {
+            engine.updateCalls.count == 1
+        }
+        #expect(engine.waitUntilUpdateIsBlocked(for: requestedProfile.id, timeout: .now() + 1))
+
+        engine.startError = TestAudioError.startFailed
+        engine.startErrorProfileID = routeProfile.id
+        engine.startErrorPreservesRunningState = true
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await settleAsyncWork()
+        engine.unblockUpdate(for: requestedProfile.id)
+
+        await waitUntil {
+            engine.startCalls.count == 2
+                && model.lifecycleState == .running
+                && model.statusMessage.contains("not applied")
+        }
+
+        #expect(engine.state == .running(output: firstOutput))
+        #expect(model.currentOutputUID == firstOutput.uid)
+        #expect(model.activeProfile == confirmedProfile)
+        #expect(model.selectedProfileID == confirmedProfile.id)
+        #expect(model.draftProfile == confirmedProfile)
+        #expect(model.profileStore == store)
+    }
+
+    @Test
     func staleRuntimeFailureDoesNotStopCompletedNewerRoute() async {
         let firstOutput = makeOutput(uid: "stale-runtime-first", name: "Stale Runtime First", id: 200)
         let secondOutput = makeOutput(uid: "stale-runtime-second", name: "Stale Runtime Second", id: 300)
@@ -619,6 +685,7 @@ struct GlassEQAppModelLifecycleTests {
             model.lifecycleState == .running
                 && engine.startCalls.count == 2
                 && model.currentOutputUID == speakers.uid
+                && model.statusMessage == localized("Processing \(speakers.name) with \(model.activeProfile.name)")
         }
 
         #expect(model.isRunning)
@@ -3084,6 +3151,7 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
     private var _startDelaySeconds: TimeInterval = 0
     private var _startDelaySecondsByUID: [String: TimeInterval] = [:]
     private var _startBlockersByUID: [String: FakeStartBlocker] = [:]
+    private var _updateBlockersByProfileID: [UUID: FakeStartBlocker] = [:]
     private var _startCalls: [StartCall] = []
     private var _updateCalls: [EQProfile] = []
     private var _updateDSPCalls: [EQProfile] = []
@@ -3217,6 +3285,25 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         blocker?.unblock()
     }
 
+    func blockUpdate(for profileID: UUID) {
+        withLock {
+            _updateBlockersByProfileID[profileID] = FakeStartBlocker()
+        }
+    }
+
+    func waitUntilUpdateIsBlocked(for profileID: UUID, timeout: DispatchTime) -> Bool {
+        withLock {
+            _updateBlockersByProfileID[profileID]
+        }?.waitUntilEntered(timeout: timeout) ?? false
+    }
+
+    func unblockUpdate(for profileID: UUID) {
+        let blocker = withLock {
+            _updateBlockersByProfileID.removeValue(forKey: profileID)
+        }
+        blocker?.unblock()
+    }
+
     func blockPlaybackBufferCalibrationReset() {
         withLock {
             _playbackBufferCalibrationResetBlocker = FakeStartBlocker()
@@ -3282,8 +3369,13 @@ private final class FakeAudioEngine: AudioEngineControlling, @unchecked Sendable
         let update = withLock {
             _events.append("update:\(profile.id)")
             _updateCalls.append(profile)
-            return (error: _updateError, preservesRunningState: _updateErrorPreservesRunningState)
+            return (
+                blocker: _updateBlockersByProfileID[profile.id],
+                error: _updateError,
+                preservesRunningState: _updateErrorPreservesRunningState
+            )
         }
+        update.blocker?.waitUntilUnblocked()
         if let updateError = update.error {
             if !update.preservesRunningState {
                 withLock {

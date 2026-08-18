@@ -533,6 +533,7 @@ final class GlassEQAppModel {
     private let storeWriter: ProfileStoreWriter
     private var profilePersistenceMode: ProfilePersistenceMode = .normal
     @ObservationIgnored private let engineWorkExecutor = EngineWorkExecutor()
+    @ObservationIgnored private let confirmedEngineProfileState = ConfirmedEngineProfileState()
     @ObservationIgnored lazy var settingsCoordinator = SettingsCoordinator(model: self)
     @ObservationIgnored var inProcessSettingsViewModelStorage: GlassEQSettingsViewModel?
     @ObservationIgnored var inProcessSettingsIsPresented = false
@@ -557,6 +558,27 @@ final class GlassEQAppModel {
         var selectedProfileID: UUID
         var draftProfile: EQProfile
         var previewReturnProfile: EQProfile?
+    }
+
+    private final class ConfirmedEngineProfileState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var rollback: ProfileRollback?
+
+        func current() -> ProfileRollback? {
+            lock.withLock { rollback }
+        }
+
+        func confirm(_ rollback: ProfileRollback) {
+            lock.withLock {
+                self.rollback = rollback
+            }
+        }
+
+        func clear() {
+            lock.withLock {
+                rollback = nil
+            }
+        }
     }
 
     private enum EngineWork: Sendable {
@@ -1053,6 +1075,7 @@ final class GlassEQAppModel {
         } else if hasPendingProfileReplacingEngineWork {
             reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
         } else if engine.updateDSP(profile: profile) {
+            confirmedEngineProfileState.confirm(profileRollback())
             statusMessage = localized("Previewing settings for \(profile.name)")
         } else {
             restartEngineWithActiveProfile(rollback: rollback)
@@ -1079,6 +1102,7 @@ final class GlassEQAppModel {
         } else if hasPendingProfileReplacingEngineWork {
             reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
         } else if engine.updateDSP(profile: profile) {
+            confirmedEngineProfileState.confirm(profileRollback())
             statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
         } else {
             restartEngineWithActiveProfile(rollback: rollback)
@@ -1436,8 +1460,16 @@ final class GlassEQAppModel {
         let engine = engine
         let defaultOutputLookup = defaultOutputLookup
         let engineWorkExecutor = engineWorkExecutor
+        let confirmation = profileRollback()
+        let confirmedEngineProfileState = confirmedEngineProfileState
         let workTask = engineWorkExecutor.enqueue(priority: .userInitiated) {
-            Self.performEngineWork(work, engine: engine, defaultOutputLookup: defaultOutputLookup)
+            Self.performEngineWork(
+                work,
+                confirmation: confirmation,
+                confirmedState: confirmedEngineProfileState,
+                engine: engine,
+                defaultOutputLookup: defaultOutputLookup
+            )
         }
 
         engineStartTask = Task { @MainActor [weak self] in
@@ -1478,6 +1510,7 @@ final class GlassEQAppModel {
         startObserver(sendInitialValue: false)
         if isRunning {
             if engine.updateDSP(profile: activeProfile) {
+                confirmedEngineProfileState.confirm(profileRollback())
                 statusMessage = processingStatus(outputName: currentOutputName, profileName: activeProfile.name)
             } else {
                 restartEngineWithActiveProfile(rollback: rollback)
@@ -1539,14 +1572,18 @@ final class GlassEQAppModel {
     private func enqueueEngineStop() -> Task<AudioEngineMetrics, Never> {
         let engine = engine
         let engineWorkExecutor = engineWorkExecutor
+        let confirmedEngineProfileState = confirmedEngineProfileState
         return engineWorkExecutor.enqueue(priority: .userInitiated) {
             engine.stop()
+            confirmedEngineProfileState.clear()
             return engine.snapshotMetrics()
         }
     }
 
     nonisolated private static func performEngineWork(
         _ work: EngineWork,
+        confirmation: ProfileRollback,
+        confirmedState: ConfirmedEngineProfileState,
         engine: any AudioEngineControlling,
         defaultOutputLookup: any DefaultOutputLookingUp
     ) -> EngineWorkResult {
@@ -1563,7 +1600,11 @@ final class GlassEQAppModel {
                     try engine.start(output: requestedOutput, profile: profile)
                 } catch {
                     if case .running(let activeOutput) = engine.state {
-                        return .profileChangeNotApplied(error, activeOutput, rollback)
+                        return .profileChangeNotApplied(
+                            error,
+                            activeOutput,
+                            confirmedState.current() ?? rollback
+                        )
                     }
                     throw error
                 }
@@ -1583,7 +1624,11 @@ final class GlassEQAppModel {
                         try engine.update(profile: profile)
                     } catch {
                         if case .running(let activeOutput) = engine.state {
-                            return .profileChangeNotApplied(error, activeOutput, rollback)
+                            return .profileChangeNotApplied(
+                                error,
+                                activeOutput,
+                                confirmedState.current() ?? rollback
+                            )
                         }
                         throw error
                     }
@@ -1608,8 +1653,15 @@ final class GlassEQAppModel {
                     }
                 }
             }
+            confirmedState.confirm(confirmation)
             return .success(output)
         } catch {
+            switch engine.state {
+            case .running:
+                break
+            case .stopped, .failed:
+                confirmedState.clear()
+            }
             return .failure(error, attemptedOutput)
         }
     }
