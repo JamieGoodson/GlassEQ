@@ -658,6 +658,12 @@ struct AdaptivePlaybackRateTests {
             callbackFrames: 128,
             after: 320
         ) == nil)
+        #expect(AdaptivePlaybackBufferPolicy.nextTargetFrames(
+            for: .underrun,
+            callbackFrames: 3_072,
+            after: 4_096,
+            maximumReservoirFrames: 2_048
+        ) == 4_160)
     }
 
     @Test

@@ -445,15 +445,15 @@ struct CoreAudioDeviceTests {
         ) == 1_088)
         #expect(SystemTapAudioEngine.preferredPlaybackPrimeFrames(
             for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 1_024)
-        ) == 1_088)
+        ) == 2_048)
         #expect(SystemTapAudioEngine.preferredPlaybackPrimeFrames(
             for: output(channelCount: 2, sampleRate: 24_000, bufferFrameSize: 1_024),
             tapSampleRate: 48_000
-        ) == 2_112)
+        ) == 3_072)
         #expect(SystemTapAudioEngine.preferredPlaybackPrimeFrames(
             for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 1_024),
             tapSampleRate: 48_000
-        ) == 3_136)
+        ) == 4_096)
     }
 
     @Test
@@ -486,7 +486,7 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
-    func adaptivePlaybackBufferAppliesToEveryNormalRateOutput() {
+    func adaptivePlaybackBufferAppliesToEveryValidOutputRate() {
         #expect(SystemTapAudioEngine.shouldAdaptPlaybackBuffer(
             for: output(channelCount: 2, bufferFrameSize: 64)
         ))
@@ -497,9 +497,13 @@ struct CoreAudioDeviceTests {
                 transportType: kAudioDeviceTransportTypeBluetooth
             )
         ))
-        #expect(!SystemTapAudioEngine.shouldAdaptPlaybackBuffer(
+        #expect(SystemTapAudioEngine.shouldAdaptPlaybackBuffer(
             for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 1_024)
         ))
+        #expect(SystemTapAudioEngine.playbackInputCallbackFrames(
+            for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 1_024),
+            tapSampleRate: 48_000
+        ) == 3_072)
     }
 
     @Test

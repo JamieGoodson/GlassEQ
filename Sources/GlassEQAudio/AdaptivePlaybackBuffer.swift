@@ -552,7 +552,7 @@ enum PersistedPlaybackBufferCalibrationStore {
 struct AdaptivePlaybackBufferPolicy {
     private static let frameSizeLadder: [UInt32] = [64, 128, 256, 512]
     private static let reservoirStepFrames = 64
-    private static let maximumReservoirFrames = reservoirStepFrames * 3
+    static let maximumReservoirFrames = reservoirStepFrames * 3
 
     static func nextFrameSize(
         after currentFrameSize: UInt32,
@@ -570,7 +570,8 @@ struct AdaptivePlaybackBufferPolicy {
     static func nextTargetFrames(
         for reason: PlaybackBufferInstabilityReason,
         callbackFrames: UInt32,
-        after currentTargetFrames: Int
+        after currentTargetFrames: Int,
+        maximumReservoirFrames: Int = maximumReservoirFrames
     ) -> Int? {
         // Reservoir protects against missing input. Backlog is trimmed during reprime and does
         // not become safer when both the prime and target move upward together.
@@ -578,7 +579,7 @@ struct AdaptivePlaybackBufferPolicy {
             return nil
         }
         let callbackFrames = max(Int(callbackFrames), 1)
-        let maximumTargetFrames = callbackFrames + maximumReservoirFrames
+        let maximumTargetFrames = callbackFrames + max(maximumReservoirFrames, reservoirStepFrames)
         let nextTargetFrames = max(
             currentTargetFrames + reservoirStepFrames,
             minimumTargetFrames(callbackFrames: UInt32(callbackFrames))

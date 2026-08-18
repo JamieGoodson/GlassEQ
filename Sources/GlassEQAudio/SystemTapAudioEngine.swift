@@ -116,6 +116,9 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     // Leaves one preferred 64-frame capture callback after servicing a 64-frame output pull.
     private static let preferredBluetoothPlaybackReservoirFrames = 64
     private static let preferredLowSampleRateBufferFrameSize: UInt32 = 1024
+    // Converted headset routes need enough tap-rate audio to span one full admitted
+    // capture callback even when the aggregate ignores the preferred 64-frame request.
+    private static let preferredLowSampleRatePlaybackReservoirFrames = Int(maximumRuntimeBufferFrameSize)
     private static let preferredCaptureBufferFrameSize: UInt32 = 64
     private static let minimumRingBufferFrames = 2048
     private static let maximumRuntimeBufferFrameSize: UInt32 = 1024
@@ -128,7 +131,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     private static let lowSampleRateThreshold = 24_000.0
     private static let maximumPlannedPlaybackPrimeFrames =
         maximumSupportedCallbackFrames * maximumPlannedPlaybackRateRatio
-            + Int(preferredCaptureBufferFrameSize)
+            + maximumSupportedCallbackFrames
     static let runtimeRingCapacityFrames = max(
         minimumRingBufferFrames,
         maximumPlannedPlaybackPrimeFrames * playbackRingPullCount
@@ -452,6 +455,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
         func playbackTargetFrames() -> Int {
             adaptivePlaybackTargetFrames.load(ordering: .acquiring)
+        }
+
+        func maximumObservedCaptureCallbackFrames() -> Int {
+            maxCaptureCallbackFrames.load(ordering: .relaxed)
         }
 
         // Called when a new output half is started. Clears any transition mute (the runtime
@@ -2366,7 +2373,10 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             from: playbackBufferCalibrationStoreURL
         )
         let targetFrames = AdaptivePlaybackBufferPolicy.startupTargetFrames(
-            callbackFrames: output.bufferFrameSize,
+            callbackFrames: Self.playbackInputCallbackFrames(
+                for: output,
+                tapSampleRate: tapSampleRate
+            ),
             baselineTargetFrames: baseline,
             operatingPoint: calibration?.operatingPoint(for: output.bufferFrameSize),
             allowsDownwardProbe: allowsDownwardProbe
@@ -2585,8 +2595,17 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             let previousTargetFrames = preparation.runtime.playbackTargetFrames()
             guard let targetFrames = AdaptivePlaybackBufferPolicy.nextTargetFrames(
                 for: preparation.reason,
-                callbackFrames: preparation.output.bufferFrameSize,
-                after: previousTargetFrames
+                callbackFrames: Self.playbackInputCallbackFrames(
+                    for: preparation.output,
+                    tapSampleRate: preparation.runtime.sampleRate
+                ),
+                after: previousTargetFrames,
+                maximumReservoirFrames: Self.isLowSampleRateRoute(preparation.output)
+                    ? max(
+                        Self.preferredLowSampleRatePlaybackReservoirFrames,
+                        preparation.runtime.maximumObservedCaptureCallbackFrames()
+                    )
+                    : AdaptivePlaybackBufferPolicy.maximumReservoirFrames
             ) else {
                 return nil
             }
@@ -2735,7 +2754,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             return max(
                 sampleRatePlan.inputFrames(forOutputFrames: Int(Self.preferredLowSampleRateBufferFrameSize)),
                 sampleRatePlan.inputFrames(forOutputFrames: outputCallbackFrames)
-                    + Self.preferredBluetoothPlaybackReservoirFrames
+                    + Self.preferredLowSampleRatePlaybackReservoirFrames
             )
         }
         if output.isBluetoothTransport {
@@ -2751,7 +2770,17 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     }
 
     static func shouldAdaptPlaybackBuffer(for output: AudioOutputDevice) -> Bool {
-        !isLowSampleRateRoute(output)
+        output.nominalSampleRate > 0
+    }
+
+    static func playbackInputCallbackFrames(
+        for output: AudioOutputDevice,
+        tapSampleRate: Double
+    ) -> UInt32 {
+        UInt32(clamping: PlaybackSampleRatePlan(
+            inputSampleRate: tapSampleRate,
+            outputSampleRate: output.nominalSampleRate
+        ).inputFrames(forOutputFrames: Int(output.bufferFrameSize)))
     }
 
     static func shouldUseSampleRateConversion(
