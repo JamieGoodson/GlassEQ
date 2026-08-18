@@ -500,6 +500,10 @@ struct CoreAudioDeviceTests {
             for: output(channelCount: 2, sampleRate: 16_000, bufferFrameSize: 1_024),
             tapSampleRate: 48_000
         ) == 4_096)
+        #expect(SystemTapAudioEngine.preferredPlaybackPrimeFrames(
+            for: output(channelCount: 2, sampleRate: 48_000, bufferFrameSize: 64),
+            tapSampleRate: 24_000
+        ) == 1_056)
     }
 
     @Test
@@ -533,6 +537,24 @@ struct CoreAudioDeviceTests {
             tapSampleRate: 24_000,
             output: headsetOutput
         ))
+        #expect(SystemTapAudioEngine.shouldRefreshCaptureForOutput(
+            tapSampleRate: 24_000,
+            output: normalOutput
+        ))
+        #expect(!SystemTapAudioEngine.shouldRefreshCaptureForOutput(
+            tapSampleRate: 48_000,
+            output: headsetOutput
+        ))
+        #expect(SystemTapAudioEngine.maximumPlaybackReservoirFrames(
+            for: normalOutput,
+            tapSampleRate: 24_000,
+            maximumObservedCaptureCallbackFrames: 768
+        ) == 1_024)
+        #expect(SystemTapAudioEngine.maximumPlaybackReservoirFrames(
+            for: normalOutput,
+            tapSampleRate: 48_000,
+            maximumObservedCaptureCallbackFrames: 768
+        ) == AdaptivePlaybackBufferPolicy.maximumReservoirFrames)
     }
 
     @Test

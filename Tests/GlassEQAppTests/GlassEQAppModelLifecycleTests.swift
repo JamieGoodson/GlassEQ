@@ -158,6 +158,57 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func profileAppliedDuringRouteStartIsRepublishedAfterTheRouteSettles() async throws {
+        let firstOutput = makeOutput(uid: "profile-first", name: "Profile First", id: 200)
+        let secondOutput = makeOutput(uid: "profile-second", name: "Profile Second", id: 300)
+        let initialProfile = makeProfile(name: "Initial")
+        let appliedProfile = makeProfile(name: "Applied During Route Start")
+        let store = ProfileStore(
+            profiles: [initialProfile, appliedProfile],
+            fallbackProfileID: initialProfile.id
+        )
+        let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(firstOutput))
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: lookup,
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        let observer = observers.observers[0]
+        observer.emit(.success(firstOutput))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        engine.blockStart(for: secondOutput.uid)
+        lookup.result = .success(secondOutput)
+        observer.emit(.success(secondOutput))
+        await waitUntil {
+            engine.startCalls.count == 2
+        }
+        #expect(engine.waitUntilStartIsBlocked(for: secondOutput.uid, timeout: .now() + 1))
+
+        try model.apply(profile: appliedProfile)
+        #expect(engine.updateDSPCalls.isEmpty)
+
+        engine.unblockStart(for: secondOutput.uid)
+        await waitUntil {
+            model.lifecycleState == .running
+                && model.currentOutputUID == secondOutput.uid
+                && engine.startCalls.count == 3
+        }
+
+        #expect(engine.startCalls.last?.profile == appliedProfile)
+        #expect(model.activeProfile == appliedProfile)
+        #expect(model.statusMessage == localized("Processing \(secondOutput.name) with \(appliedProfile.name)"))
+    }
+
+    @Test
     func staleRuntimeFailureDoesNotStopCompletedNewerRoute() async {
         let firstOutput = makeOutput(uid: "stale-runtime-first", name: "Stale Runtime First", id: 200)
         let secondOutput = makeOutput(uid: "stale-runtime-second", name: "Stale Runtime Second", id: 300)
@@ -1760,6 +1811,36 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsHelperExitAfterConnectBeforeReadyRequestsInProcessFallback() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        let bootstrap = try #require(launcher.readHostMessages().first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        try launcher.writeHelperOutput(try SettingsPipeCodec.encodeLine(
+            .request(sessionToken: token, id: "connect", kind: .connect, command: nil)
+        ))
+        try launcher.closeHelperOutput()
+
+        for _ in 0..<100 where model.inProcessSettingsPresentationGeneration == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.inProcessSettingsPresentationGeneration == 1)
+        #expect(model.statusMessage.contains("exited before connecting"))
+        #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
     func malformedSettingsIPCBeforeConnectingRequestsInProcessFallback() async throws {
         let model = makeModel()
         let launcher = ControllableSettingsHelperLauncher()
@@ -1779,6 +1860,51 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.inProcessSettingsPresentationGeneration == 1)
         #expect(model.statusMessage.contains("IPC failed before connecting"))
         #expect(!coordinator.hasActiveSessionResourcesForTesting)
+    }
+
+    @Test
+    func settingsModelNotificationPublishesMetricsOnlyChanges() async throws {
+        let model = makeModel()
+        let launcher = ControllableSettingsHelperLauncher()
+        let coordinator = SettingsCoordinator(
+            model: model,
+            helperLauncher: launcher,
+            helperValidator: PermissiveSettingsHelperLaunchValidator(),
+            settingsHelperURLProvider: { URL(fileURLWithPath: "/tmp/GlassEQSettings.app") }
+        )
+
+        #expect(coordinator.openSettings() == .helper)
+        let bootstrap = try #require(launcher.readHostMessages().first)
+        guard case .bootstrap(let token) = bootstrap else {
+            Issue.record("Expected Settings bootstrap message")
+            return
+        }
+        let requests = try SettingsPipeCodec.encodeLine(
+            .request(sessionToken: token, id: "connect", kind: .connect, command: nil)
+        ) + SettingsPipeCodec.encodeLine(
+            .request(sessionToken: token, id: "ready", kind: .ready, command: nil)
+        )
+        try launcher.writeHelperOutput(requests)
+        for _ in 0..<100 where !coordinator.isHelperReadyForTesting {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(coordinator.isHelperReadyForTesting)
+        _ = try launcher.readHostMessages()
+
+        model.engineMetrics = AudioEngineMetrics(capturedFrames: 42)
+        coordinator.modelDidChange()
+
+        let expectedMessage = SettingsPipeMessage.event(
+            sessionToken: token,
+            event: .metricsChanged(SettingsAudioMetricsDTO(capturedFrames: 42))
+        )
+        var messages: [SettingsPipeMessage] = []
+        for _ in 0..<100 where !messages.contains(expectedMessage) {
+            try await Task.sleep(for: .milliseconds(10))
+            messages.append(contentsOf: try launcher.readHostMessages())
+        }
+        #expect(messages.contains(expectedMessage))
+        coordinator.shutdown()
     }
 
     @Test
@@ -2247,6 +2373,17 @@ private final class ControllableSettingsHelperLauncher: SettingsHelperLaunching,
 
     func writeHelperMessage(_ message: SettingsPipeMessage) throws {
         try writeHelperOutput(SettingsPipeCodec.encodeLine(message))
+    }
+
+    func closeHelperOutput() throws {
+        try output.fileHandleForWriting.close()
+    }
+
+    func readHostMessages() throws -> [SettingsPipeMessage] {
+        let data = input.fileHandleForReading.availableData
+        return try data.split(separator: 0x0A).map { line in
+            try SettingsPipeCodec.decodeLine(Data(line))
+        }
     }
 }
 

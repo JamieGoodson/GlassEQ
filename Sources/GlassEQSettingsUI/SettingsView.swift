@@ -190,6 +190,25 @@ func clockCorrectionLimitIsReached(isRunning: Bool, metricsSaturated: Bool) -> B
     isRunning && metricsSaturated
 }
 
+func settingsSnapshotPreservingLocalDraft(
+    current: SettingsSnapshot,
+    latest: SettingsSnapshot
+) -> SettingsSnapshot {
+    guard latest.profiles.contains(where: { $0.id == current.selectedProfileID }) else {
+        return latest
+    }
+
+    let selectedProfile = current.profiles.first(where: { $0.id == current.selectedProfileID })
+        ?? current.draftProfile
+    let hasUnsavedDraft = current.draftProfile != selectedProfile
+    var merged = latest
+    merged.selectedProfileID = current.selectedProfileID
+    merged.draftProfile = hasUnsavedDraft
+        ? current.draftProfile
+        : latest.profiles.first(where: { $0.id == current.selectedProfileID }) ?? current.draftProfile
+    return merged
+}
+
 private func localizedLatency(milliseconds: Double) -> String {
     let number = localizedDecimal(milliseconds, minimumFractionDigits: 2, maximumFractionDigits: 2)
     return localized("\(number) ms")
@@ -333,7 +352,7 @@ public struct SettingsView: View {
 
     private func importProfile(format: ImportFormat, name: String, text: String) async -> Bool {
         let response = await model.perform(.importProfile(format: format, name: name, text: text))
-        syncFromModel()
+        refreshSnapshotFromModel()
         return response?.importSucceeded ?? false
     }
 
@@ -385,29 +404,12 @@ public struct SettingsView: View {
         perform(.deleteProfile(snapshot.selectedProfileID))
     }
 
-    private func syncFromModel() {
-        snapshot = model.snapshot
-    }
-
     private func refreshMetricsFromModel() {
         snapshot.metrics = model.snapshot.metrics
     }
 
     private func refreshSnapshotFromModel() {
-        let latest = model.snapshot
-
-        guard latest.profiles.contains(where: { $0.id == snapshot.selectedProfileID }) else {
-            snapshot = latest
-            return
-        }
-
-        let selectedProfileID = snapshot.selectedProfileID
-        let draftProfile = hasUnsavedDraft
-            ? snapshot.draftProfile
-            : latest.profiles.first(where: { $0.id == selectedProfileID }) ?? snapshot.draftProfile
-        snapshot = latest
-        snapshot.selectedProfileID = selectedProfileID
-        snapshot.draftProfile = draftProfile
+        snapshot = settingsSnapshotPreservingLocalDraft(current: snapshot, latest: model.snapshot)
     }
 
     private func updateMetricsPolling() {
@@ -426,7 +428,7 @@ public struct SettingsView: View {
     private func perform(_ command: SettingsCommand) {
         Task { @MainActor in
             await model.perform(command)
-            syncFromModel()
+            refreshSnapshotFromModel()
         }
     }
 }

@@ -708,6 +708,18 @@ struct AdaptivePlaybackRateTests {
     }
 
     @Test
+    func activeAdaptiveRenderFailureTakesPriorityOverLaterInstability() {
+        #expect(AdaptivePlaybackRenderRecoveryPolicy.effectiveInstabilityReason(
+            latest: .outputTimestampDiscontinuity,
+            renderFailureActive: true
+        ) == .adaptiveRenderFailure)
+        #expect(AdaptivePlaybackRenderRecoveryPolicy.effectiveInstabilityReason(
+            latest: .outputTimestampDiscontinuity,
+            renderFailureActive: false
+        ) == .outputTimestampDiscontinuity)
+    }
+
+    @Test
     func playbackBufferCalibrationKeepsServoTargetsPerCallbackSize() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("GlassEQPlaybackBufferCalibration-\(UUID().uuidString)", isDirectory: true)
@@ -740,6 +752,48 @@ struct AdaptivePlaybackRateTests {
         #expect(calibration.preferredTargetFrames(for: 64) == 256)
         #expect(calibration.preferredTargetFrames(for: 128) == 192)
         #expect(calibration.operatingPoints.map(\.frameSize) == [64, 128])
+    }
+
+    @Test
+    func playbackBufferCalibrationKeepsServoTargetsPerTapRate() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GlassEQPlaybackBufferCalibration-\(UUID().uuidString)", isDirectory: true)
+        let url = directory.appendingPathComponent("LearnedPlaybackBuffers.json")
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        try PersistedPlaybackBufferCalibrationStore.recordStable(
+            outputUID: "scarlett",
+            sampleRate: 48_000,
+            tapSampleRate: 24_000,
+            frameSize: 64,
+            targetFrames: 1_056,
+            at: url
+        )
+        try PersistedPlaybackBufferCalibrationStore.recordStable(
+            outputUID: "scarlett",
+            sampleRate: 48_000,
+            tapSampleRate: 48_000,
+            frameSize: 64,
+            targetFrames: 192,
+            at: url
+        )
+
+        let convertedRoute = try #require(PersistedPlaybackBufferCalibrationStore.calibration(
+            outputUID: "scarlett",
+            sampleRate: 48_000,
+            tapSampleRate: 24_000,
+            from: url
+        ))
+        let directRoute = try #require(PersistedPlaybackBufferCalibrationStore.calibration(
+            outputUID: "scarlett",
+            sampleRate: 48_000,
+            tapSampleRate: 48_000,
+            from: url
+        ))
+        #expect(convertedRoute.preferredTargetFrames(for: 64) == 1_056)
+        #expect(directRoute.preferredTargetFrames(for: 64) == 192)
     }
 
     @Test
