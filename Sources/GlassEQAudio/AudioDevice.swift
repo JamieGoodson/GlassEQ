@@ -60,7 +60,7 @@ public enum AudioDeviceAvailabilityError: Error, Equatable, LocalizedError, Cust
         case .outputDeviceHasNoOutputChannels(let id):
             "Output device \(id) has no output channels"
         case .unsupportedOutputChannelCount(let id, let channelCount):
-            "Output device \(id) has unsupported channel count \(channelCount); GlassEQ currently supports mono and stereo outputs only"
+            "Output device \(id) reports channel count \(channelCount); GlassEQ supports up to \(CoreAudioDeviceQuery.maxChannelCount) output channels"
         case .invalidDeviceMetadata(let id, let message):
             "Output device \(id) reported invalid Core Audio metadata: \(message)"
         }
@@ -166,8 +166,6 @@ public enum CoreAudioDeviceQuery {
             do {
                 return try outputDevice(id: deviceID)
             } catch AudioDeviceAvailabilityError.outputDeviceHasNoOutputChannels {
-                return nil
-            } catch AudioDeviceAvailabilityError.unsupportedOutputChannelCount {
                 return nil
             }
         }
@@ -402,6 +400,29 @@ public enum CoreAudioDeviceQuery {
             throw CoreAudioError(operation: "AudioObjectGetPropertyData(\(selector)) nil", status: kAudioHardwareBadObjectError)
         }
         return value as String
+    }
+
+    /// The device's preferred stereo pair as raw 1-based channel numbers; callers sanitize
+    /// (the HAL reports zeros when the pair was never configured).
+    static func preferredStereoChannels(objectID: AudioObjectID) throws -> (left: UInt32, right: UInt32) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyPreferredChannelsForStereo,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var channels: (UInt32, UInt32) = (0, 0)
+        var size = UInt32(MemoryLayout<(UInt32, UInt32)>.size)
+        try checkOSStatus(
+            AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &channels),
+            operation: "AudioObjectGetPropertyData(preferred stereo channels)"
+        )
+        try validatePropertySize(
+            actual: size,
+            expected: UInt32(MemoryLayout<(UInt32, UInt32)>.size),
+            operation: "AudioObjectGetPropertyData(preferred stereo channels)",
+            objectID: objectID
+        )
+        return (left: channels.0, right: channels.1)
     }
 
     static func getChannelCount(
