@@ -1615,6 +1615,15 @@ struct GlassEQAppModelLifecycleTests {
                 return false
             }
         }
+        try launcher.writeHelperMessage(.request(
+            sessionToken: token,
+            id: "ready",
+            kind: .ready,
+            command: nil
+        ))
+        await waitUntil {
+            coordinator.isHelperReadyForTesting
+        }
         let commandMessageStart = launcher.receivedAppMessages.count
 
         try launcher.writeHelperMessage(.request(
