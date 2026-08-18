@@ -122,8 +122,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     // Leaves one preferred 64-frame capture callback after servicing a 64-frame output pull.
     private static let preferredBluetoothPlaybackReservoirFrames = 64
     private static let preferredLowSampleRateBufferFrameSize: UInt32 = 1024
-    // Converted headset routes need enough tap-rate audio to span one full admitted
-    // capture callback even when the aggregate ignores the preferred 64-frame request.
+    // Low-rate routes keep at least one normal runtime callback in reserve. The configured
+    // capture callback expands this at startup when the aggregate ignores the 64-frame request.
     private static let preferredLowSampleRatePlaybackReservoirFrames = Int(maximumRuntimeBufferFrameSize)
     private static let preferredCaptureBufferFrameSize: UInt32 = 64
     private static let minimumRingBufferFrames = 2048
@@ -310,6 +310,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         let ringBuffer: RealtimeAudioRingBuffer
         let channelCount: Int
         let sampleRate: Double
+        private let configuredCaptureCallbackFrames: Int
         private let playbackPrimeFrames: Atomic<Int>
         private let maxCallbackFrames: Int
         private var processor: EQProcessor
@@ -371,10 +372,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             channelCount: Int,
             ringCapacityFrames: Int,
             scratchFrames: Int,
+            captureCallbackFrames: Int,
             playbackPrimeFrames: Int
         ) {
             self.channelCount = max(channelCount, 1)
             self.sampleRate = sampleRate
+            self.configuredCaptureCallbackFrames = max(captureCallbackFrames, 1)
             self.ringBuffer = RealtimeAudioRingBuffer(
                 channelCount: self.channelCount,
                 capacityFrames: ringCapacityFrames
@@ -496,8 +499,11 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             adaptivePlaybackTargetFrames.load(ordering: .acquiring)
         }
 
-        func maximumObservedCaptureCallbackFrames() -> Int {
-            maxCaptureCallbackFrames.load(ordering: .relaxed)
+        func maximumKnownCaptureCallbackFrames() -> Int {
+            max(
+                configuredCaptureCallbackFrames,
+                maxCaptureCallbackFrames.load(ordering: .relaxed)
+            )
         }
 
         func hasActiveAdaptivePlaybackRenderFailure() -> Bool {
@@ -1831,21 +1837,34 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         let ringCapacityFrames = Self.runtimeRingCapacityFrames
         let scratchFrames = max(runtimeBufferFrameSize, Self.minimumRingBufferFrames)
 
+        state.aggregateDeviceID = try createPrivateAggregateDevice(tapID: tapID)
+        // Ask the capture aggregate for small callbacks to cut latency. The write is best-effort,
+        // so size the initial playback reservoir from the value the aggregate actually reports.
+        try? CoreAudioDeviceQuery.setBufferFrameSize(
+            Self.preferredCaptureBufferFrameSize,
+            objectID: state.aggregateDeviceID
+        )
+        let reportedCaptureCallbackFrames = try? CoreAudioDeviceQuery.getUInt32Property(
+            objectID: state.aggregateDeviceID,
+            selector: kAudioDevicePropertyBufferFrameSize,
+            scope: kAudioObjectPropertyScopeGlobal
+        )
+        let captureCallbackFrames = Self.startupCaptureCallbackFrames(
+            reportedFrames: reportedCaptureCallbackFrames
+        )
+
         let runtime = AudioRuntime(
             profile: profile,
             sampleRate: tapSampleRate,
             channelCount: tapChannelCount,
             ringCapacityFrames: ringCapacityFrames,
             scratchFrames: scratchFrames,
+            captureCallbackFrames: captureCallbackFrames,
             playbackPrimeFrames: playbackPrimeFrames
         )
         state.runtime = runtime
         state.activeProfile = profile
 
-        state.aggregateDeviceID = try createPrivateAggregateDevice(tapID: tapID)
-        // Ask the capture aggregate for small callbacks to cut latency (best-effort; not all
-        // tap aggregates honor it — if ignored, the prime above still keeps capture safe).
-        try? CoreAudioDeviceQuery.setBufferFrameSize(Self.preferredCaptureBufferFrameSize, objectID: state.aggregateDeviceID)
         state.captureIOProcID = try createCaptureIOProc(deviceID: state.aggregateDeviceID, runtime: runtime)
         try checkOSStatus(
             AudioDeviceStart(state.aggregateDeviceID, state.captureIOProcID),
@@ -1984,7 +2003,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         try Self.validatePlaybackCallbackCapacity(for: tunedOutput)
         try Self.validatePlaybackConversionCapacity(
             for: tunedOutput,
-            tapSampleRate: runtime.sampleRate
+            tapSampleRate: runtime.sampleRate,
+            captureCallbackFrames: runtime.maximumKnownCaptureCallbackFrames()
         )
         state.activeOutput = tunedOutput
         let operatingPointKey = PlaybackBufferOperatingPointKey(
@@ -1997,6 +2017,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         let targetFrames = preferredPlaybackTargetFrames(
             for: tunedOutput,
             tapSampleRate: runtime.sampleRate,
+            captureCallbackFrames: runtime.maximumKnownCaptureCallbackFrames(),
             allowsDownwardProbe: allowsDownwardProbe
         )
         // Capture applies prepared configs and retires their boxes. Output switches are a safe
@@ -2274,14 +2295,16 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     static func validatePlaybackConversionCapacity(
         for output: AudioOutputDevice,
-        tapSampleRate: Double
+        tapSampleRate: Double,
+        captureCallbackFrames: Int = preferredLowSampleRatePlaybackReservoirFrames
     ) throws {
         guard shouldUseSampleRateConversion(tapSampleRate: tapSampleRate, output: output) else {
             return
         }
         let requiredPrimeFrames = preferredPlaybackPrimeFrames(
             for: output,
-            tapSampleRate: tapSampleRate
+            tapSampleRate: tapSampleRate,
+            captureCallbackFrames: captureCallbackFrames
         )
         let maximumPrimeFrames = runtimeRingCapacityFrames / playbackRingPullCount
         guard requiredPrimeFrames <= maximumPrimeFrames else {
@@ -2568,11 +2591,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     private func preferredPlaybackTargetFrames(
         for output: AudioOutputDevice,
         tapSampleRate: Double,
+        captureCallbackFrames: Int,
         allowsDownwardProbe: Bool
     ) -> Int {
         let baseline = Self.preferredPlaybackPrimeFrames(
             for: output,
-            tapSampleRate: tapSampleRate
+            tapSampleRate: tapSampleRate,
+            captureCallbackFrames: captureCallbackFrames
         )
         guard Self.shouldAdaptPlaybackBuffer(for: output) else {
             return baseline
@@ -2719,7 +2744,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         do {
             try Self.validatePlaybackConversionCapacity(
                 for: proposedOutput,
-                tapSampleRate: preparation.runtime.sampleRate
+                tapSampleRate: preparation.runtime.sampleRate,
+                captureCallbackFrames: preparation.runtime.maximumKnownCaptureCallbackFrames()
             )
         } catch {
             continueCalibrationAfterUnresolvedInstability(preparation)
@@ -2767,6 +2793,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             let targetFrames = preferredPlaybackTargetFrames(
                 for: updatedOutput,
                 tapSampleRate: preparation.runtime.sampleRate,
+                captureCallbackFrames: preparation.runtime.maximumKnownCaptureCallbackFrames(),
                 allowsDownwardProbe: false
             )
             preparation.runtime.retargetPlayback(
@@ -2842,8 +2869,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 maximumReservoirFrames: Self.maximumPlaybackReservoirFrames(
                     for: preparation.output,
                     tapSampleRate: preparation.runtime.sampleRate,
-                    maximumObservedCaptureCallbackFrames: preparation.runtime
-                        .maximumObservedCaptureCallbackFrames()
+                    maximumKnownCaptureCallbackFrames: preparation.runtime
+                        .maximumKnownCaptureCallbackFrames()
                 )
             ) else {
                 return nil
@@ -3059,7 +3086,8 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
 
     static func preferredPlaybackPrimeFrames(
         for output: AudioOutputDevice,
-        tapSampleRate: Double? = nil
+        tapSampleRate: Double? = nil,
+        captureCallbackFrames: Int = preferredLowSampleRatePlaybackReservoirFrames
     ) -> Int {
         let outputCallbackFrames = max(Int(output.bufferFrameSize), 1)
         if hasLowSampleRateEndpoint(
@@ -3070,10 +3098,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
                 inputSampleRate: tapSampleRate ?? output.nominalSampleRate,
                 outputSampleRate: output.nominalSampleRate
             )
+            let reservoirFrames = min(
+                max(captureCallbackFrames, Self.preferredLowSampleRatePlaybackReservoirFrames),
+                Self.maximumSupportedCallbackFrames
+            )
             return max(
                 sampleRatePlan.inputFrames(forOutputFrames: Int(Self.preferredLowSampleRateBufferFrameSize)),
                 sampleRatePlan.inputFrames(forOutputFrames: outputCallbackFrames)
-                    + Self.preferredLowSampleRatePlaybackReservoirFrames
+                    + reservoirFrames
             )
         }
         if output.isBluetoothTransport {
@@ -3100,6 +3132,15 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             inputSampleRate: tapSampleRate,
             outputSampleRate: output.nominalSampleRate
         ).inputFrames(forOutputFrames: Int(output.bufferFrameSize)))
+    }
+
+    static func startupCaptureCallbackFrames(reportedFrames: UInt32?) -> Int {
+        guard let reportedFrames,
+              reportedFrames > 0,
+              reportedFrames <= UInt32(maximumSupportedCallbackFrames) else {
+            return maximumSupportedCallbackFrames
+        }
+        return Int(reportedFrames)
     }
 
     static func shouldUseSampleRateConversion(
@@ -3163,14 +3204,14 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     static func maximumPlaybackReservoirFrames(
         for output: AudioOutputDevice,
         tapSampleRate: Double,
-        maximumObservedCaptureCallbackFrames: Int
+        maximumKnownCaptureCallbackFrames: Int
     ) -> Int {
         guard hasLowSampleRateEndpoint(tapSampleRate: tapSampleRate, output: output) else {
             return AdaptivePlaybackBufferPolicy.maximumReservoirFrames
         }
         return max(
             Self.preferredLowSampleRatePlaybackReservoirFrames,
-            maximumObservedCaptureCallbackFrames
+            maximumKnownCaptureCallbackFrames
         )
     }
 
