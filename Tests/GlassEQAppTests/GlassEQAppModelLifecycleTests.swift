@@ -275,26 +275,29 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
-    func menuBarProfileSelectionAppliesTheStoredProfileToTheRunningEngine() async {
+    func menuBarProfileSelectionPersistsForTheCurrentOutputAndIsRestoredAfterDeviceSwitches() async {
         let initialProfile = makeProfile(name: "Initial")
         let selectedProfile = makeProfile(name: "Menu Selection")
-        let output = makeOutput(uid: "menu-profile-output", name: "Menu Profile Output")
+        let output = makeOutput(uid: "menu-profile-output", name: "Menu Profile Output", id: 200)
+        let otherOutput = makeOutput(uid: "other-menu-profile-output", name: "Other Menu Profile Output", id: 300)
         let store = ProfileStore(
             profiles: [initialProfile, selectedProfile],
             fallbackProfileID: initialProfile.id
         )
         let engine = FakeAudioEngine()
+        let lookup = FakeDefaultOutputLookup(.success(output))
         let observers = FakeDefaultOutputObserverFactory()
         let model = makeModel(
             store: store,
             engine: engine,
-            lookup: FakeDefaultOutputLookup(.success(output)),
+            lookup: lookup,
             observers: observers,
             outputDelay: .zero
         )
 
         model.start()
-        observers.observers[0].emit(.success(output))
+        let observer = observers.observers[0]
+        observer.emit(.success(output))
         await waitUntil {
             model.lifecycleState == .running && engine.startCalls.count == 1
         }
@@ -305,8 +308,28 @@ struct GlassEQAppModelLifecycleTests {
         #expect(model.activeProfile == selectedProfile)
         #expect(model.selectedProfileID == selectedProfile.id)
         #expect(model.draftProfile == selectedProfile)
-        #expect(model.profileStore.outputMappings.isEmpty)
+        #expect(model.profileStore.outputMappings == [
+            OutputDeviceProfileMapping(outputDeviceUID: output.uid, profileID: selectedProfile.id)
+        ])
         #expect(model.statusMessage == localized("Processing \(output.name) with \(selectedProfile.name)"))
+
+        lookup.result = .success(otherOutput)
+        observer.emit(.success(otherOutput))
+        await waitUntil {
+            model.currentOutputUID == otherOutput.uid
+                && model.lifecycleState == .running
+                && engine.startCalls.count == 2
+        }
+        #expect(model.activeProfile == initialProfile)
+
+        lookup.result = .success(output)
+        observer.emit(.success(output))
+        await waitUntil {
+            model.currentOutputUID == output.uid
+                && model.lifecycleState == .running
+                && engine.startCalls.count == 3
+        }
+        #expect(model.activeProfile == selectedProfile)
     }
 
     @Test

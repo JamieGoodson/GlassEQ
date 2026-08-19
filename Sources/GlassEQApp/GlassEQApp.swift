@@ -1110,7 +1110,11 @@ final class GlassEQAppModel {
         }
 
         do {
-            try apply(profile: profile)
+            if currentOutputUID.isEmpty {
+                try apply(profile: profile)
+            } else {
+                try useForCurrentOutput(profile: profile)
+            }
         } catch {
             reportProfileActionFailure(error)
         }
