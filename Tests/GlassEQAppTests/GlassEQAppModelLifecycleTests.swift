@@ -255,6 +255,41 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func menuBarProfileSelectionAppliesTheStoredProfileToTheRunningEngine() async {
+        let initialProfile = makeProfile(name: "Initial")
+        let selectedProfile = makeProfile(name: "Menu Selection")
+        let output = makeOutput(uid: "menu-profile-output", name: "Menu Profile Output")
+        let store = ProfileStore(
+            profiles: [initialProfile, selectedProfile],
+            fallbackProfileID: initialProfile.id
+        )
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output)),
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        model.applyProfileSelection(selectedProfile.id)
+
+        #expect(engine.updateDSPCalls == [selectedProfile])
+        #expect(model.activeProfile == selectedProfile)
+        #expect(model.selectedProfileID == selectedProfile.id)
+        #expect(model.draftProfile == selectedProfile)
+        #expect(model.profileStore.outputMappings.isEmpty)
+        #expect(model.statusMessage == localized("Processing \(output.name) with \(selectedProfile.name)"))
+    }
+
+    @Test
     func profilePreviewedDuringRouteStartIsRepublishedAfterTheRouteSettles() async {
         let firstOutput = makeOutput(uid: "preview-first", name: "Preview First", id: 200)
         let secondOutput = makeOutput(uid: "preview-second", name: "Preview Second", id: 300)

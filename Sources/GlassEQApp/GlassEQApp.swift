@@ -1001,6 +1001,18 @@ final class GlassEQAppModel {
         notifyModelDidChange()
     }
 
+    func applyProfileSelection(_ id: UUID) {
+        guard let profile = profileStore.profiles.first(where: { $0.id == id }) else {
+            return
+        }
+
+        do {
+            try apply(profile: profile)
+        } catch {
+            reportProfileActionFailure(error)
+        }
+    }
+
     func applyDraft() {
         do {
             try apply(profile: draftProfile)
@@ -2521,8 +2533,8 @@ private struct MenuBarView: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Picker(localized("Profile"), selection: Binding(
-                    get: { model.selectedProfileID },
-                    set: { model.selectProfile($0) }
+                    get: { model.activeProfile.id },
+                    set: { model.applyProfileSelection($0) }
                 )) {
                     ForEach(model.profileStore.profiles) { profile in
                         Text(profile.name).tag(profile.id)
@@ -2530,8 +2542,8 @@ private struct MenuBarView: View {
                 }
                 .labelsHidden()
                 .accessibilityLabel(Text(localized("Profile")))
-                .accessibilityValue(Text(model.selectedProfile.name))
-                .accessibilityHint(Text(localized("Chooses a profile for editing")))
+                .accessibilityValue(Text(model.activeProfile.name))
+                .accessibilityHint(Text(localized("Applies the selected profile")))
             }
 
             HStack(spacing: 10) {
