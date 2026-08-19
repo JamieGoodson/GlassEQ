@@ -293,6 +293,38 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func reorderProfilesCommandRoundTrips() throws {
+        let profileIDs = [UUID(), UUID(), UUID()]
+        let message = SettingsPipeMessage.request(
+            sessionToken: "token",
+            id: "request-reorder-profiles",
+            kind: .command,
+            command: .reorderProfiles(profileIDs)
+        )
+
+        let decoded = try SettingsPipeCodec.decodeLine(
+            Data(try SettingsPipeCodec.encodeLine(message).dropLast())
+        )
+
+        #expect(decoded == message)
+    }
+
+    @Test
+    func profileMoveUsesTheDestinationPositionInEitherDirection() {
+        let first = EQProfile(name: "First", mode: .parametric, filters: [])
+        let second = EQProfile(name: "Second", mode: .parametric, filters: [])
+        let third = EQProfile(name: "Third", mode: .parametric, filters: [])
+        let profiles = [first, second, third]
+
+        let movedDown = profilesByMoving(profiles, sourceID: first.id, destinationID: third.id)
+        let movedUp = profilesByMoving(profiles, sourceID: third.id, destinationID: first.id)
+
+        #expect(movedDown?.map(\.id) == [second.id, third.id, first.id])
+        #expect(movedUp?.map(\.id) == [third.id, first.id, second.id])
+        #expect(profilesByMoving(profiles, sourceID: second.id, destinationID: second.id) == nil)
+    }
+
+    @Test
     func audioMetricsDecodeOldPayloadsWithDefaultedNewFields() throws {
         let data = Data("""
         {

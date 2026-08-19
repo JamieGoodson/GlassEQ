@@ -262,6 +262,7 @@ public struct SettingsView: View {
                 mappedProfileID: snapshot.currentOutputMappedProfileID,
                 selectedProfileID: snapshot.selectedProfileID,
                 onSelect: selectProfile,
+                onMove: moveProfile,
                 onCreateGraphic31: createGraphic31Profile,
                 onCreateGraphic10: createGraphic10Profile,
                 onCreateParametric: createParametricProfile,
@@ -424,6 +425,20 @@ public struct SettingsView: View {
         perform(.deleteProfile(snapshot.selectedProfileID))
     }
 
+    private func moveProfile(_ sourceID: UUID, _ destinationID: UUID) {
+        guard let reorderedProfiles = profilesByMoving(
+            snapshot.profiles,
+            sourceID: sourceID,
+            destinationID: destinationID
+        ) else {
+            return
+        }
+        withAnimation(.easeInOut(duration: 0.15)) {
+            snapshot.profiles = reorderedProfiles
+        }
+        performPreservingLocalDraft(.reorderProfiles(reorderedProfiles.map(\.id)))
+    }
+
     private func refreshMetricsFromModel() {
         snapshot.metrics = model.snapshot.metrics
     }
@@ -460,6 +475,32 @@ public struct SettingsView: View {
             refreshSnapshotFromModel(afterCommandDispatchedFrom: dispatchedSnapshot)
         }
     }
+
+    private func performPreservingLocalDraft(_ command: SettingsCommand) {
+        Task { @MainActor in
+            await model.perform(command)
+            refreshSnapshotFromModel()
+        }
+    }
+}
+
+func profilesByMoving(
+    _ profiles: [EQProfile],
+    sourceID: UUID,
+    destinationID: UUID
+) -> [EQProfile]? {
+    guard sourceID != destinationID,
+          let sourceIndex = profiles.firstIndex(where: { $0.id == sourceID }),
+          let destinationIndex = profiles.firstIndex(where: { $0.id == destinationID }) else {
+        return nil
+    }
+
+    var reorderedProfiles = profiles
+    reorderedProfiles.move(
+        fromOffsets: IndexSet(integer: sourceIndex),
+        toOffset: destinationIndex > sourceIndex ? destinationIndex + 1 : destinationIndex
+    )
+    return reorderedProfiles
 }
 
 private struct FinderStyleWindowConfigurator: NSViewRepresentable {
@@ -788,6 +829,7 @@ private struct ProfileSidebar: View {
     var mappedProfileID: UUID?
     var selectedProfileID: UUID
     var onSelect: (UUID) -> Void
+    var onMove: (UUID, UUID) -> Void
     var onCreateGraphic31: () -> Void
     var onCreateGraphic10: () -> Void
     var onCreateParametric: () -> Void
@@ -830,7 +872,12 @@ private struct ProfileSidebar: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityLabel(Text(profile.name))
                         .accessibilityValue(Text(profileAccessibilityValue(profile)))
-                        .accessibilityHint(Text(localized("Selects this profile for editing")))
+                        .accessibilityHint(Text(localized("Selects this profile for editing. Drag to reorder profiles.")))
+                        .profileDragAndDrop(
+                            profileID: profile.id,
+                            isEnabled: !isReadOnly,
+                            onMove: onMove
+                        )
                     }
                 }
                 // Align the row text (which sits 10pt inside the selection capsule) with the
@@ -936,6 +983,29 @@ private struct ProfileSidebar: View {
             values.append(localized("Mapped to current output"))
         }
         return values.isEmpty ? localized("Not selected") : values.joined(separator: ", ")
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func profileDragAndDrop(
+        profileID: UUID,
+        isEnabled: Bool,
+        onMove: @escaping (UUID, UUID) -> Void
+    ) -> some View {
+        if isEnabled {
+            draggable(profileID.uuidString)
+                .dropDestination(for: String.self) { draggedIDs, _ in
+                    guard let draggedID = draggedIDs.first.flatMap(UUID.init(uuidString:)),
+                          draggedID != profileID else {
+                        return false
+                    }
+                    onMove(draggedID, profileID)
+                    return true
+                }
+        } else {
+            self
+        }
     }
 }
 

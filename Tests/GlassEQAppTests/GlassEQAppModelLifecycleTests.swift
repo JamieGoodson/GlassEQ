@@ -1704,6 +1704,43 @@ struct GlassEQAppModelLifecycleTests {
     }
 
     @Test
+    func settingsReorderProfilesCommandPersistsTheRequestedOrderAndSelection() async throws {
+        let first = makeProfile(name: "First")
+        let second = makeProfile(name: "Second")
+        let third = makeProfile(name: "Third")
+        let store = ProfileStore(profiles: [first, second, third], fallbackProfileID: first.id)
+        let model = makeModel(store: store)
+        model.selectProfile(second.id)
+
+        let response = try await model.performSettingsCommand(
+            .reorderProfiles([third.id, first.id, second.id])
+        )
+
+        let snapshot = try #require(response.snapshot)
+        #expect(model.profileStore.profiles.map(\.id) == [third.id, first.id, second.id])
+        #expect(snapshot.profiles.map(\.id) == [third.id, first.id, second.id])
+        #expect(snapshot.selectedProfileID == second.id)
+        #expect(snapshot.draftProfile == second)
+    }
+
+    @Test
+    func settingsReorderProfilesRejectsAnIncompleteOrDuplicateIDList() async throws {
+        let first = makeProfile(name: "First")
+        let second = makeProfile(name: "Second")
+        let store = ProfileStore(profiles: [first, second], fallbackProfileID: first.id)
+        let model = makeModel(store: store)
+
+        await #expect(throws: SettingsCommandFailure.self) {
+            _ = try await model.performSettingsCommand(.reorderProfiles([first.id]))
+        }
+        await #expect(throws: SettingsCommandFailure.self) {
+            _ = try await model.performSettingsCommand(.reorderProfiles([first.id, first.id]))
+        }
+
+        #expect(model.profileStore == store)
+    }
+
+    @Test
     func bypassAfterSelectingDifferentDraftOnlyTogglesActiveProfileAndStopsEngine() async {
         let active = makeProfile(name: "Active")
         let draft = makeProfile(name: "Draft")

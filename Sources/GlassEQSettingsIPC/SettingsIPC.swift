@@ -387,6 +387,7 @@ public enum SettingsCommand: Codable, Equatable, Sendable {
     case createProfile(SettingsProfileKind)
     case duplicateProfile(UUID)
     case deleteProfile(UUID)
+    case reorderProfiles([UUID])
     case applyProfile(EQProfile)
     case useProfileForCurrentOutput(EQProfile)
     case setFallback(EQProfile)

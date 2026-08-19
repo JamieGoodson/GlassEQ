@@ -1394,6 +1394,26 @@ final class GlassEQAppModel {
         try addProfile(profile, name: localized("\(source.name) Copy"), status: localized("Duplicated \(source.name)"))
     }
 
+    func reorderProfiles(_ profileIDs: [UUID]) throws {
+        try ensureProfileStoreWritable()
+        let existingProfileIDs = Set(profileStore.profiles.map(\.id))
+        guard profileIDs.count == profileStore.profiles.count,
+              Set(profileIDs).count == profileIDs.count,
+              Set(profileIDs) == existingProfileIDs else {
+            throw SettingsCommandFailure(
+                message: localized("The profile list changed while it was being reordered. Refresh settings and try again.")
+            )
+        }
+
+        let profilesByID = Dictionary(uniqueKeysWithValues: profileStore.profiles.map { ($0.id, $0) })
+        var store = profileStore
+        store.profiles = profileIDs.compactMap { profilesByID[$0] }
+        try ProfilePersistence.validateForCommit(store)
+        profileStore = store
+        saveStore()
+        notifyModelDidChange()
+    }
+
     func deleteProfile(id: UUID) throws {
         try ensureProfileStoreWritable()
         guard let deletedIndex = profileStore.profiles.firstIndex(where: { $0.id == id }) else {

@@ -994,6 +994,10 @@ extension GlassEQAppModel {
             try deleteProfile(id: id)
             return SettingsCommandResponse(snapshot: settingsSnapshot())
 
+        case .reorderProfiles(let profileIDs):
+            try reorderProfiles(profileIDs)
+            return SettingsCommandResponse(snapshot: settingsSnapshot())
+
         case .applyProfile(let profile):
             try validateIncomingProfile(profile)
             try apply(profile: profile)
