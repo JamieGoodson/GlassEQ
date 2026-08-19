@@ -2773,13 +2773,6 @@ private struct MenuBarView: View {
                 .buttonStyle(.glass)
                 .tint(popoverControlsAreActive ? .macOSSystemRed : nil)
             }
-
-            Text(model.statusMessage)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(model.isRunning ? Color.secondary : Color.macOSSystemRed)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityLabel(Text(localized("Status")))
-                .accessibilityValue(Text(model.statusMessage))
         }
         .padding()
         .background { PopoverGlassConfigurator() }
