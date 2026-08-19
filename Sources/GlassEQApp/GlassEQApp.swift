@@ -20,13 +20,17 @@ struct GlassEQApp: App {
             MenuBarView(model: model)
                 .frame(width: 340)
         } label: {
-            Image(systemName: model.isRunning ? "slider.horizontal.3" : "slider.horizontal.2.gobackward")
-                .accessibilityLabel(Text(model.menuBarAccessibilityLabel))
-                .accessibilityValue(Text(model.statusMessage))
-                .accessibilityHint(Text(localized("Opens GlassEQ controls")))
-                .background {
-                    InProcessSettingsPresenter(model: model)
-                }
+            HStack(spacing: 4) {
+                Image(systemName: model.isRunning ? "slider.horizontal.3" : "slider.horizontal.2.gobackward")
+                Text(verbatim: model.activeProfile.name)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(model.menuBarAccessibilityLabel))
+            .accessibilityValue(Text(model.statusMessage))
+            .accessibilityHint(Text(localized("Opens GlassEQ controls")))
+            .background {
+                InProcessSettingsPresenter(model: model)
+            }
         }
         .menuBarExtraStyle(.window)
 
