@@ -111,16 +111,6 @@
         }
       }
     },
-    "Enable" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Enable"
-          }
-        }
-      }
-    },
     "Fallback" : {
       "localizations" : {
         "en" : {

@@ -2736,22 +2736,12 @@ private struct MenuBarView: View {
             }
 
             HStack(spacing: 10) {
-                Button {
-                    model.toggleProcessingBypass()
-                } label: {
-                    Label(
-                        model.isProcessingBypassed ? localized("Enable") : localized("Disable"),
-                        systemImage: model.isProcessingBypassed ? "speaker.wave.2" : "speaker.slash"
-                    )
-                        .frame(minWidth: 82, minHeight: 28)
-                        .contentShape(.rect)
+                Toggle(isOn: processingEnabled) {
+                    EmptyView()
                 }
-                .controlSize(.large)
-                .buttonStyle(.glass)
-                .tint(popoverControlsAreActive ? enableButtonTint : nil)
-                .accessibilityLabel(Text(model.isProcessingBypassed ? localized("Enable equalizer") : localized("Disable equalizer")))
-                .accessibilityValue(Text(statusBadgeTitle))
-                .accessibilityHint(Text(localized("Temporarily enables an automatically bypassed output without changing its saved rule")))
+                    .toggleStyle(.switch)
+                    .controlSize(.large)
+                    .accessibilityHint(Text(localized("Temporarily enables an automatically bypassed output without changing its saved rule")))
 
                 Button {
                     dismiss()
@@ -2825,8 +2815,17 @@ private struct MenuBarView: View {
         model.isRunning && !model.isProcessingBypassed ? .macOSSystemGreen : .macOSSystemRed
     }
 
-    private var enableButtonTint: Color {
-        model.isProcessingBypassed ? .macOSSystemGreen : .macOSSystemYellow
+    private var processingEnabled: Binding<Bool> {
+        Binding(
+            get: { !model.isProcessingBypassed },
+            set: { isEnabled in
+                let isCurrentlyEnabled = !model.isProcessingBypassed
+                guard isEnabled != isCurrentlyEnabled else {
+                    return
+                }
+                model.toggleProcessingBypass()
+            }
+        )
     }
 
     private var popoverControlsAreActive: Bool {
