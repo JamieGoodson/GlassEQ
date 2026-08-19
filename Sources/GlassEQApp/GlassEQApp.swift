@@ -21,8 +21,8 @@ struct GlassEQApp: App {
                 .frame(width: 340)
         } label: {
             HStack(spacing: 4) {
-                Image(systemName: model.isRunning ? "slider.horizontal.3" : "slider.horizontal.2.gobackward")
-                Text(verbatim: model.activeProfile.name)
+                Image(systemName: "slider.horizontal.3")
+                Text(verbatim: model.menuBarTitle)
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(Text(model.menuBarAccessibilityLabel))
@@ -906,6 +906,10 @@ final class GlassEQAppModel {
 
     var isProcessingBypassed: Bool {
         isManuallyBypassed || isCurrentOutputDeviceBypassed
+    }
+
+    var menuBarTitle: String {
+        isRunning && !isProcessingBypassed ? activeProfile.name : localized("Bypass")
     }
 
     var menuBarAccessibilityLabel: String {

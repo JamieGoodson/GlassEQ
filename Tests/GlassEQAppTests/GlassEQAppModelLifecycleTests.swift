@@ -10,6 +10,26 @@ import Testing
 @Suite
 struct GlassEQAppModelLifecycleTests {
     @Test
+    func menuBarTitleShowsProfileOnlyWhileProcessing() {
+        let profile = makeProfile(name: "Listening Profile")
+        let output = makeOutput(uid: "menu-bar-title-output", name: "Menu Bar Title Output")
+        let model = makeModel(store: ProfileStore(profiles: [profile], fallbackProfileID: profile.id))
+
+        #expect(model.menuBarTitle == localized("Bypass"))
+
+        model.isRunning = true
+        #expect(model.menuBarTitle == profile.name)
+
+        model.profileStore.isBypassed = true
+        #expect(model.menuBarTitle == localized("Bypass"))
+
+        model.profileStore.isBypassed = false
+        model.profileStore.bypassedOutputDeviceUIDs = [output.uid]
+        model.currentOutputUID = output.uid
+        #expect(model.menuBarTitle == localized("Bypass"))
+    }
+
+    @Test
     func retryRunningEngineUpdatesActiveProfileWithoutDefaultLookup() async {
         let runningOutput = makeOutput(uid: "running-output", name: "Running Output")
         let defaultOutput = makeOutput(uid: "default-output", name: "Default Output")
