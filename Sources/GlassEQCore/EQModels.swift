@@ -55,7 +55,6 @@ public struct EQProfile: Codable, Equatable, Identifiable, Sendable {
     public var leftFilters: [EQFilter]
     public var rightPreampDB: Double
     public var rightFilters: [EQFilter]
-    public var isBypassed: Bool
 
     public init(
         id: UUID = UUID(),
@@ -67,8 +66,7 @@ public struct EQProfile: Codable, Equatable, Identifiable, Sendable {
         leftPreampDB: Double? = nil,
         leftFilters: [EQFilter]? = nil,
         rightPreampDB: Double? = nil,
-        rightFilters: [EQFilter]? = nil,
-        isBypassed: Bool = false
+        rightFilters: [EQFilter]? = nil
     ) {
         self.id = id
         self.name = name
@@ -80,7 +78,6 @@ public struct EQProfile: Codable, Equatable, Identifiable, Sendable {
         self.leftFilters = leftFilters ?? filters
         self.rightPreampDB = rightPreampDB ?? preampDB
         self.rightFilters = rightFilters ?? filters
-        self.isBypassed = isBypassed
     }
 
     enum CodingKeys: String, CodingKey {
@@ -94,7 +91,6 @@ public struct EQProfile: Codable, Equatable, Identifiable, Sendable {
         case leftFilters
         case rightPreampDB
         case rightFilters
-        case isBypassed
     }
 
     public init(from decoder: Decoder) throws {
@@ -109,7 +105,6 @@ public struct EQProfile: Codable, Equatable, Identifiable, Sendable {
         leftFilters = try container.decodeIfPresent([EQFilter].self, forKey: .leftFilters) ?? filters
         rightPreampDB = try container.decodeIfPresent(Double.self, forKey: .rightPreampDB) ?? preampDB
         rightFilters = try container.decodeIfPresent([EQFilter].self, forKey: .rightFilters) ?? filters
-        isBypassed = try container.decodeIfPresent(Bool.self, forKey: .isBypassed) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -124,7 +119,6 @@ public struct EQProfile: Codable, Equatable, Identifiable, Sendable {
         try container.encode(leftFilters, forKey: .leftFilters)
         try container.encode(rightPreampDB, forKey: .rightPreampDB)
         try container.encode(rightFilters, forKey: .rightFilters)
-        try container.encode(isBypassed, forKey: .isBypassed)
     }
 
     public static let flatParametric = EQProfile(
@@ -176,61 +170,82 @@ public struct OutputDeviceProfileMapping: Codable, Equatable, Sendable {
 }
 
 public struct ProfileStoreRepairSummary: Equatable, Sendable {
+    public var migratedSchemaVersion: Bool
     public var restoredDefaultProfiles: Bool
     public var repairedFallbackProfileID: Bool
     public var removedOutputMappings: Int
     public var deduplicatedOutputMappings: Int
+    public var removedBypassedOutputDeviceUIDs: Int
+    public var deduplicatedBypassedOutputDeviceUIDs: Int
     public var removedInvalidProfiles: Int
 
     public var didRepair: Bool {
-        restoredDefaultProfiles ||
+        migratedSchemaVersion ||
+            restoredDefaultProfiles ||
             repairedFallbackProfileID ||
             removedOutputMappings > 0 ||
             deduplicatedOutputMappings > 0 ||
+            removedBypassedOutputDeviceUIDs > 0 ||
+            deduplicatedBypassedOutputDeviceUIDs > 0 ||
             removedInvalidProfiles > 0
     }
 
     public init(
+        migratedSchemaVersion: Bool = false,
         restoredDefaultProfiles: Bool = false,
         repairedFallbackProfileID: Bool = false,
         removedOutputMappings: Int = 0,
         deduplicatedOutputMappings: Int = 0,
+        removedBypassedOutputDeviceUIDs: Int = 0,
+        deduplicatedBypassedOutputDeviceUIDs: Int = 0,
         removedInvalidProfiles: Int = 0
     ) {
+        self.migratedSchemaVersion = migratedSchemaVersion
         self.restoredDefaultProfiles = restoredDefaultProfiles
         self.repairedFallbackProfileID = repairedFallbackProfileID
         self.removedOutputMappings = removedOutputMappings
         self.deduplicatedOutputMappings = deduplicatedOutputMappings
+        self.removedBypassedOutputDeviceUIDs = removedBypassedOutputDeviceUIDs
+        self.deduplicatedBypassedOutputDeviceUIDs = deduplicatedBypassedOutputDeviceUIDs
         self.removedInvalidProfiles = removedInvalidProfiles
     }
 
     mutating func merge(_ other: ProfileStoreRepairSummary) {
+        migratedSchemaVersion = migratedSchemaVersion || other.migratedSchemaVersion
         restoredDefaultProfiles = restoredDefaultProfiles || other.restoredDefaultProfiles
         repairedFallbackProfileID = repairedFallbackProfileID || other.repairedFallbackProfileID
         removedOutputMappings += other.removedOutputMappings
         deduplicatedOutputMappings += other.deduplicatedOutputMappings
+        removedBypassedOutputDeviceUIDs += other.removedBypassedOutputDeviceUIDs
+        deduplicatedBypassedOutputDeviceUIDs += other.deduplicatedBypassedOutputDeviceUIDs
         removedInvalidProfiles += other.removedInvalidProfiles
     }
 }
 
 public struct ProfileStore: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
     public static let defaultProfiles: [EQProfile] = [.flatGraphic31, .flatGraphic10, .flatParametric]
 
     public var schemaVersion: Int
     public var profiles: [EQProfile]
     public var outputMappings: [OutputDeviceProfileMapping]
+    public var isBypassed: Bool
+    public var bypassedOutputDeviceUIDs: [String]
     public var fallbackProfileID: UUID
 
     public init(
         schemaVersion: Int = ProfileStore.currentSchemaVersion,
         profiles: [EQProfile] = ProfileStore.defaultProfiles,
         outputMappings: [OutputDeviceProfileMapping] = [],
+        isBypassed: Bool = false,
+        bypassedOutputDeviceUIDs: [String] = [],
         fallbackProfileID: UUID? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.profiles = profiles
         self.outputMappings = outputMappings
+        self.isBypassed = isBypassed
+        self.bypassedOutputDeviceUIDs = bypassedOutputDeviceUIDs
         self.fallbackProfileID = fallbackProfileID ?? profiles.first?.id ?? EQProfile.flatParametric.id
     }
 
@@ -238,6 +253,8 @@ public struct ProfileStore: Codable, Equatable, Sendable {
         case schemaVersion
         case profiles
         case outputMappings
+        case isBypassed
+        case bypassedOutputDeviceUIDs
         case fallbackProfileID
     }
 
@@ -246,6 +263,11 @@ public struct ProfileStore: Codable, Equatable, Sendable {
         schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? Self.currentSchemaVersion
         profiles = try container.decode([EQProfile].self, forKey: .profiles)
         outputMappings = try container.decode([OutputDeviceProfileMapping].self, forKey: .outputMappings)
+        isBypassed = try container.decodeIfPresent(Bool.self, forKey: .isBypassed) ?? false
+        bypassedOutputDeviceUIDs = try container.decodeIfPresent(
+            [String].self,
+            forKey: .bypassedOutputDeviceUIDs
+        ) ?? []
         fallbackProfileID = try container.decode(UUID.self, forKey: .fallbackProfileID)
     }
 
@@ -254,12 +276,19 @@ public struct ProfileStore: Codable, Equatable, Sendable {
         try container.encode(schemaVersion, forKey: .schemaVersion)
         try container.encode(profiles, forKey: .profiles)
         try container.encode(outputMappings, forKey: .outputMappings)
+        try container.encode(isBypassed, forKey: .isBypassed)
+        try container.encode(bypassedOutputDeviceUIDs, forKey: .bypassedOutputDeviceUIDs)
         try container.encode(fallbackProfileID, forKey: .fallbackProfileID)
     }
 
     @discardableResult
     public mutating func repairReferences() -> ProfileStoreRepairSummary {
         var summary = ProfileStoreRepairSummary()
+
+        if schemaVersion > 0, schemaVersion < Self.currentSchemaVersion {
+            schemaVersion = Self.currentSchemaVersion
+            summary.migratedSchemaVersion = true
+        }
 
         if profiles.isEmpty {
             profiles = Self.defaultProfiles
@@ -289,6 +318,19 @@ public struct ProfileStore: Codable, Equatable, Sendable {
         }
         outputMappings = dedupedReversed.reversed()
 
+        let bypassCountBeforeRemoval = bypassedOutputDeviceUIDs.count
+        bypassedOutputDeviceUIDs.removeAll(where: \.isEmpty)
+        summary.removedBypassedOutputDeviceUIDs = bypassCountBeforeRemoval - bypassedOutputDeviceUIDs.count
+
+        var seenBypassedOutputUIDs = Set<String>()
+        bypassedOutputDeviceUIDs = bypassedOutputDeviceUIDs.filter { uid in
+            if seenBypassedOutputUIDs.insert(uid).inserted {
+                return true
+            }
+            summary.deduplicatedBypassedOutputDeviceUIDs += 1
+            return false
+        }
+
         return summary
     }
 
@@ -300,5 +342,12 @@ public struct ProfileStore: Codable, Equatable, Sendable {
         }
 
         return profiles.first(where: { $0.id == fallbackProfileID }) ?? profiles.first ?? .flatParametric
+    }
+
+    public func bypassesOutputDevice(uid: String?) -> Bool {
+        guard let uid, !uid.isEmpty else {
+            return false
+        }
+        return bypassedOutputDeviceUIDs.contains(uid)
     }
 }

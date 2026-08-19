@@ -406,12 +406,12 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
             )
             self.processor = EQProcessor(
                 renderConfiguration: EQRenderConfiguration(
-                    profile: SystemTapAudioEngine.dspProfile(from: profile),
+                    profile: profile,
                     sampleRate: sampleRate,
                     channelCount: self.channelCount
                 )
             )
-            self.bypassEnabled = Atomic(profile.isBypassed)
+            self.bypassEnabled = Atomic(false)
         }
 
         deinit {
@@ -1631,14 +1631,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
 
         let preparedConfig = EQRenderConfiguration(
-            profile: Self.dspProfile(from: profile),
+            profile: profile,
             sampleRate: runtime.sampleRate,
             channelCount: runtime.channelCount,
             maximumUsableFrequency: maximumUsableFrequency
         )
         runtime.drainDSPConfigBoxes()
         runtime.publishPendingDSPConfig(preparedConfig)
-        runtime.setBypassed(profile.isBypassed)
         state.activeProfile = profile
         if incrementsProfileRevision {
             state.profileRevision &+= 1
@@ -1659,13 +1658,13 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
 
         return EQRenderConfiguration(
-            profile: Self.dspProfile(from: nextProfile),
+            profile: nextProfile,
             sampleRate: sampleRate,
             channelCount: channelCount,
             maximumUsableFrequency: maximumUsableFrequency
         ).hasRealtimeCompatibleTopology(
             with: EQRenderConfiguration(
-                profile: Self.dspProfile(from: activeProfile),
+                profile: activeProfile,
                 sampleRate: sampleRate,
                 channelCount: channelCount,
                 maximumUsableFrequency: maximumUsableFrequency
@@ -1676,7 +1675,6 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
     public func setBypassed(_ isBypassed: Bool) {
         control.withLock { state in
             state.runtime?.setBypassed(isBypassed)
-            state.activeProfile?.isBypassed = isBypassed
             state.profileRevision &+= 1
         }
     }
@@ -2024,7 +2022,7 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         // control-path opportunity to release those boxes before publishing the next config.
         runtime.drainDSPConfigBoxes()
         runtime.publishPendingDSPConfig(EQRenderConfiguration(
-            profile: Self.dspProfile(from: effectiveProfile),
+            profile: effectiveProfile,
             sampleRate: runtime.sampleRate,
             channelCount: runtime.channelCount,
             maximumUsableFrequency: EQRouteFrequencyPolicy.maximumUsableFrequency(
@@ -2234,12 +2232,6 @@ public final class SystemTapAudioEngine: @unchecked Sendable {
         }
 
         try? PersistedAudioDeviceRestorationStore.save(records, to: url)
-    }
-
-    private static func dspProfile(from profile: EQProfile) -> EQProfile {
-        var profile = profile
-        profile.isBypassed = false
-        return profile
     }
 
     private func audioEngineFailure(from error: Error) -> AudioEngineFailure {

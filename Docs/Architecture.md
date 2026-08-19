@@ -8,11 +8,12 @@ The runtime flow is:
 
 1. Discover current default output device and UID.
 2. Load the mapped profile for that output UID.
-3. Build a private Core Audio system tap that excludes GlassEQ itself.
-4. Mute tapped dry output while the tap is active.
-5. Process tap buffers through the active EQ configuration.
-6. Replay processed audio to the current default output device.
-7. Tear down and rebuild the graph when macOS changes the default output.
+3. If GlassEQ is globally disabled or the output UID is configured for automatic bypass, leave the audio graph stopped and let macOS play the dry output normally.
+4. Otherwise, build a private Core Audio system tap that excludes GlassEQ itself.
+5. Mute tapped dry output while the tap is active.
+6. Process tap buffers through the active EQ configuration.
+7. Replay processed audio to the current default output device.
+8. Tear down and rebuild the graph when macOS changes the default output.
 
 ## Real-Time Rules
 
@@ -54,4 +55,4 @@ swift run GlassEQDiagnostics 2
 
 ## Profile Storage And Settings Helper
 
-Profile data belongs to the main app sandbox and is migrated by the main app through `container-migration.plist`. The settings helper does not share profile storage and does not need an app-group entitlement; it receives snapshots and sends commands over the private stdin/stdout IPC session launched by GlassEQ.
+Profiles, the global manual bypass flag, and the automatic per-output bypass UID list belong to the main app sandbox and are migrated by the main app through `container-migration.plist`. Bypass state is application-level and never part of an EQ profile. The menu can temporarily override an automatic rule for the current output visit; that exception is in-memory only and is cleared when the default output UID changes, leaving the saved rule untouched. The settings helper does not share this storage and does not need an app-group entitlement; it receives snapshots and sends commands over the private stdin/stdout IPC session launched by GlassEQ. Its profile editor opens automatic device bypass in a dedicated global window backed by the same IPC model.

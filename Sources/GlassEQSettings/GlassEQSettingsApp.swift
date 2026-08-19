@@ -21,6 +21,14 @@ struct GlassEQSettingsApp: App {
         .defaultSize(width: 1180, height: 720)
         .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
+
+        Window(String(localized: "Automatic Bypass"), id: SettingsWindowID.automaticBypass) {
+            AutomaticBypassView(model: model)
+        }
+        .defaultSize(width: 520, height: 460)
+        .windowResizability(.contentMinSize)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
     }
 }
 

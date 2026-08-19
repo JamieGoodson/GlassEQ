@@ -36,7 +36,8 @@ public struct EQConfiguration: Equatable, Sendable {
         profile: EQProfile,
         sampleRate: Double,
         channelCount: Int,
-        maximumUsableFrequency: Double? = nil
+        maximumUsableFrequency: Double? = nil,
+        isBypassed: Bool = false
     ) {
         self.sampleRate = sampleRate
         self.maximumUsableFrequency = min(
@@ -59,7 +60,7 @@ public struct EQConfiguration: Equatable, Sendable {
             channelCount: self.channelCount,
             linkedConfiguration: linkedConfiguration
         )
-        self.isBypassed = profile.isBypassed
+        self.isBypassed = isBypassed
     }
 
     private static func makeChannelConfigurations(
@@ -110,13 +111,15 @@ public struct EQRenderConfiguration: Equatable, Sendable {
         profile: EQProfile,
         sampleRate: Double,
         channelCount: Int,
-        maximumUsableFrequency: Double? = nil
+        maximumUsableFrequency: Double? = nil,
+        isBypassed: Bool = false
     ) {
         self.init(configuration: EQConfiguration(
             profile: profile,
             sampleRate: sampleRate,
             channelCount: channelCount,
-            maximumUsableFrequency: maximumUsableFrequency
+            maximumUsableFrequency: maximumUsableFrequency,
+            isBypassed: isBypassed
         ))
     }
 

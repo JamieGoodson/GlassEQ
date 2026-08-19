@@ -66,6 +66,15 @@ public final class GlassEQSettingsViewModel {
             snapshot.currentOutputChannelCount = currentOutput.channelCount
             snapshot.currentOutputBufferFrameSize = currentOutput.bufferFrameSize
         }
+        if let knownOutputDevices = patch.knownOutputDevices {
+            snapshot.knownOutputDevices = knownOutputDevices
+        }
+        if let isBypassed = patch.isBypassed {
+            snapshot.isBypassed = isBypassed
+        }
+        if let bypassedOutputDeviceUIDs = patch.bypassedOutputDeviceUIDs {
+            snapshot.bypassedOutputDeviceUIDs = bypassedOutputDeviceUIDs
+        }
         if let profileStoreProtection = patch.profileStoreProtection {
             snapshot.profileStoreProtection = profileStoreProtection
         }

@@ -43,12 +43,32 @@ struct GlassEQApp: App {
                 }
                 .onDisappear {
                     model.inProcessSettingsDidDisappear()
-                    NSApplication.shared.setActivationPolicy(.accessory)
+                    if !model.inProcessConfigurationWindowIsPresented {
+                        NSApplication.shared.setActivationPolicy(.accessory)
+                    }
                 }
         }
         .defaultSize(width: 1180, height: 720)
         .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+
+        Window(localized("Automatic Bypass"), id: SettingsWindowID.automaticBypass) {
+            AutomaticBypassView(model: model.inProcessSettingsViewModel())
+                .onAppear {
+                    NSApplication.shared.setActivationPolicy(.regular)
+                    model.inProcessAutomaticBypassDidAppear()
+                }
+                .onDisappear {
+                    model.inProcessAutomaticBypassDidDisappear()
+                    if !model.inProcessConfigurationWindowIsPresented {
+                        NSApplication.shared.setActivationPolicy(.accessory)
+                    }
+                }
+        }
+        .defaultSize(width: 520, height: 460)
+        .windowResizability(.contentMinSize)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
     }
@@ -289,6 +309,16 @@ struct CoreAudioDefaultOutputLookup: DefaultOutputLookingUp {
     }
 }
 
+protocol OutputDevicesLookingUp: Sendable {
+    func outputDevices() throws -> [AudioOutputDevice]
+}
+
+struct CoreAudioOutputDevicesLookup: OutputDevicesLookingUp {
+    func outputDevices() throws -> [AudioOutputDevice] {
+        try CoreAudioDeviceQuery.outputDevices()
+    }
+}
+
 typealias DefaultOutputObserverHandler = @Sendable (Result<AudioOutputDevice, Error>) -> Void
 
 protocol DefaultOutputObserving: AnyObject, Sendable {
@@ -498,6 +528,8 @@ final class GlassEQAppModel {
     var currentOutputBufferFrameSize: UInt32 = 0
     var statusMessage = localized("Stopped")
     var isRunning = false
+    // A menu-bar exception for the current output visit. The persisted automatic rule remains on.
+    private(set) var temporarilyEnabledOutputUID: String?
     var activeProfile: EQProfile
     var profileStore: ProfileStore
     var selectedProfileID: UUID
@@ -511,6 +543,7 @@ final class GlassEQAppModel {
 
     private let engine: any AudioEngineControlling
     private let defaultOutputLookup: any DefaultOutputLookingUp
+    private let outputDevicesLookup: any OutputDevicesLookingUp
     private let observerFactory: any DefaultOutputObservingMaking
     private let workspaceOpener: any WorkspaceOpening
     private let playbackBufferRenegotiationNotifier: any PlaybackBufferRenegotiationNotifying
@@ -541,6 +574,7 @@ final class GlassEQAppModel {
     @ObservationIgnored lazy var settingsCoordinator = SettingsCoordinator(model: self)
     @ObservationIgnored var inProcessSettingsViewModelStorage: GlassEQSettingsViewModel?
     @ObservationIgnored var inProcessSettingsIsPresented = false
+    @ObservationIgnored var inProcessAutomaticBypassIsPresented = false
     @ObservationIgnored var inProcessSettingsPresentationIsPending = false
     var inProcessSettingsPresentationGeneration = 0
 
@@ -752,6 +786,7 @@ final class GlassEQAppModel {
         storeURL: URL = ProfilePersistence.defaultStoreURL(),
         engine: any AudioEngineControlling = SystemTapAudioEngine(),
         defaultOutputLookup: any DefaultOutputLookingUp = CoreAudioDefaultOutputLookup(),
+        outputDevicesLookup: any OutputDevicesLookingUp = CoreAudioOutputDevicesLookup(),
         observerFactory: any DefaultOutputObservingMaking = CoreAudioDefaultOutputObserverFactory(),
         autoStart: Bool = true,
         installLifecycleObservers shouldInstallLifecycleObservers: Bool = true,
@@ -786,6 +821,7 @@ final class GlassEQAppModel {
         self.draftProfile = initialProfile
         self.engine = engine
         self.defaultOutputLookup = defaultOutputLookup
+        self.outputDevicesLookup = outputDevicesLookup
         self.observerFactory = observerFactory
         self.workspaceOpener = workspaceOpener
         self.playbackBufferRenegotiationNotifier = playbackBufferRenegotiationNotifier
@@ -850,9 +886,34 @@ final class GlassEQAppModel {
         profileStore.profiles.first(where: { $0.id == selectedProfileID }) ?? activeProfile
     }
 
+    var isCurrentOutputDeviceConfiguredForBypass: Bool {
+        profileStore.bypassesOutputDevice(uid: currentOutputUID)
+    }
+
+    var isTemporarilyIgnoringCurrentOutputBypass: Bool {
+        isCurrentOutputDeviceConfiguredForBypass
+            && temporarilyEnabledOutputUID == currentOutputUID
+    }
+
+    var isCurrentOutputDeviceBypassed: Bool {
+        isCurrentOutputDeviceConfiguredForBypass
+            && !isTemporarilyIgnoringCurrentOutputBypass
+    }
+
+    var isManuallyBypassed: Bool {
+        profileStore.isBypassed
+    }
+
+    var isProcessingBypassed: Bool {
+        isManuallyBypassed || isCurrentOutputDeviceBypassed
+    }
+
     var menuBarAccessibilityLabel: String {
-        if activeProfile.isBypassed {
+        if isManuallyBypassed {
             return localized("GlassEQ disabled")
+        }
+        if isCurrentOutputDeviceBypassed {
+            return localized("GlassEQ automatically bypassed")
         }
         return isRunning ? localized("GlassEQ active") : localized("GlassEQ stopped")
     }
@@ -875,12 +936,46 @@ final class GlassEQAppModel {
             currentOutputBufferFrameSize: currentOutputBufferFrameSize,
             currentOutputMappedProfileID: currentOutputMappedProfileID,
             fallbackProfileID: profileStore.fallbackProfileID,
+            knownOutputDevices: knownOutputDevices(),
+            isBypassed: profileStore.isBypassed,
+            bypassedOutputDeviceUIDs: profileStore.bypassedOutputDeviceUIDs,
             statusMessage: statusMessage,
             metrics: SettingsAudioMetricsDTO(engineMetrics),
             isRunning: isRunning,
             isPreviewing: previewReturnProfile != nil,
             profileStoreProtection: profileStoreProtectionSnapshot()
         )
+    }
+
+    private func knownOutputDevices() -> [SettingsKnownOutputDeviceDTO] {
+        var devices = (try? outputDevicesLookup.outputDevices()) ?? []
+        if !currentOutputUID.isEmpty,
+           !devices.contains(where: { $0.uid == currentOutputUID }) {
+            devices.append(AudioOutputDevice(
+                id: 0,
+                uid: currentOutputUID,
+                name: currentOutputName,
+                nominalSampleRate: currentOutputSampleRate,
+                outputChannelCount: currentOutputChannelCount,
+                bufferFrameSize: currentOutputBufferFrameSize
+            ))
+        }
+
+        var seenUIDs = Set<String>()
+        return devices
+            .filter { device in
+                !device.uid.isEmpty
+                    && !device.uid.hasPrefix("com.glasseq.aggregate.")
+                    && seenUIDs.insert(device.uid).inserted
+            }
+            .map { SettingsKnownOutputDeviceDTO(name: $0.name, uid: $0.uid) }
+            .sorted { lhs, rhs in
+                let nameComparison = lhs.name.localizedStandardCompare(rhs.name)
+                if nameComparison == .orderedSame {
+                    return lhs.uid < rhs.uid
+                }
+                return nameComparison == .orderedAscending
+            }
     }
 
     private func profileStoreProtectionSnapshot() -> SettingsProfileStoreProtectionDTO {
@@ -1077,28 +1172,78 @@ final class GlassEQAppModel {
         notifyModelDidChange()
     }
 
-    func setBypass(_ isBypassed: Bool) {
-        do {
-            try ensureProfileStoreWritable()
-        } catch {
-            reportProfileActionFailure(error)
+    func setBypass(_ isBypassed: Bool) throws {
+        try ensureProfileStoreWritable()
+        var store = profileStore
+        guard store.isBypassed != isBypassed else {
             return
         }
-        let rollback = profileRollback()
-        var profile = activeProfile
-        profile.isBypassed = isBypassed
+        store.isBypassed = isBypassed
+        try ProfilePersistence.validateForCommit(store)
+        profileStore = store
+        if isBypassed {
+            temporarilyEnabledOutputUID = nil
+        }
+        saveStore()
+        synchronizeActiveProfileProcessing()
+        notifyModelDidChange()
+    }
+
+    func setOutputDeviceBypassed(uid: String, isBypassed: Bool) throws {
+        try ensureProfileStoreWritable()
+
         var store = profileStore
-        upsertProfile(profile, in: &store)
-        do {
-            try ProfilePersistence.validateForCommit(store)
-            profileStore = store
-            activeProfile = profile
-            if draftProfile.id == profile.id {
-                draftProfile = profile
+        let wasBypassed = store.bypassesOutputDevice(uid: uid)
+        guard wasBypassed != isBypassed else {
+            return
+        }
+
+        store.bypassedOutputDeviceUIDs.removeAll { $0 == uid }
+        if isBypassed {
+            store.bypassedOutputDeviceUIDs.append(uid)
+        }
+        try ProfilePersistence.validateForCommit(store)
+
+        profileStore = store
+        if uid == currentOutputUID {
+            temporarilyEnabledOutputUID = nil
+        }
+        saveStore()
+        if uid == currentOutputUID {
+            synchronizeActiveProfileProcessing()
+        }
+        notifyModelDidChange()
+    }
+
+    func toggleProcessingBypass() {
+        if isProcessingBypassed {
+            let previousTemporaryOutputUID = temporarilyEnabledOutputUID
+            if isCurrentOutputDeviceConfiguredForBypass {
+                temporarilyEnabledOutputUID = currentOutputUID
             }
-            saveStore()
-            synchronizeActiveProfileProcessing(rollback: rollback)
+            do {
+                if isManuallyBypassed {
+                    try setBypass(false)
+                } else {
+                    synchronizeActiveProfileProcessing()
+                    notifyModelDidChange()
+                }
+            } catch {
+                temporarilyEnabledOutputUID = previousTemporaryOutputUID
+                reportProfileActionFailure(error)
+            }
+            return
+        }
+
+        if isTemporarilyIgnoringCurrentOutputBypass {
+            temporarilyEnabledOutputUID = nil
+            synchronizeActiveProfileProcessing()
             notifyModelDidChange()
+            return
+        }
+
+        do {
+            try setBypass(true)
         } catch {
             reportProfileActionFailure(error)
         }
@@ -1230,7 +1375,7 @@ final class GlassEQAppModel {
         activeProfile = profile
         selectedProfileID = profile.id
         draftProfile = profile
-        if activeProfile.isBypassed {
+        if isProcessingBypassed {
             disableActiveProfileProcessing(updateMetrics: true)
         } else if hasPendingProfileReplacingEngineWork {
             reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
@@ -1257,7 +1402,7 @@ final class GlassEQAppModel {
         activeProfile = profile
         selectedProfileID = profile.id
         draftProfile = profile
-        if activeProfile.isBypassed {
+        if isProcessingBypassed {
             disableActiveProfileProcessing(updateMetrics: true)
         } else if hasPendingProfileReplacingEngineWork {
             reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
@@ -1582,6 +1727,9 @@ final class GlassEQAppModel {
     }
 
     private func refreshCurrentOutputMetadata(from output: AudioOutputDevice) {
+        if currentOutputUID != output.uid {
+            temporarilyEnabledOutputUID = nil
+        }
         currentOutputName = output.name
         currentOutputUID = output.uid
         currentOutputSampleRate = output.nominalSampleRate
@@ -1604,7 +1752,7 @@ final class GlassEQAppModel {
             selectedProfileID = activeProfile.id
             draftProfile = activeProfile
 
-            if activeProfile.isBypassed {
+            if isProcessingBypassed {
                 disableActiveProfileProcessing(updateMetrics: false)
             } else {
                 scheduleEngineWork(.start(output: output, profile: activeProfile, rollback: rollback))
@@ -1681,7 +1829,7 @@ final class GlassEQAppModel {
             return
         }
 
-        guard !activeProfile.isBypassed else {
+        guard !isProcessingBypassed else {
             disableActiveProfileProcessing(updateMetrics: true)
             return
         }
@@ -2183,7 +2331,7 @@ final class GlassEQAppModel {
               lifecycleState != .sleeping else {
             return
         }
-        guard !activeProfile.isBypassed else {
+        guard !isProcessingBypassed else {
             synchronizeActiveProfileProcessing()
             notifyModelDidChange()
             return
@@ -2216,6 +2364,15 @@ final class GlassEQAppModel {
     }
 
     private func disabledStatus(outputName: String) -> String {
+        if isManuallyBypassed {
+            return localized("GlassEQ is disabled")
+        }
+        if isCurrentOutputDeviceBypassed {
+            guard !outputName.isEmpty, outputName != noOutputName else {
+                return localized("Automatically bypassing the current output")
+            }
+            return localized("Automatically bypassing \(outputName)")
+        }
         guard !outputName.isEmpty, outputName != noOutputName else {
             return localized("Audio processing disabled")
         }
@@ -2340,7 +2497,9 @@ final class GlassEQAppModel {
             return
         }
 
-        wasRunningBeforeSleep = isRunning || wasRunningBeforeSleep
+        wasRunningBeforeSleep = isRunning
+            || (isCurrentOutputDeviceBypassed && !isManuallyBypassed)
+            || wasRunningBeforeSleep
         invalidatePendingOutputChange()
         invalidatePendingEngineStart()
         stopObserver()
@@ -2536,6 +2695,12 @@ final class GlassEQAppModel {
         if summary.removedOutputMappings > 0 || summary.deduplicatedOutputMappings > 0 {
             return localized("Profile store repaired: removed unavailable output mapping")
         }
+        if summary.removedBypassedOutputDeviceUIDs > 0 || summary.deduplicatedBypassedOutputDeviceUIDs > 0 {
+            return localized("Profile store repaired: removed invalid bypassed output device")
+        }
+        if summary.migratedSchemaVersion {
+            return localized("Profile store updated")
+        }
         return localized("Profile store repaired")
     }
 }
@@ -2572,11 +2737,11 @@ private struct MenuBarView: View {
 
             HStack(spacing: 10) {
                 Button {
-                    model.setBypass(!model.activeProfile.isBypassed)
+                    model.toggleProcessingBypass()
                 } label: {
                     Label(
-                        model.activeProfile.isBypassed ? localized("Enable") : localized("Disable"),
-                        systemImage: model.activeProfile.isBypassed ? "speaker.wave.2" : "speaker.slash"
+                        model.isProcessingBypassed ? localized("Enable") : localized("Disable"),
+                        systemImage: model.isProcessingBypassed ? "speaker.wave.2" : "speaker.slash"
                     )
                         .frame(minWidth: 82, minHeight: 28)
                         .contentShape(.rect)
@@ -2584,9 +2749,9 @@ private struct MenuBarView: View {
                 .controlSize(.large)
                 .buttonStyle(.glass)
                 .tint(popoverControlsAreActive ? enableButtonTint : nil)
-                .accessibilityLabel(Text(model.activeProfile.isBypassed ? localized("Enable equalizer") : localized("Disable equalizer")))
+                .accessibilityLabel(Text(model.isProcessingBypassed ? localized("Enable equalizer") : localized("Disable equalizer")))
                 .accessibilityValue(Text(statusBadgeTitle))
-                .accessibilityHint(Text(localized("Starts or stops system audio processing for the active profile")))
+                .accessibilityHint(Text(localized("Temporarily enables an automatically bypassed output without changing its saved rule")))
 
                 Button {
                     dismiss()
@@ -2647,18 +2812,21 @@ private struct MenuBarView: View {
     }
 
     private var statusBadgeTitle: String {
-        if model.activeProfile.isBypassed {
+        if model.isManuallyBypassed {
             return localized("Disabled")
+        }
+        if model.isCurrentOutputDeviceBypassed {
+            return localized("Auto Bypass")
         }
         return model.isRunning ? localized("Active") : localized("Stopped")
     }
 
     private var statusBadgeColor: Color {
-        model.isRunning && !model.activeProfile.isBypassed ? .macOSSystemGreen : .macOSSystemRed
+        model.isRunning && !model.isProcessingBypassed ? .macOSSystemGreen : .macOSSystemRed
     }
 
     private var enableButtonTint: Color {
-        model.activeProfile.isBypassed ? .macOSSystemGreen : .macOSSystemYellow
+        model.isProcessingBypassed ? .macOSSystemGreen : .macOSSystemYellow
     }
 
     private var popoverControlsAreActive: Bool {

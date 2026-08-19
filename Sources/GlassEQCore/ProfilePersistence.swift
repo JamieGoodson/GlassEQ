@@ -25,11 +25,15 @@ public enum ProfileStoreValidationError: Error, Equatable, Sendable, LocalizedEr
     case unsupportedSchemaVersion(version: Int, maximumSupported: Int)
     case invalidProfileCount(count: Int, allowed: ClosedRange<Int>)
     case invalidOutputMappingCount(count: Int, allowed: ClosedRange<Int>)
+    case invalidBypassedOutputDeviceCount(count: Int, allowed: ClosedRange<Int>)
     case duplicateProfileID(profileID: UUID)
     case missingFallbackProfile(profileID: UUID)
     case emptyProfileName(profileID: UUID)
     case profileNameTooLong(profileID: UUID, byteCount: Int, maximum: Int)
     case outputUIDTooLong(mappingIndex: Int, byteCount: Int, maximum: Int)
+    case emptyBypassedOutputUID(index: Int)
+    case bypassedOutputUIDTooLong(index: Int, byteCount: Int, maximum: Int)
+    case duplicateBypassedOutputUID(uid: String)
     case valueOutOfRange(profileID: UUID, field: String, value: Double, range: ClosedRange<Double>)
     case tooManyFilters(profileID: UUID, channel: String, count: Int, maximum: Int)
     case tooManyActiveFilters(profileID: UUID, channel: String, count: Int, maximum: Int)
@@ -47,6 +51,8 @@ public enum ProfileStoreValidationError: Error, Equatable, Sendable, LocalizedEr
             return "Profile store has \(count) profiles; expected \(allowed.lowerBound)...\(allowed.upperBound)."
         case let .invalidOutputMappingCount(count, allowed):
             return "Profile store has \(count) output mappings; expected \(allowed.lowerBound)...\(allowed.upperBound)."
+        case let .invalidBypassedOutputDeviceCount(count, allowed):
+            return "Profile store has \(count) bypassed output devices; expected \(allowed.lowerBound)...\(allowed.upperBound)."
         case let .duplicateProfileID(profileID):
             return "Profile store contains duplicate profile ID \(profileID)."
         case let .missingFallbackProfile(profileID):
@@ -57,6 +63,12 @@ public enum ProfileStoreValidationError: Error, Equatable, Sendable, LocalizedEr
             return "Profile store contains a profile name with \(byteCount) UTF-8 bytes, which exceeds the \(maximum)-byte limit."
         case let .outputUIDTooLong(mappingIndex, byteCount, maximum):
             return "Output mapping \(mappingIndex) has \(byteCount) UTF-8 bytes, which exceeds the \(maximum)-byte limit."
+        case let .emptyBypassedOutputUID(index):
+            return "Bypassed output device \(index) has an empty UID."
+        case let .bypassedOutputUIDTooLong(index, byteCount, maximum):
+            return "Bypassed output device \(index) has \(byteCount) UTF-8 bytes, which exceeds the \(maximum)-byte limit."
+        case let .duplicateBypassedOutputUID(uid):
+            return "Profile store contains duplicate bypassed output device UID \(uid)."
         case let .valueOutOfRange(_, field, value, range):
             return "Profile store contains \(field) \(format(value)), outside the allowed range \(format(range.lowerBound))...\(format(range.upperBound))."
         case let .tooManyFilters(_, channel, count, maximum):
@@ -81,6 +93,7 @@ public enum ProfilePersistence {
     public static let maxStoreBytes = 5 * 1_024 * 1_024
     public static let profileCountRange = 1...64
     public static let outputMappingCountRange = 0...256
+    public static let bypassedOutputDeviceCountRange = 0...256
     public static let maxProfileNameUTF8Bytes = 120
     public static let maxOutputUIDUTF8Bytes = 512
     public static let maxFiltersPerChannel = 128
@@ -149,6 +162,13 @@ public enum ProfilePersistence {
             )
         }
 
+        guard bypassedOutputDeviceCountRange.contains(store.bypassedOutputDeviceUIDs.count) else {
+            throw ProfileStoreValidationError.invalidBypassedOutputDeviceCount(
+                count: store.bypassedOutputDeviceUIDs.count,
+                allowed: bypassedOutputDeviceCountRange
+            )
+        }
+
         var profileIDs = Set<UUID>()
         for profile in store.profiles {
             guard profileIDs.insert(profile.id).inserted else {
@@ -171,6 +191,24 @@ public enum ProfilePersistence {
                     byteCount: byteCount,
                     maximum: maxOutputUIDUTF8Bytes
                 )
+            }
+        }
+
+        var bypassedOutputUIDs = Set<String>()
+        for (index, uid) in store.bypassedOutputDeviceUIDs.enumerated() {
+            guard !uid.isEmpty else {
+                throw ProfileStoreValidationError.emptyBypassedOutputUID(index: index)
+            }
+            let byteCount = uid.utf8.count
+            guard byteCount <= maxOutputUIDUTF8Bytes else {
+                throw ProfileStoreValidationError.bypassedOutputUIDTooLong(
+                    index: index,
+                    byteCount: byteCount,
+                    maximum: maxOutputUIDUTF8Bytes
+                )
+            }
+            guard bypassedOutputUIDs.insert(uid).inserted else {
+                throw ProfileStoreValidationError.duplicateBypassedOutputUID(uid: uid)
             }
         }
     }
@@ -312,11 +350,15 @@ public enum ProfilePersistence {
     private struct ProfileStoreEnvelope: Decodable {
         var schemaVersion: Int
         var outputMappings: [OutputDeviceProfileMapping]
+        var isBypassed: Bool
+        var bypassedOutputDeviceUIDs: [String]
         var fallbackProfileID: UUID
 
         private enum CodingKeys: String, CodingKey {
             case schemaVersion
             case outputMappings
+            case isBypassed
+            case bypassedOutputDeviceUIDs
             case fallbackProfileID
         }
 
@@ -325,6 +367,11 @@ public enum ProfilePersistence {
             schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion)
                 ?? ProfileStore.currentSchemaVersion
             outputMappings = try container.decode([OutputDeviceProfileMapping].self, forKey: .outputMappings)
+            isBypassed = try container.decodeIfPresent(Bool.self, forKey: .isBypassed) ?? false
+            bypassedOutputDeviceUIDs = try container.decodeIfPresent(
+                [String].self,
+                forKey: .bypassedOutputDeviceUIDs
+            ) ?? []
             fallbackProfileID = try container.decode(UUID.self, forKey: .fallbackProfileID)
         }
     }
@@ -362,6 +409,8 @@ public enum ProfilePersistence {
                 schemaVersion: envelope.schemaVersion,
                 profiles: profiles,
                 outputMappings: envelope.outputMappings,
+                isBypassed: envelope.isBypassed,
+                bypassedOutputDeviceUIDs: envelope.bypassedOutputDeviceUIDs,
                 fallbackProfileID: envelope.fallbackProfileID
             ),
             removedInvalidProfiles

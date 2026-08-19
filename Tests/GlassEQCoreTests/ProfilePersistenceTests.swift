@@ -94,6 +94,36 @@ struct ProfilePersistenceTests {
     }
 
     @Test
+    func loadMigratesLegacyProfileBypassToGloballyEnabledWithNoDeviceRules() throws {
+        let url = try temporaryStoreURL()
+        defer { removeTemporaryStoreDirectory(for: url) }
+        let profile = EQProfile(name: "Legacy", mode: .parametric, filters: [])
+        let store = ProfileStore(profiles: [profile], fallbackProfileID: profile.id)
+        var object = try #require(
+            JSONSerialization.jsonObject(with: ProfilePersistence.encoder.encode(store)) as? [String: Any]
+        )
+        object["schemaVersion"] = 1
+        object.removeValue(forKey: "isBypassed")
+        object.removeValue(forKey: "bypassedOutputDeviceUIDs")
+        var profiles = try #require(object["profiles"] as? [[String: Any]])
+        profiles[0]["isBypassed"] = true
+        object["profiles"] = profiles
+        try JSONSerialization.data(withJSONObject: object).write(to: url)
+
+        let result = ProfilePersistence.load(from: url, timestamp: timestamp)
+
+        guard case .repairedReferences(let summary) = result.status else {
+            Issue.record("Expected schema migration, got \(result.status)")
+            return
+        }
+        #expect(summary.migratedSchemaVersion)
+        #expect(result.store.schemaVersion == ProfileStore.currentSchemaVersion)
+        #expect(!result.store.isBypassed)
+        #expect(result.store.bypassedOutputDeviceUIDs.isEmpty)
+        #expect(try ProfilePersistence.decode(Data(contentsOf: url)) == result.store)
+    }
+
+    @Test
     func loadRepairsInvalidProfileWithoutDroppingValidProfiles() throws {
         let url = try temporaryStoreURL()
         defer { removeTemporaryStoreDirectory(for: url) }

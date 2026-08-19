@@ -191,6 +191,18 @@ public struct SettingsOutputDTO: Codable, Equatable, Sendable {
     }
 }
 
+public struct SettingsKnownOutputDeviceDTO: Codable, Equatable, Identifiable, Sendable {
+    public var name: String
+    public var uid: String
+
+    public var id: String { uid }
+
+    public init(name: String, uid: String) {
+        self.name = name
+        self.uid = uid
+    }
+}
+
 public enum SettingsOptionalUUIDPatchDTO: Codable, Equatable, Sendable {
     case set(UUID)
     case clear
@@ -227,6 +239,9 @@ public struct SettingsSnapshotPatchDTO: Codable, Equatable, Sendable {
     public var fallbackProfileID: UUID?
     public var currentOutput: SettingsOutputDTO?
     public var currentOutputMappedProfileID: SettingsOptionalUUIDPatchDTO?
+    public var knownOutputDevices: [SettingsKnownOutputDeviceDTO]?
+    public var isBypassed: Bool?
+    public var bypassedOutputDeviceUIDs: [String]?
     public var profileStoreProtection: SettingsProfileStoreProtectionDTO?
 
     public init(
@@ -240,6 +255,9 @@ public struct SettingsSnapshotPatchDTO: Codable, Equatable, Sendable {
         fallbackProfileID: UUID? = nil,
         currentOutput: SettingsOutputDTO? = nil,
         currentOutputMappedProfileID: SettingsOptionalUUIDPatchDTO? = nil,
+        knownOutputDevices: [SettingsKnownOutputDeviceDTO]? = nil,
+        isBypassed: Bool? = nil,
+        bypassedOutputDeviceUIDs: [String]? = nil,
         profileStoreProtection: SettingsProfileStoreProtectionDTO? = nil
     ) {
         self.statusMessage = statusMessage
@@ -252,6 +270,9 @@ public struct SettingsSnapshotPatchDTO: Codable, Equatable, Sendable {
         self.fallbackProfileID = fallbackProfileID
         self.currentOutput = currentOutput
         self.currentOutputMappedProfileID = currentOutputMappedProfileID
+        self.knownOutputDevices = knownOutputDevices
+        self.isBypassed = isBypassed
+        self.bypassedOutputDeviceUIDs = bypassedOutputDeviceUIDs
         self.profileStoreProtection = profileStoreProtection
     }
 }
@@ -269,6 +290,9 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
     public var currentOutputBufferFrameSize: UInt32
     public var currentOutputMappedProfileID: UUID?
     public var fallbackProfileID: UUID
+    public var knownOutputDevices: [SettingsKnownOutputDeviceDTO]
+    public var isBypassed: Bool
+    public var bypassedOutputDeviceUIDs: [String]
     public var statusMessage: String
     public var metrics: SettingsAudioMetricsDTO
     public var isRunning: Bool
@@ -288,6 +312,9 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
         case currentOutputBufferFrameSize
         case currentOutputMappedProfileID
         case fallbackProfileID
+        case knownOutputDevices
+        case isBypassed
+        case bypassedOutputDeviceUIDs
         case statusMessage
         case metrics
         case isRunning
@@ -308,6 +335,9 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
         currentOutputBufferFrameSize: UInt32,
         currentOutputMappedProfileID: UUID?,
         fallbackProfileID: UUID,
+        knownOutputDevices: [SettingsKnownOutputDeviceDTO] = [],
+        isBypassed: Bool = false,
+        bypassedOutputDeviceUIDs: [String] = [],
         statusMessage: String,
         metrics: SettingsAudioMetricsDTO,
         isRunning: Bool,
@@ -326,6 +356,9 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
         self.currentOutputBufferFrameSize = currentOutputBufferFrameSize
         self.currentOutputMappedProfileID = currentOutputMappedProfileID
         self.fallbackProfileID = fallbackProfileID
+        self.knownOutputDevices = knownOutputDevices
+        self.isBypassed = isBypassed
+        self.bypassedOutputDeviceUIDs = bypassedOutputDeviceUIDs
         self.statusMessage = statusMessage
         self.metrics = metrics
         self.isRunning = isRunning
@@ -348,6 +381,15 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
             currentOutputBufferFrameSize: try container.decode(UInt32.self, forKey: .currentOutputBufferFrameSize),
             currentOutputMappedProfileID: try container.decodeIfPresent(UUID.self, forKey: .currentOutputMappedProfileID),
             fallbackProfileID: try container.decode(UUID.self, forKey: .fallbackProfileID),
+            knownOutputDevices: try container.decodeIfPresent(
+                [SettingsKnownOutputDeviceDTO].self,
+                forKey: .knownOutputDevices
+            ) ?? [],
+            isBypassed: try container.decodeIfPresent(Bool.self, forKey: .isBypassed) ?? false,
+            bypassedOutputDeviceUIDs: try container.decodeIfPresent(
+                [String].self,
+                forKey: .bypassedOutputDeviceUIDs
+            ) ?? [],
             statusMessage: try container.decode(String.self, forKey: .statusMessage),
             metrics: try container.decode(SettingsAudioMetricsDTO.self, forKey: .metrics),
             isRunning: try container.decodeIfPresent(Bool.self, forKey: .isRunning) ?? false,
@@ -374,6 +416,9 @@ public struct SettingsSnapshotDTO: Codable, Equatable, Sendable {
             currentOutputBufferFrameSize: 0,
             currentOutputMappedProfileID: nil,
             fallbackProfileID: profile.id,
+            knownOutputDevices: [],
+            isBypassed: false,
+            bypassedOutputDeviceUIDs: [],
             statusMessage: "Connecting to GlassEQ...",
             metrics: SettingsAudioMetricsDTO(),
             isRunning: false,
@@ -391,6 +436,8 @@ public enum SettingsCommand: Codable, Equatable, Sendable {
     case applyProfile(EQProfile)
     case useProfileForCurrentOutput(EQProfile)
     case setFallback(EQProfile)
+    case setBypassed(Bool)
+    case setOutputDeviceBypassed(uid: String, isBypassed: Bool)
     case importProfile(format: SettingsImportFormat, name: String, text: String)
     case preview(EQProfile)
     case stopPreview

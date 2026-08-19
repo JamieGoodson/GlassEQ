@@ -186,14 +186,18 @@ struct EQCoreTests {
 
     @Test
     func bypassLeavesSamplesUntouched() {
-        var profile = EQProfile(
+        let profile = EQProfile(
             name: "Bypass",
             mode: .parametric,
             filters: [EQFilter(kind: .peak, frequency: 1_000, gainDB: 12, q: 1)]
         )
-        profile.isBypassed = true
 
-        var processor = EQProcessor(configuration: EQConfiguration(profile: profile, sampleRate: 48_000, channelCount: 2))
+        var processor = EQProcessor(configuration: EQConfiguration(
+            profile: profile,
+            sampleRate: 48_000,
+            channelCount: 2,
+            isBypassed: true
+        ))
         var samples: [Float] = [0.1, -0.2, 0.3, -0.4]
 
         processor.processInterleaved(&samples, channelCount: 2)
@@ -471,14 +475,12 @@ struct EQCoreTests {
         updated.filters[0].gainDB = -8
         updated.filters[1].frequency = 10_000
         updated.filters[1].gainDB = -3
-        updated.isBypassed = true
-
         var processor = EQProcessor(configuration: EQConfiguration(profile: initial, sampleRate: 48_000, channelCount: 2))
         var warmup = makeStereoTestBlock(frameCount: 512, sampleRate: 48_000)
         processor.processInterleaved(&warmup, channelCount: 2)
 
         let retiredStorage = processor.applyRealtimeCompatiblePreparedConfiguration(
-            EQRenderConfiguration(profile: updated, sampleRate: 48_000, channelCount: 2)
+            EQRenderConfiguration(profile: updated, sampleRate: 48_000, channelCount: 2, isBypassed: true)
         )
 
         #expect(retiredStorage != nil)
@@ -489,7 +491,6 @@ struct EQCoreTests {
             channelCount: 2
         ).preampLinearGain)
 
-        updated.isBypassed = false
         _ = processor.applyRealtimeCompatiblePreparedConfiguration(
             EQRenderConfiguration(profile: updated, sampleRate: 48_000, channelCount: 2)
         )
@@ -569,7 +570,7 @@ struct EQCoreTests {
           "mode": "parametric",
           "preampDB": 0,
           "filters": [],
-          "isBypassed": false
+          "isBypassed": true
         }
         """
 
@@ -577,6 +578,10 @@ struct EQCoreTests {
         #expect(profile.channelMode == EQChannelMode.linked)
         #expect(profile.leftFilters == profile.filters)
         #expect(profile.rightFilters == profile.filters)
+        let encodedObject = try #require(
+            JSONSerialization.jsonObject(with: ProfilePersistence.encoder.encode(profile)) as? [String: Any]
+        )
+        #expect(encodedObject["isBypassed"] == nil)
     }
 
     @Test
@@ -635,6 +640,21 @@ struct EQCoreTests {
     }
 
     @Test
+    func profileStoreRepairRemovesInvalidAndDuplicateBypassedOutputUIDs() {
+        var store = ProfileStore(
+            bypassedOutputDeviceUIDs: ["speakers", "", "headphones", "speakers"]
+        )
+
+        let summary = store.repairReferences()
+
+        #expect(summary.removedBypassedOutputDeviceUIDs == 1)
+        #expect(summary.deduplicatedBypassedOutputDeviceUIDs == 1)
+        #expect(store.bypassedOutputDeviceUIDs == ["speakers", "headphones"])
+        #expect(store.bypassesOutputDevice(uid: "speakers"))
+        #expect(!store.bypassesOutputDevice(uid: "dac"))
+    }
+
+    @Test
     func profileLookupFallsBackToFirstProfileThenFlatProfile() {
         let first = EQProfile(name: "First", mode: .parametric, filters: [])
         let storeWithBrokenFallback = ProfileStore(profiles: [first], fallbackProfileID: UUID())
@@ -646,12 +666,14 @@ struct EQCoreTests {
 
     @Test
     func profileStoreRoundTripsThroughJSON() throws {
-        let store = ProfileStore()
+        let store = ProfileStore(isBypassed: true, bypassedOutputDeviceUIDs: ["built-in-speakers"])
         let data = try ProfilePersistence.encode(store)
         let decoded = try ProfilePersistence.decode(data)
 
         #expect(decoded.profiles.count == store.profiles.count)
         #expect(decoded.outputMappings == store.outputMappings)
+        #expect(decoded.isBypassed)
+        #expect(decoded.bypassedOutputDeviceUIDs == store.bypassedOutputDeviceUIDs)
     }
 
     private func makeStereoTestBlock(frameCount: Int, sampleRate: Double) -> [Float] {

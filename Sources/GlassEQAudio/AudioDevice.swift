@@ -96,6 +96,18 @@ public enum CoreAudioDeviceQuery {
         return try outputDevice(id: deviceID)
     }
 
+    public static func outputDevices() throws -> [AudioOutputDevice] {
+        try audioDeviceIDs()
+            .compactMap { try? outputDevice(id: $0) }
+            .sorted { lhs, rhs in
+                let nameComparison = lhs.name.localizedStandardCompare(rhs.name)
+                if nameComparison == .orderedSame {
+                    return lhs.uid < rhs.uid
+                }
+                return nameComparison == .orderedAscending
+            }
+    }
+
     public static func outputDevice(id: AudioObjectID) throws -> AudioOutputDevice {
         guard id != kAudioObjectUnknown else {
             throw AudioDeviceAvailabilityError.noDefaultOutput

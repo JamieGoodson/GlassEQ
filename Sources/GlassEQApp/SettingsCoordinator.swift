@@ -518,6 +518,18 @@ final class SettingsCoordinator: NSObject {
             }
             didPatch = true
         }
+        if previous.knownOutputDevices != snapshot.knownOutputDevices {
+            patch.knownOutputDevices = snapshot.knownOutputDevices
+            didPatch = true
+        }
+        if previous.isBypassed != snapshot.isBypassed {
+            patch.isBypassed = snapshot.isBypassed
+            didPatch = true
+        }
+        if previous.bypassedOutputDeviceUIDs != snapshot.bypassedOutputDeviceUIDs {
+            patch.bypassedOutputDeviceUIDs = snapshot.bypassedOutputDeviceUIDs
+            didPatch = true
+        }
         if previous.profileStoreProtection != snapshot.profileStoreProtection {
             patch.profileStoreProtection = snapshot.profileStoreProtection
             didPatch = true
@@ -949,6 +961,18 @@ extension GlassEQAppModel {
         inProcessSettingsIsPresented = false
     }
 
+    var inProcessConfigurationWindowIsPresented: Bool {
+        inProcessSettingsIsPresented || inProcessAutomaticBypassIsPresented
+    }
+
+    func inProcessAutomaticBypassDidAppear() {
+        inProcessAutomaticBypassIsPresented = true
+    }
+
+    func inProcessAutomaticBypassDidDisappear() {
+        inProcessAutomaticBypassIsPresented = false
+    }
+
     func inProcessSettingsViewModel() -> GlassEQSettingsViewModel {
         if let inProcessSettingsViewModelStorage {
             return inProcessSettingsViewModelStorage
@@ -1011,6 +1035,14 @@ extension GlassEQAppModel {
         case .setFallback(let profile):
             try validateIncomingProfile(profile)
             try setFallback(profile: profile)
+            return SettingsCommandResponse(snapshot: settingsSnapshot())
+
+        case .setBypassed(let isBypassed):
+            try setBypass(isBypassed)
+            return SettingsCommandResponse(snapshot: settingsSnapshot())
+
+        case let .setOutputDeviceBypassed(uid, isBypassed):
+            try setOutputDeviceBypassed(uid: uid, isBypassed: isBypassed)
             return SettingsCommandResponse(snapshot: settingsSnapshot())
 
         case let .importProfile(format, name, text):

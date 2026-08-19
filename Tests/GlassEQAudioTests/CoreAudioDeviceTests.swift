@@ -16,6 +16,16 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
+    func outputDeviceEnumerationIncludesTheDefaultOutput() throws {
+        let defaultOutput = try CoreAudioDeviceQuery.defaultOutputDevice()
+        let outputs = try CoreAudioDeviceQuery.outputDevices()
+
+        #expect(outputs.contains { $0.uid == defaultOutput.uid })
+        #expect(outputs.allSatisfy { !$0.uid.isEmpty && $0.outputChannelCount > 0 })
+        #expect(Set(outputs.map(\.uid)).count == outputs.count)
+    }
+
+    @Test
     func metadataValidationRejectsInvalidScalarValues() throws {
         expectInvalidMetadata {
             _ = try CoreAudioDeviceQuery.validatedSampleRate(.infinity, objectID: 42)
@@ -921,7 +931,7 @@ struct CoreAudioDeviceTests {
     }
 
     @Test
-    func dspHotSwapAllowsSameTopologyParameterAndBypassChanges() {
+    func dspHotSwapAllowsSameTopologyParameterChanges() {
         let active = EQProfile(
             name: "Active",
             mode: .graphic10,
@@ -932,7 +942,6 @@ struct CoreAudioDeviceTests {
         next.preampDB = -4
         next.filters[0].gainDB = 3
         next.filters[1].frequency = 70
-        next.isBypassed = true
 
         #expect(SystemTapAudioEngine.canHotSwapDSP(
             from: active,

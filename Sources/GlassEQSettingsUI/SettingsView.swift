@@ -244,8 +244,13 @@ public enum SettingsWindowFocus {
     }
 }
 
+public enum SettingsWindowID {
+    public static let automaticBypass = "automatic-bypass"
+}
+
 public struct SettingsView: View {
     @Bindable var model: GlassEQSettingsViewModel
+    @Environment(\.openWindow) private var openWindow
     @State private var snapshot: SettingsSnapshot
     @State private var tab = EditorSection.editor
     @State private var draftEditGeneration = 0
@@ -268,6 +273,7 @@ public struct SettingsView: View {
                 onCreateParametric: createParametricProfile,
                 onDuplicate: duplicateSelectedProfile,
                 onDelete: deleteSelectedProfile,
+                onOpenAutomaticBypass: openAutomaticBypass,
                 canDeleteSelectedProfile: canDeleteSelectedProfile,
                 isReadOnly: isProfileStoreProtected
             )
@@ -368,6 +374,10 @@ public struct SettingsView: View {
 
     private func setFallbackToDraft() {
         perform(.setFallback(snapshot.draftProfile))
+    }
+
+    private func openAutomaticBypass() {
+        openWindow(id: SettingsWindowID.automaticBypass)
     }
 
     private func importProfile(format: ImportFormat, name: String, text: String) async -> Bool {
@@ -835,6 +845,7 @@ private struct ProfileSidebar: View {
     var onCreateParametric: () -> Void
     var onDuplicate: () -> Void
     var onDelete: () -> Void
+    var onOpenAutomaticBypass: () -> Void
     var canDeleteSelectedProfile: Bool
     var isReadOnly: Bool
 
@@ -892,6 +903,16 @@ private struct ProfileSidebar: View {
             Divider()
 
             VStack(spacing: 10) {
+                Button(action: onOpenAutomaticBypass) {
+                    Label(localized("Automatic Bypass…"), systemImage: "speaker.slash")
+                        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint(Text(localized("Opens global output-device bypass settings in a separate window")))
+
+                Divider()
+
                 HStack {
                     Button {
                         onCreateGraphic31()
@@ -1353,14 +1374,6 @@ private struct EditorTab: View {
                     suffix: "dB"
                 )
                 .id("preamp:\(activeEditContextID)")
-
-                SettingRow(title: localized("Bypass")) {
-                    Toggle(localized("Bypass"), isOn: $draftProfile.isBypassed)
-                        .labelsHidden()
-                        .accessibilityLabel(Text(localized("Bypass")))
-                        .accessibilityValue(Text(draftProfile.isBypassed ? localized("On") : localized("Off")))
-                        .accessibilityHint(Text(localized("Turns equalizer processing off without changing settings")))
-                }
 
                 HeadroomRow(profile: $draftProfile, recommendedPreampDB: analysis.recommendedPreampDB)
             }
@@ -2362,6 +2375,145 @@ private struct ImportTab: View {
                 .controlSize(.large)
             }
             .cardPanel(padding: 12)
+        }
+    }
+}
+
+public struct AutomaticBypassView: View {
+    @Bindable var model: GlassEQSettingsViewModel
+    @State private var snapshot: SettingsSnapshot
+
+    public init(model: GlassEQSettingsViewModel) {
+        self._model = Bindable(wrappedValue: model)
+        _snapshot = State(initialValue: model.snapshot)
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(localized("Automatic Bypass"))
+                    .font(.title2.weight(.semibold))
+                Text(localized("GlassEQ stops processing automatically while a selected output device is active. New output devices are processed by default."))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .cardPanel(padding: 16)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    if outputDevices.isEmpty {
+                        ContentUnavailableView(
+                            localized("No Output Devices"),
+                            systemImage: "speaker.slash",
+                            description: Text(localized("No system output devices are currently available."))
+                        )
+                        .frame(maxWidth: .infinity, minHeight: 180)
+                    } else {
+                        ForEach(Array(outputDevices.enumerated()), id: \.element.uid) { index, device in
+                            if index > 0 {
+                                Divider()
+                            }
+                            Toggle(isOn: Binding(
+                                get: { snapshot.bypassedOutputDeviceUIDs.contains(device.uid) },
+                                set: { setOutputDeviceBypassed(uid: device.uid, isBypassed: $0) }
+                            )) {
+                                HStack(spacing: 12) {
+                                    Image(systemName: device.uid == snapshot.currentOutputUID
+                                        ? "speaker.wave.2.fill"
+                                        : "speaker.wave.2")
+                                        .frame(width: 22)
+                                        .foregroundStyle(device.uid == snapshot.currentOutputUID ? Color.accentColor : Color.secondary)
+                                        .accessibilityHidden(true)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        HStack(spacing: 8) {
+                                            Text(device.name)
+                                                .font(.body.weight(.medium))
+                                                .lineLimit(1)
+                                            if device.uid == snapshot.currentOutputUID {
+                                                Text(localized("Current"))
+                                                    .font(.caption2.weight(.semibold))
+                                                    .foregroundStyle(Color.accentColor)
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 2)
+                                                    .background(Color.accentColor.opacity(0.12), in: .capsule)
+                                            }
+                                        }
+                                        Text(device.uid)
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
+                                }
+                            }
+                            .toggleStyle(.switch)
+                            .disabled(snapshot.profileStoreProtection.isProtected)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 12)
+                            .accessibilityLabel(Text(device.name))
+                            .accessibilityValue(Text(snapshot.bypassedOutputDeviceUIDs.contains(device.uid)
+                                ? localized("Bypassed")
+                                : localized("Processed")))
+                            .accessibilityHint(Text(localized("Controls whether GlassEQ processes audio sent to this output device")))
+                        }
+                    }
+                }
+                .background(Color(nsColor: .controlBackgroundColor).opacity(0.58), in: .rect(cornerRadius: 14))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                }
+            }
+            .frame(maxHeight: .infinity)
+        }
+        .padding(20)
+        .frame(minWidth: 440, minHeight: 300, alignment: .topLeading)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .overlay(alignment: .bottom) {
+            if let message = model.commandErrorMessage {
+                Text(message)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Color.macOSSystemRed)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color(nsColor: .controlBackgroundColor), in: .rect(cornerRadius: 8))
+                    .padding()
+            }
+        }
+        .onChange(of: model.snapshotVersion) { _, _ in
+            snapshot = model.snapshot
+        }
+        .onChange(of: model.isConnected) { _, _ in
+            snapshot = model.snapshot
+        }
+        .onAppear {
+            snapshot = model.snapshot
+        }
+    }
+
+    private var outputDevices: [SettingsKnownOutputDeviceDTO] {
+        let knownUIDs = Set(snapshot.knownOutputDevices.map(\.uid))
+        let unavailableBypassedDevices = snapshot.bypassedOutputDeviceUIDs
+            .filter { !knownUIDs.contains($0) }
+            .map {
+                SettingsKnownOutputDeviceDTO(
+                    name: localized("Unavailable output device"),
+                    uid: $0
+                )
+            }
+        return snapshot.knownOutputDevices + unavailableBypassedDevices
+    }
+
+    private func setOutputDeviceBypassed(uid: String, isBypassed: Bool) {
+        snapshot.bypassedOutputDeviceUIDs.removeAll { $0 == uid }
+        if isBypassed {
+            snapshot.bypassedOutputDeviceUIDs.append(uid)
+        }
+        Task { @MainActor in
+            await model.perform(.setOutputDeviceBypassed(uid: uid, isBypassed: isBypassed))
+            snapshot = model.snapshot
         }
     }
 }

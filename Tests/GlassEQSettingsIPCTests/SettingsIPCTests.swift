@@ -310,6 +310,38 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func setOutputDeviceBypassedCommandRoundTrips() throws {
+        let message = SettingsPipeMessage.request(
+            sessionToken: "token",
+            id: "request-bypass-output",
+            kind: .command,
+            command: .setOutputDeviceBypassed(uid: "built-in-speakers", isBypassed: true)
+        )
+
+        let decoded = try SettingsPipeCodec.decodeLine(
+            Data(try SettingsPipeCodec.encodeLine(message).dropLast())
+        )
+
+        #expect(decoded == message)
+    }
+
+    @Test
+    func setGlobalBypassCommandRoundTrips() throws {
+        let message = SettingsPipeMessage.request(
+            sessionToken: "token",
+            id: "request-global-bypass",
+            kind: .command,
+            command: .setBypassed(true)
+        )
+
+        let decoded = try SettingsPipeCodec.decodeLine(
+            Data(try SettingsPipeCodec.encodeLine(message).dropLast())
+        )
+
+        #expect(decoded == message)
+    }
+
+    @Test
     func profileMoveUsesTheDestinationPositionInEitherDirection() {
         let first = EQProfile(name: "First", mode: .parametric, filters: [])
         let second = EQProfile(name: "Second", mode: .parametric, filters: [])
@@ -706,6 +738,9 @@ struct SettingsIPCTests {
                 bufferFrameSize: 256
             ),
             currentOutputMappedProfileID: .set(profileID),
+            knownOutputDevices: [SettingsKnownOutputDeviceDTO(name: "DAC", uid: "dac")],
+            isBypassed: true,
+            bypassedOutputDeviceUIDs: ["dac"],
             profileStoreProtection: SettingsProfileStoreProtectionDTO(
                 isProtected: true,
                 message: "Newer store",
@@ -736,6 +771,28 @@ struct SettingsIPCTests {
     }
 
     @Test
+    func snapshotDecodeDefaultsMissingGlobalAndDeviceBypassFields() throws {
+        var snapshot = SettingsSnapshotDTO.disconnected
+        snapshot.knownOutputDevices = [SettingsKnownOutputDeviceDTO(name: "DAC", uid: "dac")]
+        snapshot.isBypassed = true
+        snapshot.bypassedOutputDeviceUIDs = ["dac"]
+        let encoded = try JSONEncoder().encode(snapshot)
+        var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "knownOutputDevices")
+        object.removeValue(forKey: "isBypassed")
+        object.removeValue(forKey: "bypassedOutputDeviceUIDs")
+
+        let decoded = try JSONDecoder().decode(
+            SettingsSnapshotDTO.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+
+        #expect(decoded.knownOutputDevices.isEmpty)
+        #expect(!decoded.isBypassed)
+        #expect(decoded.bypassedOutputDeviceUIDs.isEmpty)
+    }
+
+    @Test
     @MainActor
     func snapshotPatchUpdatesRunningState() {
         let model = GlassEQSettingsViewModel()
@@ -745,6 +802,20 @@ struct SettingsIPCTests {
 
         model.accept(patch: SettingsSnapshotPatchDTO(isRunning: false))
         #expect(!model.snapshot.isRunning)
+    }
+
+    @Test
+    @MainActor
+    func snapshotPatchUpdatesGlobalAndDeviceBypassState() {
+        let model = GlassEQSettingsViewModel()
+
+        model.accept(patch: SettingsSnapshotPatchDTO(
+            isBypassed: true,
+            bypassedOutputDeviceUIDs: ["dac"]
+        ))
+
+        #expect(model.snapshot.isBypassed)
+        #expect(model.snapshot.bypassedOutputDeviceUIDs == ["dac"])
     }
 
     @Test

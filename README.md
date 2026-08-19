@@ -59,6 +59,7 @@ The result is low, predictable latency. The built-in diagnostics report it direc
 - **Live frequency-response graph** and instant preview while you edit.
 - **Profile import** from AutoEQ / EqualizerAPO and REW text, allowing you to paste a headphone-correction curve straight in.
 - **Per-output profile mapping** by Core Audio device UID, with a fallback profile for unmapped devices.
+- **Global and per-output bypass:** disable GlassEQ as a whole, or configure automatic bypass for devices that should use the unprocessed system signal from a dedicated Settings window.
 - **Soft-clip saturation** that tames overshoot instead of hard-clipping.
 - **Built-in diagnostics** for frame loss, underruns, adaptive buffer occupancy, clock correction, and latency.
 
