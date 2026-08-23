@@ -20,6 +20,9 @@ struct GlassEQAppModelLifecycleTests {
         model.isRunning = true
         #expect(model.menuBarTitle == profile.name)
 
+        model.setFlattened(true)
+        #expect(model.menuBarTitle == "\(profile.name) (F)")
+
         model.profileStore.isBypassed = true
         #expect(model.menuBarTitle == localized("Bypass"))
 
@@ -330,6 +333,89 @@ struct GlassEQAppModelLifecycleTests {
                 && engine.startCalls.count == 3
         }
         #expect(model.activeProfile == selectedProfile)
+    }
+
+    @Test
+    func menuBarFlattenTemporarilyUpdatesDSPWithoutChangingTheStoredProfile() async {
+        let profile = EQProfile(
+            name: "Listening Profile",
+            mode: .parametric,
+            preampDB: -4.5,
+            filters: [
+                EQFilter(kind: .peak, frequency: 1_000, gainDB: 6, q: 1),
+                EQFilter(kind: .highPass, frequency: 30, q: 0.7)
+            ]
+        )
+        let output = makeOutput(uid: "flatten-output", name: "Flatten Output")
+        let store = ProfileStore(profiles: [profile], fallbackProfileID: profile.id)
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output)),
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        model.setFlattened(true)
+
+        #expect(model.isFlattened)
+        #expect(model.activeProfile == profile)
+        #expect(model.profileStore == store)
+        #expect(engine.updateDSPCalls == [profile.flattenedPreservingPreamp])
+        #expect(engine.updateDSPCalls[0].preampDB == profile.preampDB)
+
+        model.setFlattened(false)
+
+        #expect(!model.isFlattened)
+        #expect(model.activeProfile == profile)
+        #expect(model.profileStore == store)
+        #expect(engine.updateDSPCalls == [profile.flattenedPreservingPreamp, profile])
+    }
+
+    @Test
+    func profileSelectionRemainsFlattenedUntilTheCheckboxIsCleared() async {
+        var first = makeProfile(name: "First")
+        first.preampDB = -2
+        first.filters = [EQFilter(kind: .peak, frequency: 500, gainDB: 4, q: 1)]
+        var second = makeProfile(name: "Second")
+        second.preampDB = -6
+        second.filters = [EQFilter(kind: .highShelf, frequency: 8_000, gainDB: -5, q: 0.7)]
+        let output = makeOutput(uid: "flatten-selection-output", name: "Flatten Selection Output")
+        let store = ProfileStore(profiles: [first, second], fallbackProfileID: first.id)
+        let engine = FakeAudioEngine()
+        let observers = FakeDefaultOutputObserverFactory()
+        let model = makeModel(
+            store: store,
+            engine: engine,
+            lookup: FakeDefaultOutputLookup(.success(output)),
+            observers: observers,
+            outputDelay: .zero
+        )
+
+        model.start()
+        observers.observers[0].emit(.success(output))
+        await waitUntil {
+            model.lifecycleState == .running && engine.startCalls.count == 1
+        }
+
+        model.setFlattened(true)
+        model.applyProfileSelection(second.id)
+
+        #expect(model.isFlattened)
+        #expect(model.activeProfile == second)
+        #expect(model.profileStore.profiles == [first, second])
+        #expect(engine.updateDSPCalls == [
+            first.flattenedPreservingPreamp,
+            second.flattenedPreservingPreamp
+        ])
     }
 
     @Test

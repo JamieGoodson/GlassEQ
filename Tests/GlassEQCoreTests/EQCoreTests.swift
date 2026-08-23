@@ -6,6 +6,63 @@ import Testing
 @Suite
 struct EQCoreTests {
     @Test
+    func flattenedProfilePreservesPreampsAndProducesAFlatResponse() {
+        let profile = EQProfile(
+            name: "Stereo profile",
+            mode: .parametric,
+            channelMode: .stereo,
+            preampDB: -3,
+            filters: [
+                EQFilter(kind: .peak, frequency: 1_000, gainDB: 6, q: 1),
+                EQFilter(kind: .highPass, frequency: 30, q: 0.7)
+            ],
+            leftPreampDB: -4,
+            leftFilters: [EQFilter(kind: .lowShelf, frequency: 100, gainDB: 5, q: 0.8)],
+            rightPreampDB: -5,
+            rightFilters: [EQFilter(kind: .lowPass, frequency: 18_000, q: 0.7)]
+        )
+
+        let flattened = profile.flattenedPreservingPreamp
+
+        #expect(flattened.id == profile.id)
+        #expect(flattened.name == profile.name)
+        #expect(flattened.preampDB == -3)
+        #expect(flattened.leftPreampDB == -4)
+        #expect(flattened.rightPreampDB == -5)
+        #expect((flattened.filters + flattened.leftFilters + flattened.rightFilters).allSatisfy {
+            $0.gainDB == 0
+        })
+        #expect(flattened.filters[0].isEnabled)
+        #expect(flattened.filters[1].isEnabled)
+        #expect(flattened.rightFilters[0].isEnabled)
+        #expect(profile.filters[0].gainDB == 6)
+
+        let flattenedFilters = flattened.filters + flattened.leftFilters + flattened.rightFilters
+        for filter in flattenedFilters {
+            let coefficients = BiquadCoefficients.make(filter: filter, sampleRate: 48_000)
+            for frequency in [20.0, 1_000, 20_000] {
+                #expect(abs(FrequencyResponse.magnitudeDB(
+                    for: coefficients,
+                    frequency: frequency,
+                    sampleRate: 48_000
+                )) < 0.000_000_001)
+            }
+        }
+
+        let originalConfiguration = EQRenderConfiguration(
+            profile: profile,
+            sampleRate: 48_000,
+            channelCount: 2
+        )
+        let flattenedConfiguration = EQRenderConfiguration(
+            profile: flattened,
+            sampleRate: 48_000,
+            channelCount: 2
+        )
+        #expect(flattenedConfiguration.hasRealtimeCompatibleTopology(with: originalConfiguration))
+    }
+
+    @Test
     func peakFilterBoostsNearCenterFrequency() {
         let filter = EQFilter(kind: .peak, frequency: 1_000, gainDB: 6, q: 1)
         let coefficients = BiquadCoefficients.make(filter: filter, sampleRate: 48_000)

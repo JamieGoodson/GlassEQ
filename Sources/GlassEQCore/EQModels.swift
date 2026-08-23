@@ -142,6 +142,28 @@ public struct EQProfile: Codable, Equatable, Identifiable, Sendable {
             EQFilter(kind: .peak, frequency: $0, gainDB: 0, q: GraphicEQBands.graphicQ)
         }
     )
+
+    /// Returns a temporary flat-response copy while preserving the profile's preamp values.
+    public var flattenedPreservingPreamp: EQProfile {
+        var profile = self
+        profile.filters = profile.filters.map(\.flattened)
+        profile.leftFilters = profile.leftFilters.map(\.flattened)
+        profile.rightFilters = profile.rightFilters.map(\.flattened)
+        return profile
+    }
+}
+
+private extension EQFilter {
+    var flattened: EQFilter {
+        var filter = self
+        filter.gainDB = 0
+        if filter.isEnabled && (filter.kind == .highPass || filter.kind == .lowPass) {
+            // A zero-gain peak is an identity filter. Using it for pass filters keeps the
+            // enabled-filter topology stable, so the realtime engine can hot-swap the profile.
+            filter.kind = .peak
+        }
+        return filter
+    }
 }
 
 public enum GraphicEQBands {

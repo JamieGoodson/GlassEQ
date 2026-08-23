@@ -530,6 +530,7 @@ final class GlassEQAppModel {
     var isRunning = false
     // A menu-bar exception for the current output visit. The persisted automatic rule remains on.
     private(set) var temporarilyEnabledOutputUID: String?
+    private(set) var isFlattened = false
     var activeProfile: EQProfile
     var profileStore: ProfileStore
     var selectedProfileID: UUID
@@ -593,6 +594,7 @@ final class GlassEQAppModel {
     private struct ProfileRollback: Sendable {
         var profileStore: ProfileStore
         var activeProfile: EQProfile
+        var isFlattened: Bool
         var selectedProfileID: UUID
         var draftProfile: EQProfile
         var previewReturnProfile: EQProfile?
@@ -600,9 +602,11 @@ final class GlassEQAppModel {
 
     private struct EngineProfileConfirmation: Sendable {
         var activeProfile: EQProfile
+        var isFlattened: Bool
 
         init(_ rollback: ProfileRollback) {
             activeProfile = rollback.activeProfile
+            isFlattened = rollback.isFlattened
         }
     }
 
@@ -625,6 +629,8 @@ final class GlassEQAppModel {
         var attemptedDraftProfile: EQProfile
         var previousPreviewReturnProfile: EQProfile?
         var attemptedPreviewReturnProfile: EQProfile?
+        var previousIsFlattened: Bool
+        var attemptedIsFlattened: Bool
         var mappingChanges: [MappingChange]
 
         init(profileID: UUID, previous: ProfileRollback?, attempted: ProfileRollback) {
@@ -633,6 +639,7 @@ final class GlassEQAppModel {
             attemptedSelectedProfileID = attempted.selectedProfileID
             attemptedDraftProfile = attempted.draftProfile
             attemptedPreviewReturnProfile = attempted.previewReturnProfile
+            attemptedIsFlattened = attempted.isFlattened
 
             guard let previous else {
                 previousProfile = attemptedProfile
@@ -640,6 +647,7 @@ final class GlassEQAppModel {
                 previousSelectedProfileID = attempted.selectedProfileID
                 previousDraftProfile = attempted.draftProfile
                 previousPreviewReturnProfile = attempted.previewReturnProfile
+                previousIsFlattened = attempted.isFlattened
                 mappingChanges = []
                 return
             }
@@ -648,6 +656,7 @@ final class GlassEQAppModel {
             previousSelectedProfileID = previous.selectedProfileID
             previousDraftProfile = previous.draftProfile
             previousPreviewReturnProfile = previous.previewReturnProfile
+            previousIsFlattened = previous.isFlattened
             let outputUIDs = Set(previous.profileStore.outputMappings.map(\.outputDeviceUID))
                 .union(attempted.profileStore.outputMappings.map(\.outputDeviceUID))
             mappingChanges = outputUIDs.compactMap { outputUID in
@@ -909,7 +918,10 @@ final class GlassEQAppModel {
     }
 
     var menuBarTitle: String {
-        isRunning && !isProcessingBypassed ? activeProfile.name : localized("Bypass")
+        guard isRunning && !isProcessingBypassed else {
+            return localized("Bypass")
+        }
+        return isFlattened ? "\(activeProfile.name) (F)" : activeProfile.name
     }
 
     var menuBarAccessibilityLabel: String {
@@ -1118,6 +1130,16 @@ final class GlassEQAppModel {
         } catch {
             reportProfileActionFailure(error)
         }
+    }
+
+    func setFlattened(_ isFlattened: Bool) {
+        guard self.isFlattened != isFlattened else {
+            return
+        }
+        let rollback = profileRollback()
+        self.isFlattened = isFlattened
+        synchronizeActiveProfileProcessing(rollback: rollback)
+        notifyModelDidChange()
     }
 
     func applyDraft() {
@@ -1387,7 +1409,7 @@ final class GlassEQAppModel {
             disableActiveProfileProcessing(updateMetrics: true)
         } else if hasPendingProfileReplacingEngineWork {
             reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
-        } else if engine.updateDSP(profile: profile) {
+        } else if engine.updateDSP(profile: activeProcessingProfile) {
             confirmedEngineProfileState.confirm(EngineProfileConfirmation(profileRollback()))
             statusMessage = localized("Previewing settings for \(profile.name)")
         } else {
@@ -1414,7 +1436,7 @@ final class GlassEQAppModel {
             disableActiveProfileProcessing(updateMetrics: true)
         } else if hasPendingProfileReplacingEngineWork {
             reschedulePendingEngineStartWithActiveProfile(rollback: rollback)
-        } else if engine.updateDSP(profile: profile) {
+        } else if engine.updateDSP(profile: activeProcessingProfile) {
             confirmedEngineProfileState.confirm(EngineProfileConfirmation(profileRollback()))
             statusMessage = processingStatus(outputName: currentOutputName, profileName: profile.name)
         } else {
@@ -1643,6 +1665,7 @@ final class GlassEQAppModel {
         ProfileRollback(
             profileStore: profileStore,
             activeProfile: activeProfile,
+            isFlattened: isFlattened,
             selectedProfileID: selectedProfileID,
             draftProfile: draftProfile,
             previewReturnProfile: previewReturnProfile
@@ -1657,7 +1680,7 @@ final class GlassEQAppModel {
         }
 
         statusMessage = localized("Reconnecting audio output...")
-        scheduleEngineWork(.restart(profile: activeProfile, rollback: rollback))
+        scheduleEngineWork(.restart(profile: activeProcessingProfile, rollback: rollback))
         notifyModelDidChange()
     }
 
@@ -1763,7 +1786,7 @@ final class GlassEQAppModel {
             if isProcessingBypassed {
                 disableActiveProfileProcessing(updateMetrics: false)
             } else {
-                scheduleEngineWork(.start(output: output, profile: activeProfile, rollback: rollback))
+                scheduleEngineWork(.start(output: output, profile: activeProcessingProfile, rollback: rollback))
             }
         case .failure(let error):
             if lifecycleState == .waking {
@@ -1854,7 +1877,7 @@ final class GlassEQAppModel {
 
         startObserver(sendInitialValue: false)
         if isRunning {
-            if engine.updateDSP(profile: activeProfile) {
+            if engine.updateDSP(profile: activeProcessingProfile) {
                 confirmedEngineProfileState.confirm(EngineProfileConfirmation(profileRollback()))
                 statusMessage = processingStatus(outputName: currentOutputName, profileName: activeProfile.name)
             } else {
@@ -2092,6 +2115,7 @@ final class GlassEQAppModel {
     private func restoreProfileRollback(_ rollback: ProfileRollback, persist: Bool) {
         profileStore = rollback.profileStore
         activeProfile = rollback.activeProfile
+        isFlattened = rollback.isFlattened
         selectedProfileID = rollback.selectedProfileID
         draftProfile = rollback.draftProfile
         previewReturnProfile = rollback.previewReturnProfile
@@ -2148,6 +2172,9 @@ final class GlassEQAppModel {
             if previewReturnProfile == failedAttempt.attemptedPreviewReturnProfile {
                 previewReturnProfile = failedAttempt.previousPreviewReturnProfile
             }
+            if isFlattened == failedAttempt.attemptedIsFlattened {
+                isFlattened = failedAttempt.previousIsFlattened
+            }
         }
         let confirmation = reconciliation.confirmation
         let profileIDs = Set(profileStore.profiles.map(\.id))
@@ -2159,6 +2186,7 @@ final class GlassEQAppModel {
             profileStore.fallbackProfileID = storedConfirmation.id
         }
         activeProfile = confirmation.activeProfile
+        isFlattened = confirmation.isFlattened
         if !profileStore.profiles.contains(where: { $0.id == selectedProfileID }) {
             selectedProfileID = storedConfirmation.id
         }
@@ -2180,10 +2208,14 @@ final class GlassEQAppModel {
             return
         }
         if let output = pendingEngineStartOutput {
-            scheduleEngineWork(.start(output: output, profile: activeProfile, rollback: rollback))
+            scheduleEngineWork(.start(output: output, profile: activeProcessingProfile, rollback: rollback))
         } else {
-            scheduleEngineWork(.restart(profile: activeProfile, rollback: rollback))
+            scheduleEngineWork(.restart(profile: activeProcessingProfile, rollback: rollback))
         }
+    }
+
+    private var activeProcessingProfile: EQProfile {
+        isFlattened ? activeProfile.flattenedPreservingPreamp : activeProfile
     }
 
     private var hasPendingProfileReplacingEngineWork: Bool {
@@ -2729,18 +2761,30 @@ private struct MenuBarView: View {
                 Text(localized("Profile"))
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                Picker(localized("Profile"), selection: Binding(
-                    get: { model.activeProfile.id },
-                    set: { model.applyProfileSelection($0) }
-                )) {
-                    ForEach(model.profileStore.profiles) { profile in
-                        Text(profile.name).tag(profile.id)
+                HStack(spacing: 12) {
+                    Picker(localized("Profile"), selection: Binding(
+                        get: { model.activeProfile.id },
+                        set: { model.applyProfileSelection($0) }
+                    )) {
+                        ForEach(model.profileStore.profiles) { profile in
+                            Text(profile.name).tag(profile.id)
+                        }
                     }
+                    .labelsHidden()
+                    .accessibilityLabel(Text(localized("Profile")))
+                    .accessibilityValue(Text(model.activeProfile.name))
+                    .accessibilityHint(Text(localized("Applies the selected profile")))
+
+                    Toggle(localized("Flatten"), isOn: Binding(
+                        get: { model.isFlattened },
+                        set: { model.setFlattened($0) }
+                    ))
+                    .toggleStyle(.checkbox)
+                    .fixedSize()
+                    .accessibilityHint(Text(localized("Temporarily sets EQ adjustments to zero while keeping the preamp unchanged")))
+
+                    Spacer(minLength: 0)
                 }
-                .labelsHidden()
-                .accessibilityLabel(Text(localized("Profile")))
-                .accessibilityValue(Text(model.activeProfile.name))
-                .accessibilityHint(Text(localized("Applies the selected profile")))
             }
 
             HStack(spacing: 10) {
