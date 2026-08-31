@@ -13,6 +13,8 @@ let package = Package(
         .library(name: "GlassEQAudio", targets: ["GlassEQAudio"]),
         .library(name: "GlassEQSettingsIPC", targets: ["GlassEQSettingsIPC"]),
         .library(name: "GlassEQSettingsUI", targets: ["GlassEQSettingsUI"]),
+        .library(name: "GlassEQMenuBarUI", targets: ["GlassEQMenuBarUI"]),
+        .library(name: "GlassEQAppPreviews", targets: ["GlassEQAppPreviews"]),
         .executable(name: "GlassEQ", targets: ["GlassEQApp"]),
         .executable(name: "GlassEQSettings", targets: ["GlassEQSettings"]),
         .executable(name: "GlassEQDiagnostics", targets: ["GlassEQDiagnostics"])
@@ -48,11 +50,19 @@ let package = Package(
                 .linkedFramework("Security")
             ]
         ),
+        .target(
+            name: "GlassEQMenuBarUI",
+            linkerSettings: [
+                .linkedFramework("SwiftUI"),
+                .linkedFramework("AppKit")
+            ]
+        ),
         .executableTarget(
             name: "GlassEQApp",
             dependencies: [
                 "GlassEQCore",
                 "GlassEQAudio",
+                "GlassEQMenuBarUI",
                 "GlassEQSettingsIPC",
                 "GlassEQSettingsUI"
             ],
@@ -67,6 +77,13 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("Security"),
                 .linkedFramework("UserNotifications")
+            ]
+        ),
+        .target(
+            name: "GlassEQAppPreviews",
+            dependencies: ["GlassEQMenuBarUI"],
+            linkerSettings: [
+                .linkedFramework("SwiftUI")
             ]
         ),
         .executableTarget(

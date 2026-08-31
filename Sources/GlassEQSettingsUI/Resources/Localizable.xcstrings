@@ -1,6 +1,612 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "" : {
+
+    },
+    "%@ / %@ frames" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ / %2$@ frames"
+          }
+        }
+      }
+    },
+    "%@ dB" : {
+
+    },
+    "%@ enabled filter above %@ is inactive on this route" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ enabled filter above %2$@ is inactive on this route"
+          }
+        }
+      }
+    },
+    "%@ enabled filters above %@ are inactive on this route" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ enabled filters above %2$@ are inactive on this route"
+          }
+        }
+      }
+    },
+    "%@ frame" : {
+
+    },
+    "%@ frames" : {
+
+    },
+    "%@ Hz" : {
+
+    },
+    "%@ kHz" : {
+
+    },
+    "%@ ms" : {
+
+    },
+    "%@ ppm" : {
+
+    },
+    "%@ profile, %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ profile, %2$@"
+          }
+        }
+      }
+    },
+    "%@ value" : {
+
+    },
+    "%@, %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@, %2$@"
+          }
+        }
+      }
+    },
+    "%@, %@, %@, %@, Q %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@, %2$@, %3$@, %4$@, Q %5$@"
+          }
+        }
+      }
+    },
+    "%@. %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@. %2$@"
+          }
+        }
+      }
+    },
+    "10-Band" : {
+
+    },
+    "31-Band" : {
+
+    },
+    "Active" : {
+
+    },
+    "Active Profile" : {
+
+    },
+    "Adaptive Render Failures" : {
+
+    },
+    "Add Filter" : {
+
+    },
+    "Added Latency" : {
+
+    },
+    "Adds a new parametric filter and selects it" : {
+
+    },
+    "Adjusts %@" : {
+
+    },
+    "Adjusts this graphic EQ band" : {
+
+    },
+    "All changes saved" : {
+
+    },
+    "Applies the recommended preamp to avoid clipping" : {
+
+    },
+    "Apply" : {
+
+    },
+    "Assign to current output" : {
+
+    },
+    "AutoEQ / EqualizerAPO" : {
+
+    },
+    "Automatic Bypass" : {
+
+    },
+    "Automatic Bypass…" : {
+
+    },
+    "Available" : {
+
+    },
+    "Buffer" : {
+
+    },
+    "Buffer Renegotiations" : {
+
+    },
+    "Buffered" : {
+
+    },
+    "Bypassed" : {
+
+    },
+    "Capture Callback Peak" : {
+
+    },
+    "Captured" : {
+
+    },
+    "Changes the equalizer profile type" : {
+
+    },
+    "Changes the selected filter type" : {
+
+    },
+    "Channels" : {
+
+    },
+    "Chooses whether channels share one EQ or use separate left and right settings" : {
+
+    },
+    "Chooses which stereo channel is being edited" : {
+
+    },
+    "Clear" : {
+
+    },
+    "Click to type a value" : {
+
+    },
+    "Clock Correction" : {
+
+    },
+    "Clock Correction Limit" : {
+
+    },
+    "Controls whether GlassEQ processes audio sent to this output device" : {
+
+    },
+    "Copies the selected profile" : {
+
+    },
+    "Creates a 10-band graphic equalizer profile" : {
+
+    },
+    "Creates a 31-band graphic equalizer profile" : {
+
+    },
+    "Creates a parametric equalizer profile" : {
+
+    },
+    "Current" : {
+
+    },
+    "Current Output" : {
+
+    },
+    "Delete filter" : {
+
+    },
+    "Delete profile" : {
+
+    },
+    "Deletes the selected profile" : {
+
+    },
+    "Diagnostics" : {
+
+    },
+    "Disabled" : {
+
+    },
+    "Done" : {
+
+    },
+    "Dropped Buffered" : {
+
+    },
+    "Dropped Input" : {
+
+    },
+    "Duplicate profile" : {
+
+    },
+    "Editing" : {
+
+    },
+    "Editing channel" : {
+
+    },
+    "Editor" : {
+
+    },
+    "Edits %@ as text" : {
+
+    },
+    "Edits the selected profile name" : {
+
+    },
+    "Enabled" : {
+
+    },
+    "Engine Status" : {
+
+    },
+    "Export Current" : {
+
+    },
+    "Fallback" : {
+
+    },
+    "Filter %@" : {
+
+    },
+    "Filter enabled" : {
+
+    },
+    "Filter type" : {
+
+    },
+    "Filters" : {
+
+    },
+    "Forget the learned callback size for this output device and calibrate it again" : {
+
+    },
+    "Format" : {
+
+    },
+    "Freq" : {
+
+    },
+    "Frequency" : {
+
+    },
+    "Frequency Response" : {
+
+    },
+    "Frequency response graph" : {
+
+    },
+    "Gain" : {
+
+    },
+    "Gain at %@" : {
+
+    },
+    "GlassEQ stops processing automatically while a selected output device is active. New output devices are processed by default." : {
+
+    },
+    "Graphic filter row" : {
+
+    },
+    "Headroom" : {
+
+    },
+    "High" : {
+
+    },
+    "High Pass" : {
+
+    },
+    "High Shelf" : {
+
+    },
+    "Import" : {
+
+    },
+    "Import / Export" : {
+
+    },
+    "Imported Profile" : {
+
+    },
+    "Importing" : {
+
+    },
+    "Inactive" : {
+
+    },
+    "Includes or bypasses this filter" : {
+
+    },
+    "Latency Range" : {
+
+    },
+    "Left" : {
+
+    },
+    "Left curve from %@ to %@; right curve from %@ to %@; recommended preamp %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Left curve from %1$@ to %2$@; right curve from %3$@ to %4$@; recommended preamp %5$@"
+          }
+        }
+      }
+    },
+    "Linked" : {
+
+    },
+    "Linked curve from %@ to %@; recommended preamp %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Linked curve from %1$@ to %2$@; recommended preamp %3$@"
+          }
+        }
+      }
+    },
+    "Low" : {
+
+    },
+    "Low Pass" : {
+
+    },
+    "Low Shelf" : {
+
+    },
+    "Mapped Profile" : {
+
+    },
+    "Mapped to current output" : {
+
+    },
+    "Maps the selected profile to the current output device" : {
+
+    },
+    "New 10-band profile" : {
+
+    },
+    "New 31-band profile" : {
+
+    },
+    "New parametric profile" : {
+
+    },
+    "No current output is available" : {
+
+    },
+    "No Filter Selected" : {
+
+    },
+    "No Output Devices" : {
+
+    },
+    "No samples" : {
+
+    },
+    "No system output devices are currently available." : {
+
+    },
+    "Not previewing" : {
+
+    },
+    "Not reached" : {
+
+    },
+    "Not selected" : {
+
+    },
+    "Off" : {
+
+    },
+    "OK" : {
+
+    },
+    "On" : {
+
+    },
+    "Open Import Editor" : {
+
+    },
+    "Open Privacy Settings" : {
+
+    },
+    "Opens global output-device bypass settings in a separate window" : {
+
+    },
+    "Output" : {
+
+    },
+    "Output Callback Peak" : {
+
+    },
+    "Output Timing Gaps" : {
+
+    },
+    "Parametric" : {
+
+    },
+    "Peak" : {
+
+    },
+    "Peak Buffer" : {
+
+    },
+    "Played" : {
+
+    },
+    "Preamp" : {
+
+    },
+    "Preview" : {
+
+    },
+    "Previewing" : {
+
+    },
+    "Processed" : {
+
+    },
+    "Profile edit state" : {
+
+    },
+    "Profile Mapping" : {
+
+    },
+    "Profile name" : {
+
+    },
+    "Profile Name" : {
+
+    },
+    "Profile summary" : {
+
+    },
+    "Profile type" : {
+
+    },
+    "Q" : {
+
+    },
+    "Reached" : {
+
+    },
+    "Recommend %@" : {
+
+    },
+    "Removes the selected filter" : {
+
+    },
+    "Rename profile" : {
+
+    },
+    "Reset buffer calibration for this device" : {
+
+    },
+    "Reset metrics" : {
+
+    },
+    "Retry audio engine" : {
+
+    },
+    "Revert" : {
+
+    },
+    "REW" : {
+
+    },
+    "Right" : {
+
+    },
+    "Ring Gate Failures" : {
+
+    },
+    "Ring Peak" : {
+
+    },
+    "Sample Rate" : {
+
+    },
+    "Sample Rate Conversion" : {
+
+    },
+    "Saturated Samples" : {
+
+    },
+    "Section" : {
+
+    },
+    "Selected" : {
+
+    },
+    "Selected Filter" : {
+
+    },
+    "Selects this filter for editing" : {
+
+    },
+    "Selects this profile for editing. Drag to reorder profiles." : {
+
+    },
+    "Separate L/R" : {
+
+    },
+    "Separate left and right" : {
+
+    },
+    "Servo Buffer" : {
+
+    },
+    "Set as fallback profile" : {
+
+    },
+    "Shows the estimated gain curve from 20 Hz to %@" : {
+
+    },
+    "Status" : {
+
+    },
+    "Stop Preview" : {
+
+    },
+    "Switch away from the active profile before deleting it" : {
+
+    },
+    "Switches between editor, import, and output details" : {
+
+    },
+    "Type" : {
+
+    },
+    "UID" : {
+
+    },
+    "Unavailable for active profile" : {
+
+    },
+    "Unavailable output device" : {
+
+    },
+    "Underruns" : {
+
+    },
+    "Unknown" : {
+
+    },
+    "Unsaved changes" : {
+
+    },
+    "Use for this output" : {
+
+    }
   },
   "version" : "1.0"
 }

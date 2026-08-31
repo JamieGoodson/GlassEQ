@@ -1,6 +1,7 @@
 import AppKit
 import GlassEQAudio
 import GlassEQCore
+import GlassEQMenuBarUI
 import GlassEQSettingsIPC
 import GlassEQSettingsUI
 import SwiftUI
@@ -2747,103 +2748,22 @@ final class GlassEQAppModel {
 
 private struct MenuBarView: View {
     @Bindable var model: GlassEQAppModel
-    @Environment(\.dismiss) private var dismiss
-    @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            header
-            Divider()
-
-            popoverValue(title: localized("Output"), value: model.currentOutputName)
-
-            VStack(alignment: .leading, spacing: 5) {
-                Text(localized("Profile"))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                HStack(spacing: 12) {
-                    Picker(localized("Profile"), selection: Binding(
-                        get: { model.activeProfile.id },
-                        set: { model.applyProfileSelection($0) }
-                    )) {
-                        ForEach(model.profileStore.profiles) { profile in
-                            Text(profile.name).tag(profile.id)
-                        }
-                    }
-                    .labelsHidden()
-                    .accessibilityLabel(Text(localized("Profile")))
-                    .accessibilityValue(Text(model.activeProfile.name))
-                    .accessibilityHint(Text(localized("Applies the selected profile")))
-
-                    Toggle(localized("Flatten"), isOn: Binding(
-                        get: { model.isFlattened },
-                        set: { model.setFlattened($0) }
-                    ))
-                    .toggleStyle(.checkbox)
-                    .fixedSize()
-                    .accessibilityHint(Text(localized("Temporarily sets EQ adjustments to zero while keeping the preamp unchanged")))
-
-                    Spacer(minLength: 0)
-                }
-            }
-
-            HStack(spacing: 10) {
-                Toggle(isOn: processingEnabled) {
-                    EmptyView()
-                }
-                    .toggleStyle(.switch)
-                    .controlSize(.large)
-                    .accessibilityHint(Text(localized("Temporarily enables an automatically bypassed output without changing its saved rule")))
-
-                Button {
-                    dismiss()
-                    model.openSettings()
-                } label: {
-                    Label(localized("Settings"), systemImage: "slider.horizontal.3")
-                        .frame(minWidth: 86, minHeight: 28)
-                        .contentShape(.rect)
-                }
-                .controlSize(.large)
-                .buttonStyle(.glass)
-
-                Button(role: .destructive) {
-                    model.requestQuit()
-                } label: {
-                    Label(localized("Quit"), systemImage: "power")
-                        .frame(minWidth: 58, minHeight: 28)
-                        .contentShape(.rect)
-                }
-                .controlSize(.large)
-                .buttonStyle(.glass)
-                .tint(popoverControlsAreActive ? .macOSSystemRed : nil)
-            }
-        }
-        .padding()
-        .background { PopoverGlassConfigurator() }
-    }
-
-    private var header: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(localized("GlassEQ"))
-                    .font(.title3.weight(.semibold))
-                Text(AppBuildInfo.displayVersion)
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Text(statusBadgeTitle)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(statusBadgeColor)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    statusBadgeColor.opacity(0.12),
-                    in: .capsule
-                )
-                .accessibilityLabel(Text(localized("Menu bar state")))
-                .accessibilityValue(Text(statusBadgeTitle))
-        }
+        GlassEQMenuBarPanel(
+            presentation: presentation,
+            selectedProfileID: Binding(
+                get: { model.activeProfile.id },
+                set: { model.applyProfileSelection($0) }
+            ),
+            isFlattened: Binding(
+                get: { model.isFlattened },
+                set: { model.setFlattened($0) }
+            ),
+            processingEnabled: processingEnabled,
+            onSettings: { _ = model.openSettings() },
+            onQuit: model.requestQuit
+        )
     }
 
     private var statusBadgeTitle: String {
@@ -2856,8 +2776,26 @@ private struct MenuBarView: View {
         return model.isRunning ? localized("Active") : localized("Stopped")
     }
 
-    private var statusBadgeColor: Color {
-        model.isRunning && !model.isProcessingBypassed ? .macOSSystemGreen : .macOSSystemRed
+    private var presentation: GlassEQMenuBarPresentation {
+        GlassEQMenuBarPresentation(
+            appName: localized("GlassEQ"),
+            version: AppBuildInfo.displayVersion,
+            outputTitle: localized("Output"),
+            outputName: model.currentOutputName,
+            profileTitle: localized("Profile"),
+            profiles: model.profileStore.profiles.map {
+                GlassEQMenuBarProfile(id: $0.id, name: $0.name)
+            },
+            flattenTitle: localized("Flatten"),
+            settingsTitle: localized("Settings"),
+            quitTitle: localized("Quit"),
+            statusTitle: statusBadgeTitle,
+            statusTint: model.isRunning && !model.isProcessingBypassed ? .active : .inactive,
+            menuBarStateAccessibilityLabel: localized("Menu bar state"),
+            profileAccessibilityHint: localized("Applies the selected profile"),
+            flattenAccessibilityHint: localized("Temporarily sets EQ adjustments to zero while keeping the preamp unchanged"),
+            processingAccessibilityHint: localized("Temporarily enables an automatically bypassed output without changing its saved rule")
+        )
     }
 
     private var processingEnabled: Binding<Bool> {
@@ -2873,64 +2811,4 @@ private struct MenuBarView: View {
         )
     }
 
-    private var popoverControlsAreActive: Bool {
-        controlActiveState != .inactive
-    }
-
-    private func popoverValue(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.headline)
-                .lineLimit(1)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(Text(title))
-        .accessibilityValue(Text(value))
-    }
-}
-
-
-private enum PopoverGlassAppearance {
-    /// Opacity applied to the popover's system Liquid Glass backing (NSGlassView).
-    /// 1.0 keeps the full system frost; lower values thin it so more of the desktop shows
-    /// through. Our content is a sibling of the backing, so it stays fully opaque regardless.
-    static let backingAlpha: CGFloat = 0.2
-}
-
-private final class PopoverGlassConfiguringView: NSView {
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        guard let window else {
-            return
-        }
-        let root = window.contentView?.superview ?? window.contentView
-        root.map(Self.dimGlassBacking)
-    }
-
-    private static func dimGlassBacking(_ view: NSView) {
-        if String(describing: type(of: view)) == "NSGlassView" {
-            view.alphaValue = PopoverGlassAppearance.backingAlpha
-        }
-        for subview in view.subviews {
-            dimGlassBacking(subview)
-        }
-    }
-}
-
-private struct PopoverGlassConfigurator: NSViewRepresentable {
-    func makeNSView(context: Context) -> PopoverGlassConfiguringView {
-        PopoverGlassConfiguringView()
-    }
-
-    func updateNSView(_ nsView: PopoverGlassConfiguringView, context: Context) {}
-}
-
-private extension Color {
-    static let macOSSystemGreen = Color(nsColor: .systemGreen)
-    static let macOSSystemRed = Color(nsColor: .systemRed)
-    static let macOSSystemYellow = Color(nsColor: .systemYellow)
 }

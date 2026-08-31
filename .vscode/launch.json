@@ -1,0 +1,64 @@
+{
+  "configurations": [
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:GlassEQ}",
+      "name": "Debug GlassEQ",
+      "target": "GlassEQ",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug GlassEQ"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:GlassEQ}",
+      "name": "Release GlassEQ",
+      "target": "GlassEQ",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release GlassEQ"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:GlassEQ}",
+      "name": "Debug GlassEQSettings",
+      "target": "GlassEQSettings",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug GlassEQSettings"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:GlassEQ}",
+      "name": "Release GlassEQSettings",
+      "target": "GlassEQSettings",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release GlassEQSettings"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:GlassEQ}",
+      "name": "Debug GlassEQDiagnostics",
+      "target": "GlassEQDiagnostics",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug GlassEQDiagnostics"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:GlassEQ}",
+      "name": "Release GlassEQDiagnostics",
+      "target": "GlassEQDiagnostics",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release GlassEQDiagnostics"
+    }
+  ]
+}
